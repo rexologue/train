@@ -1,0 +1,2 @@
+"""Serializable trainer state placeholder."""
+

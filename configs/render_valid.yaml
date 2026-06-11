@@ -1,0 +1,16 @@
+extends: smoke.yaml
+
+project:
+  name: qwen35-a3b-render-valid
+  run_name: render-valid
+
+tokenizer:
+  tokenizer_id: /mnt/e/Downloads/tokenizer
+  tokenizer_revision: null
+
+data:
+  raw:
+    valid_path: artifacts/data/valid.parquet
+
+rendering:
+  rendered_dir: artifacts/rendered_debug/valid

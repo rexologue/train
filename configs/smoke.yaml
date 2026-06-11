@@ -1,0 +1,217 @@
+project:
+  name: qwen35-a3b-smoke
+  run_name: smoke
+  seed: 42
+  output_dir: runs/smoke
+
+model:
+  base_model_id: Qwen/Qwen3.5-35B-A3B
+  base_model_revision: null
+  source_model_ref: null
+  precision: bf16
+  use_fp8_base: false
+  trust_remote_code: true
+  attn_implementation: flash_attention_2
+  gradient_checkpointing: true
+  freeze_router: true
+  freeze_embeddings: true
+  freeze_lm_head: true
+
+tokenizer:
+  tokenizer_id: Qwen/Qwen3.5-35B-A3B
+  tokenizer_revision: null
+  use_fast: true
+  add_special_tokens: false
+  padding_side: right
+  chat_template_source: tokenizer_config
+  template_hash_expected: null
+
+reasoning:
+  enabled: false
+  confirm_disabled_during_preprocessing: true
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  fail_on_nonempty_think_blocks: true
+  fail_if_supervised_think_tokens: true
+  allow_empty_template_think_markers: false
+
+lora:
+  enabled: true
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  bias: none
+  target_modules_policy: whitelist
+  target_modules: []
+  modules_to_save: []
+
+data:
+  raw:
+    train_path: train.parquet
+    valid_path: valid.parquet
+    test_path: test.parquet
+    test_required: false
+  processed:
+    train_path: data/processed/train.parquet
+    valid_path: data/processed/valid.parquet
+    test_path: data/processed/test.parquet
+    debug_dir: data/processed/debug
+  dvc:
+    repo: .
+    targets: []
+    expected_dataset_hash: null
+  max_seq_len: 8192
+  truncation: false
+  packing: false
+
+rendering:
+  reject_raw_special_markers: true
+  canonical_json_tools: true
+  sort_tool_json_keys: true
+  save_rendered_debug_samples: 20
+  render_hash_algorithm: sha256
+
+masking:
+  ignore_index: -100
+  include_assistant_eom: true
+  require_positive_supervised_tokens: true
+  golden_tests_required: true
+  policies:
+    sft_target:
+      min_guaranteed_assistant_chars: 80
+      loss_on_short_assistant_reply_prob: 0.3
+      short_response_sampling_seed: 42
+      deterministic_short_sampling: true
+    sft_tool:
+      supervise_all_assistant: true
+    dpo_target:
+      supervise_prompt: false
+      supervise_chosen_rejected_only: true
+
+loss_routing:
+  enabled: true
+  default_route: sft_target
+  sampler_weights: null
+  routes:
+    sft_target:
+      type: sft_ce
+      weight: 1.0
+    sft_tool:
+      type: sft_ce
+      weight: 1.0
+    dpo_target:
+      type: dpo
+      enabled: false
+      beta: 0.1
+      weight: 1.0
+
+training:
+  max_steps: 8
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.00005
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  logging_steps: 1
+  eval_steps: 4
+  checkpoint_steps: 4
+  save_total_limit: 2
+  best_metric: eval/bfcl/accuracy
+  greater_is_better: true
+
+progress:
+  enabled: true
+  library: tqdm
+  show_eta: true
+  show_samples_per_second: true
+  show_tokens_per_second: true
+  show_supervised_tokens_per_second: true
+  show_gpu_memory: true
+  log_pretraining_summary: true
+  mark_validation_start: true
+  redraw_train_bar_after_validation: true
+  main_process_only: true
+
+distributed:
+  backend: accelerate
+  strategy: fsdp
+  fsdp:
+    sharding_strategy: full_shard
+    mixed_precision: bf16
+    cpu_offload: false
+    activation_checkpointing: true
+    state_dict_type: sharded_state_dict
+
+eval:
+  enabled: true
+  valid_split: valid
+  test_split: test
+  run_test_only_on_final: true
+  bfcl:
+    eval_path: ru_bfcl_normalized/bfcl_eval.jsonl
+    include_multi_turn: true
+    categories: null
+    limit: null
+    generation:
+      max_new_tokens: 1024
+      temperature: 0.0
+      top_p: 1.0
+      do_sample: false
+    rows_out: eval/bfcl_rows.jsonl
+  metrics:
+    compute_ppl: true
+    compute_token_accuracy: true
+    compute_macro_f1: true
+    compute_tool_metrics: true
+    compute_length_metrics: true
+    compute_mask_metrics: true
+
+checkpointing:
+  root_dir: checkpoints
+  atomic_save: true
+  save_adapter: true
+  save_optimizer: true
+  save_scheduler: true
+  save_rng: true
+  save_sampler_state: true
+  save_dataloader_state: true
+  save_trainer_state: true
+  save_accelerate_state: true
+  checksum_files: true
+  resume:
+    enabled: true
+    path: auto
+    strict_config: true
+    strict_dataset_hash: true
+    strict_template_hash: true
+
+mlflow:
+  enabled: true
+  tracking_uri: http://localhost:5000
+  experiment_name: qwen35-a3b-sft-dpo
+  resume_run_id: null
+  log_artifacts: true
+  log_rendered_samples: true
+  log_model_candidates: true
+
+registry:
+  enabled: true
+  model_name: qwen35-a3b-sft-dpo
+  kind: generic
+  register_every_n_checkpoints: 5
+  selection_metric: eval/bfcl/accuracy
+  greater_is_better: true
+  candidate_alias_template: candidate-{candidate_index:06d}
+  rolling_candidate_alias: candidate-latest
+  promote_best_to: null
+  modelctl_path: modelctl
+
+dpo:
+  enabled: false
+  candidates_path: null
+  pairs_path: null
+  ref_logprobs_path: null
+  reference_model_uri: null
+  precompute_ref_logprobs: true

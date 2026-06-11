@@ -1,0 +1,2 @@
+"""Reference logprob precomputation placeholder."""
+
