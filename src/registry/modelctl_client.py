@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from qwen35_tuning.registry.tags import validate_training_aliases
+from registry.tags import validate_training_aliases
 
 
 def build_modelctl_register_args(modelctl_path: str, model_name: str, artifact_path: str, aliases: list[str]) -> list[str]:

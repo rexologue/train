@@ -1,13 +1,13 @@
 project:
-  name: qwen35-a3b-smoke
-  run_name: smoke
+  name: dummy-qwen35-a3b-run
+  run_name: dummy-run
   seed: 42
-  output_dir: runs/smoke
+  output_dir: runs/dummy-qwen35-a3b-run
 
 model:
-  base_model_id: Qwen/Qwen3.5-35B-A3B
-  base_model_revision: null
-  source_model_ref: null
+  base_model_id: /path/to/base/model
+  base_model_revision: dummy-revision
+  source_model_ref: models:/dummy-source@baseline
   precision: bf16
   use_fp8_base: false
   trust_remote_code: true
@@ -18,22 +18,13 @@ model:
   freeze_lm_head: true
 
 tokenizer:
-  tokenizer_id: Qwen/Qwen3.5-35B-A3B
-  tokenizer_revision: null
+  tokenizer_id: /path/to/tokenizer
+  tokenizer_revision: dummy-revision
   use_fast: true
   add_special_tokens: false
   padding_side: right
   chat_template_source: tokenizer_config
-  template_hash_expected: null
-
-reasoning:
-  enabled: false
-  confirm_disabled_during_preprocessing: true
-  apply_chat_template_kwargs:
-    enable_thinking: false
-  fail_on_nonempty_think_blocks: true
-  fail_if_supervised_think_tokens: true
-  allow_empty_template_think_markers: false
+  template_hash_expected: sha256:0000000000000000000000000000000000000000000000000000000000000000
 
 lora:
   enabled: true
@@ -42,56 +33,49 @@ lora:
   dropout: 0.05
   bias: none
   target_modules_policy: whitelist
-  target_modules: []
-  modules_to_save: []
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  modules_to_save:
+    - lm_head
 
-data:
+preprocessing:
   raw:
-    train_path: train.parquet
-    valid_path: valid.parquet
-    test_path: test.parquet
+    train_path: data/raw/train.parquet
+    valid_path: data/raw/valid.parquet
+    test_path: data/raw/test.parquet
     test_required: false
-  processed:
-    train_path: data/processed/train.parquet
-    valid_path: data/processed/valid.parquet
-    test_path: data/processed/test.parquet
-    debug_dir: data/processed/debug
-  dvc:
-    repo: .
-    targets: []
-    expected_dataset_hash: null
-  max_seq_len: 8192
-  truncation: false
-  packing: false
-
-rendering:
-  reject_raw_special_markers: true
-  canonical_json_tools: true
-  sort_tool_json_keys: true
-  save_rendered_debug_samples: 20
-  render_hash_algorithm: sha256
-
-masking:
-  ignore_index: -100
-  include_assistant_eom: true
-  require_positive_supervised_tokens: true
-  golden_tests_required: true
-  policies:
-    sft_target:
-      min_guaranteed_assistant_chars: 80
-      loss_on_short_assistant_reply_prob: 0.3
-      short_response_sampling_seed: 42
-      deterministic_short_sampling: true
-    sft_tool:
-      supervise_all_assistant: true
-    dpo_target:
-      supervise_prompt: false
-      supervise_chosen_rejected_only: true
+  output:
+    root_dir: artifacts/pretokenized/example
+    reuse_if_hash_matches: true
+    debug_examples_per_loss_kind: 5
+  sequence:
+    max_seq_len: 8192
+    truncation: false
+    packing: false
+  rendering:
+    reject_raw_special_markers: true
+  reasoning:
+    enable_thinking: false
+  masking:
+    ignore_index: -100
+    require_positive_supervised_tokens: true
+    policies:
+      sft_target:
+        min_guaranteed_assistant_chars: 80
+        loss_on_short_assistant_reply_prob: 0.3
+        short_response_sampling_seed: 42
+      sft_tool: {}
 
 loss_routing:
   enabled: true
   default_route: sft_target
-  sampler_weights: null
+  sampler_weights:
+    sft_target: 1.0
+    sft_tool: 1.0
+    dpo_target: 0.0
   routes:
     sft_target:
       type: sft_ce
@@ -106,18 +90,18 @@ loss_routing:
       weight: 1.0
 
 training:
-  max_steps: 8
+  max_steps: 100
   per_device_train_batch_size: 1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 16
   learning_rate: 0.00005
   weight_decay: 0.0
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
   max_grad_norm: 1.0
-  logging_steps: 1
-  eval_steps: 4
-  checkpoint_steps: 4
-  save_total_limit: 2
+  logging_steps: 5
+  eval_steps: 25
+  checkpoint_steps: 25
+  save_total_limit: 3
   best_metric: eval/bfcl/accuracy
   greater_is_better: true
 
@@ -150,10 +134,12 @@ eval:
   test_split: test
   run_test_only_on_final: true
   bfcl:
-    eval_path: ru_bfcl_normalized/bfcl_eval.jsonl
+    eval_path: data/eval/bfcl_eval.jsonl
     include_multi_turn: true
-    categories: null
-    limit: null
+    categories:
+      - simple
+      - parallel
+    limit: 100
     generation:
       max_new_tokens: 1024
       temperature: 0.0
@@ -169,7 +155,7 @@ eval:
     compute_mask_metrics: true
 
 checkpointing:
-  root_dir: checkpoints
+  root_dir: checkpoints/dummy-qwen35-a3b-run
   atomic_save: true
   save_adapter: true
   save_optimizer: true
@@ -190,15 +176,15 @@ checkpointing:
 mlflow:
   enabled: true
   tracking_uri: http://localhost:5000
-  experiment_name: qwen35-a3b-sft-dpo
-  resume_run_id: null
+  experiment_name: dummy-qwen35-a3b
+  resume_run_id: dummy-run-id
   log_artifacts: true
   log_rendered_samples: true
   log_model_candidates: true
 
 registry:
   enabled: true
-  model_name: qwen35-a3b-sft-dpo
+  model_name: dummy-qwen35-a3b
   kind: generic
   register_every_n_checkpoints: 5
   selection_metric: eval/bfcl/accuracy
@@ -210,8 +196,8 @@ registry:
 
 dpo:
   enabled: false
-  candidates_path: null
-  pairs_path: null
-  ref_logprobs_path: null
-  reference_model_uri: null
+  candidates_path: data/dpo/candidates.jsonl
+  pairs_path: data/dpo/pairs.parquet
+  ref_logprobs_path: data/dpo/ref_logprobs.parquet
+  reference_model_uri: models:/dummy-reference@candidate-latest
   precompute_ref_logprobs: true

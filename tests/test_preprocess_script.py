@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from qwen35_tuning.config.loader import load_config
-from scripts.preprocess import resolve_split_work
+from config import load_config
+from preprocessing.io import resolve_split_paths
 
 
-def test_resolve_split_work_skips_missing_optional_test(tmp_path):
-    config = load_config("configs/smoke.yaml")
-    work = resolve_split_work(config, ["test"], tmp_path)
-    assert work == []
-    assert (tmp_path / "test_preprocess_manifest.json").exists()
+def test_resolve_split_paths_skips_missing_optional_test():
+    config = load_config("configs/config.preprocess.yaml")
+    assert resolve_split_paths(config, ["test"]) == []

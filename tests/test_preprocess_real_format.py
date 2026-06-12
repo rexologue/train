@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from qwen35_tuning.config.loader import load_config
-from qwen35_tuning.data.preprocess import preprocess_raw_rows
-from qwen35_tuning.rendering.qwen_template import QwenTemplateRenderer
+from config import load_config
+from preprocessing.pipeline import preprocess_raw_rows
+from preprocessing.rendering import QwenTemplateRenderer
 
 from conftest import CharTokenizer
 
 
 def test_preprocess_raw_rows_rejects_zero_supervised_without_aborting():
-    config = load_config("configs/smoke.yaml")
+    config = load_config("configs/config.preprocess.yaml")
     rows = [
         {
             "sample_id": "short-dropped",
@@ -29,9 +29,8 @@ def test_preprocess_raw_rows_rejects_zero_supervised_without_aborting():
         },
     ]
 
-    processed, audits, manifest = preprocess_raw_rows(rows, "valid", QwenTemplateRenderer(None, config.section("rendering")), CharTokenizer(), config)
+    processed, audits, manifest = preprocess_raw_rows(rows, "valid", QwenTemplateRenderer(None, config.rendering), CharTokenizer(), config)
     assert [row["sample_id"] for row in processed] == ["long-kept"]
     assert manifest["num_raw_rows"] == 2
     assert manifest["num_rejected_rows"] == 1
     assert any(audit.get("rejected") for audit in audits)
-

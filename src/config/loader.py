@@ -7,6 +7,8 @@ from .schema import ConfigError, TrainingConfig, validate_config
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge YAML mappings recursively while treating `extends` as metadata."""
+
     merged = dict(base)
     for key, value in override.items():
         if key == "extends":
@@ -19,6 +21,8 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
+    """Load a YAML file and resolve a local `extends` chain."""
+
     try:
         import yaml
     except ImportError as exc:  # pragma: no cover - exercised only in minimal envs.
@@ -37,4 +41,6 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def load_config(path: str | Path) -> TrainingConfig:
+    """Load and validate a training/preprocessing YAML config."""
+
     return validate_config(load_yaml(path))

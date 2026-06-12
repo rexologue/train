@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from qwen35_tuning.data.schemas import AssistantSpan, CanonicalRow
-from qwen35_tuning.masking.target_selection import select_sft_target_spans
+from preprocessing.masking import AssistantSpan, CanonicalRow
+from preprocessing.masking import select_sft_target_spans
 
 
 def test_dialog_starting_with_assistant_is_selected_by_plain_assistant_policy():

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from qwen35_tuning.config.hashing import file_sha256
+from config.hashing import file_sha256
 
 
 def directory_checksums(root: str | Path) -> dict[str, str]:

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from qwen35_tuning.config.loader import load_config
-from qwen35_tuning.data.canonicalize import canonicalize_row
-from qwen35_tuning.data.preprocess import preprocess_dpo_row, preprocess_sft_row
-from qwen35_tuning.rendering.qwen_template import QwenTemplateRenderer
+from config import load_config
+from preprocessing.masking import canonicalize_row
+from preprocessing.pipeline import preprocess_dpo_row, preprocess_sft_row
+from preprocessing.rendering import QwenTemplateRenderer
 from conftest import CharTokenizer
 
 
@@ -16,9 +16,9 @@ def supervised_text(rendered: str, input_ids: list[int], labels: list[int]) -> s
 
 
 def test_sft_masks_all_long_assistant_replies_for_sft_target():
-    config = load_config("configs/smoke.yaml")
+    config = load_config("configs/config.preprocess.yaml")
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, config.section("rendering"))
+    renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(
         {
             "sample_id": "mask1",
@@ -41,9 +41,9 @@ def test_sft_masks_all_long_assistant_replies_for_sft_target():
 
 
 def test_tool_policy_supervises_tool_call_and_final_answer_not_tool_response():
-    config = load_config("configs/smoke.yaml")
+    config = load_config("configs/config.preprocess.yaml")
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, config.section("rendering"))
+    renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(
         {
             "sample_id": "tool1",
@@ -78,9 +78,9 @@ def test_tool_policy_supervises_tool_call_and_final_answer_not_tool_response():
 
 
 def test_tool_policy_supervises_text_answer_after_user_when_no_tool_needed():
-    config = load_config("configs/smoke.yaml")
+    config = load_config("configs/config.preprocess.yaml")
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, config.section("rendering"))
+    renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(
         {
             "sample_id": "tool-no-call",
@@ -101,9 +101,9 @@ def test_tool_policy_supervises_text_answer_after_user_when_no_tool_needed():
 
 
 def test_dpo_masks_only_chosen_and_rejected_completion_text():
-    config = load_config("configs/smoke.yaml")
+    config = load_config("configs/config.preprocess.yaml")
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, config.section("rendering"))
+    renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(
         {
             "id": "dpo1",

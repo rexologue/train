@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qwen35_tuning.registry.tags import candidate_alias, validate_training_aliases
+from registry.tags import candidate_alias, validate_training_aliases
 
 
 def test_candidate_alias_is_explicit_and_never_champion():

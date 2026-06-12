@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from qwen35_tuning.datasets.collators import SFTCollator
-from qwen35_tuning.sampling.routed_batch_sampler import RoutedBatchSampler
+from data.collators import SFTCollator
+from sampling.routed_batch_sampler import RoutedBatchSampler
 
 
 def test_routed_sampler_batches_are_homogeneous():
