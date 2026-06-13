@@ -27,10 +27,12 @@ dev = [
   "pytest>=8",
 ]
 
+[project.scripts]
+modelctl = "modelctl.cli:main"
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "vendor/modelctl-mlflow"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "vendor/modelctl-mlflow"]
 testpaths = ["tests"]
-

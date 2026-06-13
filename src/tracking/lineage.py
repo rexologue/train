@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from config import TrainingConfig, file_sha256
+
+
+def collect_tracking_lineage(config: TrainingConfig) -> dict[str, Any]:
+    """Collect git and DVC provenance that belongs in experiment tracking."""
+
+    lineage_config = config.raw.get("lineage")
+    if not isinstance(lineage_config, dict):
+        return {"dvc": {"enabled": False}}
+
+    dvc_config = lineage_config.get("dvc")
+    if not isinstance(dvc_config, dict) or not bool(dvc_config.get("enabled", False)):
+        return {"dvc": {"enabled": False}}
+
+    repo_root = Path(str(dvc_config["repo_root"])).expanduser().resolve()
+    targets = dvc_config.get("targets")
+    if not isinstance(targets, dict) or not targets:
+        raise ValueError("lineage.dvc.targets must be a non-empty mapping when DVC lineage is enabled")
+
+    return {
+        "dvc": {
+            "enabled": True,
+            "repo_root": str(repo_root),
+            "git": collect_git_metadata(repo_root),
+            "targets": {name: collect_dvc_target(repo_root, str(path)) for name, path in sorted(targets.items())},
+        }
+    }
+
+
+def collect_git_metadata(repo_root: Path) -> dict[str, Any]:
+    """Collect reproducibility metadata from a git repository."""
+
+    commit = run_git(repo_root, "rev-parse", "HEAD")
+    branch = run_git(repo_root, "branch", "--show-current")
+    status = run_git(repo_root, "status", "--short") or ""
+    remote_url = run_git(repo_root, "remote", "get-url", "origin")
+    return {
+        "commit": commit,
+        "branch": branch,
+        "dirty": bool(status.strip()),
+        "status_short": [line for line in status.splitlines() if line.strip()],
+        "remote_origin": remote_url,
+    }
+
+
+def collect_code_metadata(repo_root: Path) -> dict[str, Any]:
+    """Collect git metadata for the training code repository."""
+
+    return collect_git_metadata(repo_root)
+
+
+def run_git(repo_root: Path, *args: str) -> str | None:
+    """Run a git command and return stripped stdout, or None outside git repos."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def collect_dvc_target(repo_root: Path, dvc_file: str) -> dict[str, Any]:
+    """Read one .dvc metadata file without requiring the DVC Python package."""
+
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - PyYAML is a project dependency.
+        raise RuntimeError("PyYAML is required to read DVC metadata") from exc
+
+    dvc_path = (repo_root / dvc_file).resolve()
+    with dvc_path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError(f"DVC metadata must be a mapping: {dvc_path}")
+    outs = raw.get("outs")
+    if not isinstance(outs, list):
+        raise ValueError(f"DVC metadata has no outs list: {dvc_path}")
+    return {
+        "dvc_file": str(dvc_path),
+        "dvc_file_sha256": file_sha256(dvc_path),
+        "outs": [normalize_dvc_out(item) for item in outs],
+    }
+
+
+def normalize_dvc_out(value: Any) -> dict[str, Any]:
+    """Normalize one DVC out entry into a stable JSON object."""
+
+    if not isinstance(value, dict):
+        raise ValueError("DVC outs entries must be mappings")
+    return {
+        "path": value.get("path"),
+        "hash": value.get("hash"),
+        "md5": value.get("md5"),
+        "size": value.get("size"),
+        "nfiles": value.get("nfiles"),
+    }

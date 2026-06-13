@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from config import TrainingConfig, file_sha256, sha256_text, stable_hash
+from config import TrainingConfig, effective_tokenizer_id, file_sha256, sha256_text, stable_hash
 from preprocessing.io import (
     PretokSplitResult,
     cache_root,
@@ -48,7 +48,7 @@ def load_tokenizer(config: TrainingConfig) -> Any:
     tokenizer_config = config.section("tokenizer")
     model_config = config.section("model")
     return AutoTokenizer.from_pretrained(
-        tokenizer_config["tokenizer_id"],
+        effective_tokenizer_id(config),
         revision=tokenizer_config.get("tokenizer_revision"),
         use_fast=bool(tokenizer_config.get("use_fast", True)),
         trust_remote_code=bool(model_config.get("trust_remote_code", True)),
@@ -623,7 +623,7 @@ def prepare_pretokenized_splits(
     """
 
     logger = get_logger(__name__)
-    logger.info("loading tokenizer: %s", config.section("tokenizer")["tokenizer_id"])
+    logger.info("loading tokenizer: %s", effective_tokenizer_id(config))
     tokenizer = load_tokenizer(config)
     max_seq_len = validate_configured_max_seq_len(config, tokenizer)
     model_context = tokenizer_model_context(tokenizer)

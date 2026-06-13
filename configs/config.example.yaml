@@ -8,6 +8,16 @@ model:
   base_model_id: /path/to/base/model
   base_model_revision: dummy-revision
   source_model_ref: models:/dummy-source@baseline
+  source:
+    kind: local_or_hf
+    model_name: null
+    alias: null
+    version: null
+    local_dir: null
+    pull_policy: if_local_empty
+    verify_local_hash: true
+    verify_remote_ref: false
+    require_registry_metadata: true
   precision: bf16
   use_fp8_base: false
   trust_remote_code: true
@@ -18,7 +28,8 @@ model:
   freeze_lm_head: true
 
 tokenizer:
-  tokenizer_id: /path/to/tokenizer
+  source: model
+  tokenizer_id: null
   tokenizer_revision: dummy-revision
   use_fast: true
   add_special_tokens: false
@@ -182,6 +193,13 @@ mlflow:
   log_artifacts: true
   log_rendered_samples: true
   log_model_candidates: true
+
+lineage:
+  dvc:
+    enabled: true
+    repo_root: /path/to/dvc/repo
+    targets:
+      data: data.dvc
 
 registry:
   enabled: true

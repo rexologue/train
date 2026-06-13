@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from config import TrainingConfig
+from config import TrainingConfig, effective_tokenizer_id
 from data.collators import RoutedCollator
 from data.pretokenized_dataset import PretokenizedDataset
 from data.routed_batch_sampler import RoutedBatchSampler
@@ -49,7 +49,7 @@ def resolve_pad_token_id(config: TrainingConfig) -> int:
     tokenizer_config = config.section("tokenizer")
     model_config = config.section("model")
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_config["tokenizer_id"],
+        effective_tokenizer_id(config),
         revision=tokenizer_config.get("tokenizer_revision"),
         use_fast=bool(tokenizer_config.get("use_fast", True)),
         trust_remote_code=bool(model_config.get("trust_remote_code", True)),
