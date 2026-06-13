@@ -9,29 +9,29 @@
 В `configs/` сейчас оставлены только два файла:
 
 - `config.example.yaml` — полный шаблон со всеми полями и dummy-значениями.
-- `config.preprocess.yaml` — текущий рабочий debug-конфиг для preprocessing DVC-backed `train.parquet`/`valid.parquet`.
+- `config.preprocess.yaml` — рабочий startup-конфиг для локального debug/probe запуска. Перед запуском проверь пути raw split-ов, source модели/tokenizer, MLflow и DVC под свое окружение.
 
-Запуск полного реализованного на данный момент процесса для configured `train`/`valid` split-ов:
+Запуск полного реализованного на данный момент процесса для configured split-ов:
 
 ```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/python -m train --config configs/config.preprocess.yaml --force-preprocess
+PYTHONPATH=src:vendor/modelctl-mlflow python -m train --config configs/config.preprocess.yaml --force-preprocess
 ```
 
 Что произойдет:
 
 1. Будет прочитан `configs/config.preprocess.yaml`.
-2. Будет открыт MLflow run и залоггированы config, code/DVC lineage и стартовые params.
+2. При `mlflow.enabled=true` будет открыт MLflow run и залоггированы config, code/DVC lineage и стартовые params.
 3. Будет загружен tokenizer из resolved model source.
-4. Будут прочитаны raw parquet split-ы из `/home/duka/data/llm-call-center/llm-call-center/data/`.
+4. Будут прочитаны raw parquet split-ы из `preprocessing.raw.*_path`.
 5. Каждая строка `data` будет распарсена как JSON string, а `type`/`target` будет использован как authoritative `loss_kind`.
 6. Для SFT/tool/DPO samples будет применен chat template, построены supervised spans и `labels`.
-7. Результат будет записан в `artifacts/pretokenized/render_valid/`.
+7. Результат будет записан в `preprocessing.output.root_dir`.
 8. Будут построены routed DataLoader-ы и залоггированы их summaries.
 
 Если нужно только проверить reuse уже готового cache, убери `--force-preprocess`:
 
 ```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/python -m train --config configs/config.preprocess.yaml
+PYTHONPATH=src:vendor/modelctl-mlflow python -m train --config configs/config.preprocess.yaml
 ```
 
 ## Execution Path
@@ -57,7 +57,7 @@ src/train.py
   -> preprocessing.masking.tokenize_with_offsets / build_labels
      src/preprocessing/masking.py
   -> preprocessing.io.write_split_cache
-     artifacts/pretokenized/render_valid/{train.parquet,valid.parquet,debug.jsonl,manifest.json}
+     {preprocessing.output.root_dir}/{train.parquet,valid.parquet,debug.jsonl,manifest.json}
 ```
 
 ## Входы
@@ -71,16 +71,16 @@ type или target: sft_target | sft_tool | dpo_target
 
 Одна строка parquet равна одному sample. `type`/`target` является authoritative `loss_kind`; тип не выводится из содержимого `data`.
 
-Для текущего debug run используется:
+Входы и tracking references задаются в YAML:
 
 ```text
-configs/config.preprocess.yaml
-/home/duka/data/llm-call-center/llm-call-center/data/train.parquet
-/home/duka/data/llm-call-center/llm-call-center/data/valid.parquet
-model.source.local_dir: /mnt/e/Downloads/tokenizer
+preprocessing.raw.train_path
+preprocessing.raw.valid_path
+preprocessing.raw.test_path          # optional when preprocessing.raw.test_required=false
+model.source or model.base_model_id
 tokenizer.source: model
-MLflow: http://31.192.108.203:5000/
-DVC repo: /home/duka/data/llm-call-center/llm-call-center
+mlflow.tracking_uri                    # when mlflow.enabled=true
+lineage.dvc.repo_root / lineage.dvc.targets   # when lineage.dvc.enabled=true
 ```
 
 Preprocessing-related настройки теперь собраны под одним YAML блоком:
@@ -88,12 +88,12 @@ Preprocessing-related настройки теперь собраны под од
 ```yaml
 preprocessing:
   raw:
-    train_path: /home/duka/data/llm-call-center/llm-call-center/data/train.parquet
-    valid_path: /home/duka/data/llm-call-center/llm-call-center/data/valid.parquet
-    test_path: /home/duka/data/llm-call-center/llm-call-center/data/test.parquet
+    train_path: data/raw/train.parquet
+    valid_path: data/raw/valid.parquet
+    test_path: data/raw/test.parquet
     test_required: false
   output:
-    root_dir: artifacts/pretokenized/render_valid
+    root_dir: artifacts/pretokenized/example
     reuse_if_hash_matches: true
     debug_examples_per_loss_kind: 5
   sequence:
@@ -121,14 +121,21 @@ preprocessing:
 model:
   source:
     kind: local_or_hf
-    local_dir: /mnt/e/Downloads/tokenizer
+    model_name: null
+    alias: null
+    version: null
+    local_dir: null
+    pull_policy: if_local_empty
+    verify_local_hash: true
+    verify_remote_ref: false
+    require_registry_metadata: true
 
 tokenizer:
   source: model
   tokenizer_id: null
 ```
 
-`tokenizer` остается отдельной секцией только для tokenizer-specific параметров вроде `use_fast`, `add_special_tokens`, `padding_side` и expected template hash. Если для отдельного debug run понадобится отвязать tokenizer от модели, надо выставить `tokenizer.source=explicit` и указать `tokenizer.tokenizer_id`.
+`model.source.kind=local_or_hf` использует `model.source.local_dir`, если он задан, иначе `model.base_model_id`. `model.source.kind=registry` использует `models:/<model_name>@<alias>` или `models:/<model_name>/<version>` и локальный cache directory; если cache пустой, `src/tracking/model_source.py` дернет `modelctl pull` через `vendor/modelctl-mlflow` и запишет sidecar metadata для последующей проверки hash/ref. `tokenizer` остается отдельной секцией только для tokenizer-specific параметров вроде `use_fast`, `add_special_tokens`, `padding_side` и expected template hash. Если для отдельного debug run понадобится отвязать tokenizer от модели, надо выставить `tokenizer.source=explicit` и указать `tokenizer.tokenizer_id`.
 
 Что здесь за что отвечает:
 
@@ -139,14 +146,14 @@ tokenizer:
 - `reasoning`: один флаг `enable_thinking`. Если `false`, `<think>...</think>` не попадает в loss; если `true`, попадает.
 - `masking`: построение `labels`. `ignore_index` — значение для токенов без loss; `require_positive_supervised_tokens` отклоняет строки с нулем supervised tokens; `sft_target` задает deterministic short-reply sampling; `sft_tool: {}` означает текущую фиксированную политику: loss на всех assistant completions.
 
-MLflow/DVC lineage живет в отдельном tracking слое, а не внутри `preprocessing`: dataset git commit, DVC `.dvc` hash, split hashes, config hash, preprocessing manifest и DataLoader summaries логгируются в MLflow, но не управляют render/tokenize/mask проходом.
+MLflow/DVC lineage живет в отдельном tracking слое, а не внутри `preprocessing`: dataset git commit, DVC `.dvc` hash, split hashes, config hash, preprocessing manifest и DataLoader summaries логгируются при включенном tracking, но не управляют render/tokenize/mask проходом.
 
 ## Выходы
 
-После запуска с `configs/config.preprocess.yaml` пишется:
+После запуска пишется cache root из `preprocessing.output.root_dir`:
 
 ```text
-artifacts/pretokenized/render_valid/
+artifacts/pretokenized/<run>/
 ├── train.parquet
 ├── valid.parquet
 ├── debug.jsonl
@@ -164,7 +171,7 @@ Split parquet содержит tokenized rows с `input_ids`, `attention_mask`, 
   "debug": {
     "examples_per_loss_kind_per_split": 5,
     "num_rows": 10,
-    "path": "artifacts/pretokenized/render_valid/debug.jsonl"
+    "path": "artifacts/pretokenized/<run>/debug.jsonl"
   },
   "splits": {
     "train": "sha256:...",
@@ -211,7 +218,7 @@ Split parquet содержит tokenized rows с `input_ids`, `attention_mask`, 
 Текущий `src/train.py` пока не запускает реальное обучение модели. После успешного preprocessing, MLflow tracking и DataLoader build он логирует:
 
 ```text
-startup preprocessing complete; model training is the next pipeline stage
+startup preprocessing and dataloader build complete; model training is the next pipeline stage
 ```
 
-Следующие крупные этапы проекта: training dataset/dataloader, routed homogeneous batches, SFT/DPO loss routes, Accelerate/FSDP trainer, checkpoints/resume, MLflow/registry и BFCL-like eval.
+Следующие крупные этапы проекта: SFT/DPO loss routes, Accelerate/FSDP trainer, checkpoints/resume, candidate registration в registry и BFCL-like eval.
