@@ -1,2 +1,1 @@
-"""SFT and DPO loss routes."""
-
+"""Loss routes used by the trainer."""

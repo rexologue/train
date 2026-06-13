@@ -206,6 +206,49 @@ def split_cache_is_valid(
     return valid, manifest
 
 
+def load_pretokenized_split_results(config: TrainingConfig, splits: list[str]) -> list[PretokSplitResult]:
+    """Load prepared split result descriptors from an existing cache manifest."""
+
+    root = cache_root(config)
+    manifest = load_manifest(root)
+    if manifest is None:
+        raise FileNotFoundError(f"pretokenized manifest not found: {manifest_path(root)}")
+
+    raw_paths = dict(resolve_split_paths(config, splits))
+    results: list[PretokSplitResult] = []
+    for split, raw_path in raw_paths.items():
+        pretok_path = split_parquet_path(root, split)
+        if not pretok_path.exists():
+            raise FileNotFoundError(f"pretokenized split not found after preprocessing: {pretok_path}")
+        split_manifest = split_manifest_from_cache_manifest(manifest, split)
+        results.append(
+            PretokSplitResult(
+                split=split,
+                raw_path=raw_path,
+                output_dir=root,
+                pretok_path=pretok_path,
+                manifest_path=manifest_path(root),
+                reused=True,
+                manifest=split_manifest,
+            )
+        )
+    return results
+
+
+def split_manifest_from_cache_manifest(manifest: dict[str, Any], split: str) -> dict[str, Any]:
+    rows = manifest.get("rows") if isinstance(manifest.get("rows"), dict) else {}
+    row_summary = rows.get(split) if isinstance(rows, dict) else None
+    row_summary = row_summary if isinstance(row_summary, dict) else {}
+    return {
+        "input_sha256": (manifest.get("splits") or {}).get(split),
+        "pretokenized_sha256": (manifest.get("pretokenized") or {}).get(split),
+        "num_raw_rows": int(row_summary.get("raw") or 0),
+        "num_rows": int(row_summary.get("processed") or 0),
+        "num_rejected_rows": int(row_summary.get("rejected") or 0),
+        "rejected_counts": ((manifest.get("rejections") or {}).get(split) or {}),
+    }
+
+
 def sample_debug_rows(debug_rows: list[dict[str, Any]], *, examples_per_loss_kind: int) -> list[dict[str, Any]]:
     """Keep at most N debug examples per `(split, loss_kind)` pair."""
 

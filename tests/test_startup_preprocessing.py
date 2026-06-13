@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from config import load_config
-from preprocessing.io import split_cache_is_valid, write_split_cache
+from preprocessing.io import load_manifest, load_pretokenized_split_results, split_cache_is_valid, write_split_cache
 from preprocessing.pipeline import (
     _preprocess_sft_dataset_row,
     enforce_max_seq_len,
@@ -77,6 +77,54 @@ def test_split_cache_reuse_depends_only_on_that_raw_split_hash(tmp_path):
     assert split_cache_is_valid(root, "valid", "sha256:valid-a")[0] is True
     assert split_cache_is_valid(root, "valid", "sha256:valid-b")[0] is False
     assert split_cache_is_valid(root, "train", "sha256:train-a")[0] is False
+
+
+def test_load_pretokenized_split_results_from_existing_manifest(tmp_path):
+    root = tmp_path / "pretok"
+    raw_train = tmp_path / "train.parquet"
+    raw_valid = tmp_path / "valid.parquet"
+    raw_train.write_bytes(b"train")
+    raw_valid.write_bytes(b"valid")
+    write_split_cache(
+        root,
+        "train",
+        [{"sample_id": "a", "input_ids": [1]}],
+        [],
+        {
+            "input_sha256": "sha256:train",
+            "num_raw_rows": 1,
+            "num_rows": 1,
+            "num_rejected_rows": 0,
+            "rejected_counts": {},
+        },
+        base_manifest={},
+        examples_per_loss_kind=5,
+    )
+    write_split_cache(
+        root,
+        "valid",
+        [{"sample_id": "b", "input_ids": [2]}],
+        [],
+        {
+            "input_sha256": "sha256:valid",
+            "num_raw_rows": 1,
+            "num_rows": 1,
+            "num_rejected_rows": 0,
+            "rejected_counts": {},
+        },
+        base_manifest=load_manifest(root) or {},
+        examples_per_loss_kind=5,
+    )
+    config = load_config("configs/config.preprocess.yaml")
+    config.raw["preprocessing"]["output"]["root_dir"] = str(root)
+    config.raw["preprocessing"]["raw"]["train_path"] = str(raw_train)
+    config.raw["preprocessing"]["raw"]["valid_path"] = str(raw_valid)
+
+    results = load_pretokenized_split_results(config, ["train", "valid"])
+
+    assert [result.split for result in results] == ["train", "valid"]
+    assert results[0].reused is True
+    assert results[0].manifest["input_sha256"] == "sha256:train"
 
 
 def test_startup_template_falls_back_when_no_thinking_kwarg_is_unsupported():

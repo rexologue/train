@@ -1,2 +1,1 @@
-"""BFCL-style evaluation helpers."""
-
+"""Evaluation package."""

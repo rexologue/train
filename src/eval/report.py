@@ -1,2 +1,0 @@
-"""Evaluation report generation placeholder."""
-

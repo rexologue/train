@@ -1,2 +1,0 @@
-"""Preference pair builder placeholder."""
-

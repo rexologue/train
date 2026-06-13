@@ -1,2 +1,0 @@
-"""DPO sampler placeholder."""
-

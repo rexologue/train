@@ -1,2 +1,0 @@
-"""Candidate generation placeholder."""
-

@@ -33,6 +33,9 @@ modelctl = "modelctl.cli:main"
 [tool.setuptools.packages.find]
 where = ["src", "vendor/modelctl-mlflow"]
 
+[tool.setuptools.package-data]
+"eval.ru_bfcl.data" = ["*.jsonl"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "vendor/modelctl-mlflow"]
 testpaths = ["tests"]

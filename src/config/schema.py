@@ -13,6 +13,7 @@ REQUIRED_TOP_LEVEL_KEYS = {
     "preprocessing",
     "loss_routing",
     "training",
+    "distributed",
     "checkpointing",
     "mlflow",
     "registry",
@@ -101,8 +102,25 @@ def validate_config(raw: dict[str, Any]) -> TrainingConfig:
         raise ConfigError("preprocessing.sequence.packing must stay false until packing mask tests exist")
 
     training = raw["training"]
+    if "enabled" in training and not isinstance(training["enabled"], bool):
+        raise ConfigError("training.enabled must be true or false")
     if "drop_last" in training and not isinstance(training["drop_last"], bool):
         raise ConfigError("training.drop_last must be true or false")
+    if "adamw_betas" in training:
+        validate_adamw_betas(training["adamw_betas"])
+    validate_lora(raw.get("lora"), training_enabled=bool(training.get("enabled", True)))
+
+    eval_config = raw.get("eval")
+    if eval_config is not None:
+        validate_eval(eval_config)
+
+    validate_distributed(raw["distributed"])
+
+    checkpointing = raw["checkpointing"]
+    if "save_every_n_validations" in checkpointing:
+        _require_positive_int(checkpointing["save_every_n_validations"], "checkpointing.save_every_n_validations")
+    if checkpointing.get("save_total_limit") is not None:
+        _require_positive_int(checkpointing["save_total_limit"], "checkpointing.save_total_limit")
 
     mlflow = raw["mlflow"]
     if not isinstance(mlflow.get("enabled"), bool):
@@ -112,6 +130,7 @@ def validate_config(raw: dict[str, Any]) -> TrainingConfig:
             raise ConfigError("mlflow.tracking_uri must be configured when mlflow.enabled=true")
         if not mlflow.get("experiment_name"):
             raise ConfigError("mlflow.experiment_name must be configured when mlflow.enabled=true")
+    validate_mlflow_async_logging(mlflow)
 
     registry = raw["registry"]
     if registry.get("promote_best_to") is not None:
@@ -157,6 +176,22 @@ def validate_model_source(model: dict[str, Any]) -> None:
             raise ConfigError(f"model.source.{key} must be true or false")
 
 
+def validate_lora(lora: Any, *, training_enabled: bool) -> None:
+    if lora is None:
+        return
+    if not isinstance(lora, dict):
+        raise ConfigError("lora must be a mapping")
+    if not isinstance(lora.get("enabled"), bool):
+        raise ConfigError("lora.enabled must be true or false")
+    if not training_enabled or not lora.get("enabled"):
+        return
+    if lora.get("target_modules_policy") != "whitelist":
+        raise ConfigError("lora.target_modules_policy must be whitelist")
+    target_modules = lora.get("target_modules")
+    if not isinstance(target_modules, list) or not target_modules or not all(isinstance(item, str) and item for item in target_modules):
+        raise ConfigError("lora.target_modules must be a non-empty list of module names when training is enabled")
+
+
 def validate_lineage(lineage: dict[str, Any]) -> None:
     """Validate optional tracking lineage config."""
 
@@ -176,6 +211,85 @@ def validate_lineage(lineage: dict[str, Any]) -> None:
             raise ConfigError("lineage.dvc.targets must be a non-empty mapping when enabled")
 
 
+def validate_eval(eval_config: dict[str, Any]) -> None:
+    """Validate evaluation cadence and route-local limits."""
+
+    if not isinstance(eval_config, dict):
+        raise ConfigError("eval must be a mapping")
+    if "enabled" in eval_config and not isinstance(eval_config["enabled"], bool):
+        raise ConfigError("eval.enabled must be true or false")
+    if "every_train_steps" in eval_config:
+        _require_positive_int(eval_config["every_train_steps"], "eval.every_train_steps")
+
+    standard = eval_config.get("standard")
+    if standard is not None:
+        if not isinstance(standard, dict):
+            raise ConfigError("eval.standard must be a mapping")
+        if standard.get("max_batches") is not None:
+            _require_positive_int(standard["max_batches"], "eval.standard.max_batches")
+
+    bfcl = eval_config.get("bfcl")
+    if bfcl is not None:
+        if not isinstance(bfcl, dict):
+            raise ConfigError("eval.bfcl must be a mapping")
+        if bfcl.get("run_every_n_validations") is not None:
+            _require_positive_int(bfcl["run_every_n_validations"], "eval.bfcl.run_every_n_validations")
+
+
+def validate_distributed(distributed: dict[str, Any]) -> None:
+    """Validate the single supported distributed runtime: Accelerate/FSDP."""
+
+    if not isinstance(distributed, dict):
+        raise ConfigError("distributed must be a mapping")
+    fsdp = distributed.get("fsdp")
+    if not isinstance(fsdp, dict):
+        raise ConfigError("distributed.fsdp must be configured")
+    for key in (
+        "cpu_offload",
+        "activation_checkpointing",
+        "use_orig_params",
+        "limit_all_gathers",
+        "cpu_ram_efficient_loading",
+        "sync_module_states",
+    ):
+        if key in fsdp and not isinstance(fsdp[key], bool):
+            raise ConfigError(f"distributed.fsdp.{key} must be true or false")
+    class_names = fsdp.get("transformer_cls_names_to_wrap")
+    if class_names is not None:
+        if not isinstance(class_names, list) or not all(isinstance(item, str) and item for item in class_names):
+            raise ConfigError("distributed.fsdp.transformer_cls_names_to_wrap must be a list of strings")
+
+
+def validate_mlflow_async_logging(mlflow: dict[str, Any]) -> None:
+    """Validate optional asynchronous MLflow/registry logging settings."""
+
+    async_logging = mlflow.get("async_logging")
+    if async_logging is None:
+        return
+    if not isinstance(async_logging, dict):
+        raise ConfigError("mlflow.async_logging must be a mapping")
+    if not isinstance(async_logging.get("enabled"), bool):
+        raise ConfigError("mlflow.async_logging.enabled must be true or false")
+    if "queue_max_items" in async_logging:
+        _require_positive_int(async_logging["queue_max_items"], "mlflow.async_logging.queue_max_items")
+    if "flush_timeout_seconds" in async_logging:
+        _require_positive_int(async_logging["flush_timeout_seconds"], "mlflow.async_logging.flush_timeout_seconds")
+    if "fail_on_worker_error" in async_logging and not isinstance(async_logging["fail_on_worker_error"], bool):
+        raise ConfigError("mlflow.async_logging.fail_on_worker_error must be true or false")
+
+
+def validate_adamw_betas(value: Any) -> None:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ConfigError("training.adamw_betas must be a two-item list")
+    for index, beta in enumerate(value):
+        try:
+            parsed = float(beta)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("training.adamw_betas values must be floats") from exc
+        if parsed < 0.0 or parsed >= 1.0:
+            raise ConfigError(f"training.adamw_betas[{index}] must be >= 0 and < 1")
+
+
 def validate_tokenizer_source(tokenizer: dict[str, Any]) -> None:
     """Validate tokenizer source selection while keeping tokenizer params separate."""
 
@@ -184,3 +298,13 @@ def validate_tokenizer_source(tokenizer: dict[str, Any]) -> None:
         raise ConfigError("tokenizer.source must be model or explicit")
     if mode == "explicit" and not tokenizer.get("tokenizer_id"):
         raise ConfigError("tokenizer.tokenizer_id must be configured when tokenizer.source=explicit")
+
+
+def _require_positive_int(value: Any, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
+    return parsed

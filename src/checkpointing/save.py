@@ -1,12 +1,76 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
-from .atomic import atomic_checkpoint_dir
+from checkpointing.checksums import directory_checksums
+from trainer.state import TrainerState
+
+from .atomic import atomic_checkpoint_dir, commit_atomic_checkpoint_dir, reset_tmp_checkpoint_dir
 
 
-def prepare_atomic_save(path: str | Path) -> Path:
-    tmp, _ = atomic_checkpoint_dir(path)
-    tmp.mkdir(parents=True, exist_ok=False)
-    return tmp
+def checkpoint_dir_name(global_step: int) -> str:
+    return f"step-{int(global_step):06d}"
 
+
+def save_adapter_checkpoint(
+    *,
+    root_dir: str | Path,
+    model: Any,
+    state: TrainerState,
+    metrics: dict[str, Any] | None = None,
+    accelerator: Any,
+    config_hashes: dict[str, str] | None = None,
+) -> Path:
+    """Atomically save an adapter-only Accelerate/FSDP checkpoint package."""
+
+    final_dir = Path(root_dir) / checkpoint_dir_name(state.global_step)
+    tmp_dir, final_dir = atomic_checkpoint_dir(final_dir)
+    is_main_process = bool(accelerator.is_main_process)
+    if is_main_process:
+        tmp_dir = reset_tmp_checkpoint_dir(tmp_dir)
+    accelerator.wait_for_everyone()
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    adapter_dir = tmp_dir / "adapter"
+    if not hasattr(unwrapped_model, "save_pretrained"):
+        raise TypeError("adapter checkpointing requires model.save_pretrained")
+    unwrapped_model.save_pretrained(
+        adapter_dir,
+        is_main_process=is_main_process,
+        save_function=accelerator.save,
+        state_dict=accelerator.get_state_dict(model),
+    )
+
+    accelerator.wait_for_everyone()
+
+    accelerator.save_state(str(tmp_dir / "accelerate_state"))
+    accelerator.wait_for_everyone()
+
+    if not is_main_process:
+        accelerator.wait_for_everyone()
+        return final_dir
+
+    manifest = {
+        "format_version": 1,
+        "global_step": state.global_step,
+        "validation_index": state.validation_index,
+        "checkpoint_index": state.checkpoint_index,
+        "consumed_batches": state.consumed_batches,
+        "adapter_path": "adapter",
+        "metrics": metrics or {},
+        "config_hashes": config_hashes or {},
+    }
+    _write_json(tmp_dir / "trainer_state.json", state.to_dict())
+    _write_json(tmp_dir / "metrics.json", metrics or {})
+    _write_json(tmp_dir / "manifest.json", manifest)
+    _write_json(tmp_dir / "checksums.json", directory_checksums(tmp_dir))
+
+    committed = commit_atomic_checkpoint_dir(tmp_dir, final_dir)
+    accelerator.wait_for_everyone()
+    return committed
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")

@@ -10,6 +10,7 @@ from preprocessing.io import PretokSplitResult, debug_path, load_manifest
 from tracking.lineage import collect_code_metadata, collect_tracking_lineage
 from tracking.model_source import ModelSourceResolution, resolve_model_source
 from tracking.params import flatten_config_params
+from tracking.async_worker import AsyncTrackingWorker
 
 
 class ExperimentTracker:
@@ -69,7 +70,7 @@ class ExperimentTracker:
         model = self.config.section("model")
         code = collect_code_metadata(Path.cwd())
         tags = {
-            "stage": "startup_preprocessing",
+            "stage": "training_pipeline",
             "project.name": str(project.get("name")),
             "project.run_name": str(project.get("run_name")),
             "model.base_model_id": str(model.get("base_model_id")),
@@ -178,6 +179,21 @@ class ExperimentTracker:
             if isinstance(loss_kind_counts, dict):
                 for loss_kind, count in loss_kind_counts.items():
                     self.mlflow.log_metric(f"dataloader/{split}/loss_kind/{loss_kind}", int(count))
+
+    def create_async_worker(self) -> AsyncTrackingWorker | None:
+        """Create a CPU-only async worker for metrics, artifacts, and registry jobs."""
+
+        async_config = self.mlflow_config.get("async_logging")
+        if not self.enabled or not isinstance(async_config, dict) or not async_config.get("enabled"):
+            return None
+        if self.run is None:
+            raise RuntimeError("MLflow run must be active before creating async tracking worker")
+        return AsyncTrackingWorker(
+            tracking_uri=self.tracking_uri,
+            run_id=self.run.info.run_id,
+            queue_max_items=int(async_config.get("queue_max_items", 1024)),
+            fail_on_worker_error=bool(async_config.get("fail_on_worker_error", True)),
+        )
 
     def _log_params(self, params: dict[str, str]) -> None:
         """Log params in small batches for MLflow backends with request limits."""
