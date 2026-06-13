@@ -12,6 +12,7 @@ def test_preprocess_config_loads_and_configures_reasoning_switch():
     assert config.reasoning["enable_thinking"] is False
     assert config.section("model")["use_fp8_base"] is False
     assert config.sequence["truncation"] is False
+    assert config.section("training")["drop_last"] is False
     assert config.preprocessing["output"]["debug_examples_per_loss_kind"] == 5
 
 

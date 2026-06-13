@@ -1,2 +1,1 @@
-"""Loss-routed batch sampling and resume state."""
-
+"""Future trainer-side sampling schedules and resume state."""

@@ -89,6 +89,10 @@ def validate_config(raw: dict[str, Any]) -> TrainingConfig:
     if sequence.get("packing") is not False:
         raise ConfigError("preprocessing.sequence.packing must stay false until packing mask tests exist")
 
+    training = raw["training"]
+    if "drop_last" in training and not isinstance(training["drop_last"], bool):
+        raise ConfigError("training.drop_last must be true or false")
+
     registry = raw["registry"]
     if registry.get("promote_best_to") is not None:
         raise ConfigError("registry.promote_best_to must be null during ordinary training")
