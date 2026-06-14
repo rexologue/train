@@ -66,7 +66,9 @@ def resolve_resume_checkpoint(config) -> Path | None:
     if raw_path in (None, "", "auto"):
         return find_latest_checkpoint(config.section("checkpointing")["root_dir"])
     path = Path(raw_path)
-    return path if path.exists() else None
+    if not path.exists():
+        raise FileNotFoundError(f"explicit resume checkpoint does not exist: {path}")
+    return path
 
 
 def build_resume_hashes(config, *, tokenizer=None) -> dict[str, str]:
@@ -104,6 +106,37 @@ def load_trainer_state(checkpoint_dir: str | Path) -> TrainerState:
     if not path.exists():
         raise FileNotFoundError(f"missing trainer_state.json in checkpoint: {checkpoint_dir}")
     return TrainerState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def load_training_state_without_model(*, accelerator, model, optimizer, input_dir: str | Path) -> None:
+    """Restore optimizer/scheduler/RNG state after base model + adapter loading."""
+
+    if not hasattr(accelerator, "distributed_type"):
+        accelerator.load_state(str(input_dir))
+        return
+
+    from accelerate.checkpointing import load_accelerator_state
+    from accelerate.utils import DistributedType
+
+    optimizers = [optimizer]
+    if accelerator.distributed_type == DistributedType.FSDP:
+        from accelerate.utils.fsdp_utils import load_fsdp_optimizer
+
+        load_fsdp_optimizer(accelerator.state.fsdp_plugin, accelerator, optimizer, model, str(input_dir), 0)
+        optimizers = []
+
+    overrides = load_accelerator_state(
+        str(input_dir),
+        models=[],
+        optimizers=optimizers,
+        schedulers=list(getattr(accelerator, "_schedulers", [])),
+        dataloaders=list(getattr(accelerator, "_dataloaders", [])),
+        process_index=int(accelerator.process_index),
+        scaler=getattr(accelerator, "scaler", None),
+        map_location="on_device" if getattr(accelerator, "num_processes", 1) > 1 else "cpu",
+    )
+    if "step" in overrides:
+        accelerator.step = overrides["step"]
 
 
 def load_checkpoint_manifest(checkpoint_dir: str | Path) -> dict:

@@ -99,3 +99,21 @@ def test_adamw_betas_must_be_two_valid_floats():
 
     with pytest.raises(ConfigError, match="training.adamw_betas"):
         validate_config(raw)
+
+
+def test_frozen_lm_head_cannot_be_lora_module_to_save():
+    raw = copy.deepcopy(load_config("configs/config.preprocess.yaml").raw)
+    raw["training"]["enabled"] = True
+    raw["lora"]["modules_to_save"] = ["lm_head"]
+
+    with pytest.raises(ConfigError, match="freeze_lm_head"):
+        validate_config(raw)
+
+
+def test_cpu_ram_efficient_loading_requires_module_state_sync():
+    raw = copy.deepcopy(load_config("configs/config.preprocess.yaml").raw)
+    raw["distributed"]["fsdp"]["cpu_ram_efficient_loading"] = True
+    raw["distributed"]["fsdp"]["sync_module_states"] = False
+
+    with pytest.raises(ConfigError, match="requires sync_module_states=true"):
+        validate_config(raw)

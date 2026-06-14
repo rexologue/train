@@ -43,7 +43,7 @@ class ExperimentTracker:
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         if self.enabled and self.mlflow is not None:
-            self.mlflow.end_run()
+            self.mlflow.end_run(status="FAILED" if exc_type is not None else "FINISHED")
 
     def resolve_model_source(self) -> ModelSourceResolution:
         """Resolve/pull the configured model source and log the result."""
@@ -192,6 +192,7 @@ class ExperimentTracker:
             tracking_uri=self.tracking_uri,
             run_id=self.run.info.run_id,
             queue_max_items=int(async_config.get("queue_max_items", 1024)),
+            flush_timeout_seconds=float(async_config.get("flush_timeout_seconds", 300)),
             fail_on_worker_error=bool(async_config.get("fail_on_worker_error", True)),
         )
 

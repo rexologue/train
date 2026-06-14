@@ -11,13 +11,16 @@ from config import load_config
 from checkpointing import (
     adapter_dir,
     build_resume_hashes,
+    list_checkpoints,
+    load_checkpoint_manifest,
+    load_training_state_without_model,
     load_trainer_state,
     prune_old_checkpoints,
     resolve_resume_checkpoint,
     save_adapter_checkpoint,
     validate_resume_checkpoint,
 )
-from data.dataloaders import build_dataloaders
+from data.dataloaders import build_dataloaders, validate_sft_only_training_inputs
 from data.inspection import inspect_random_batch
 from eval.bfcl import run_bfcl_eval
 from eval.ordinary import run_standard_eval
@@ -32,7 +35,7 @@ from trainer.modeling import build_training_objects, load_tokenizer
 from trainer.progress import TrainingProgress
 from trainer.state import TrainerState
 from trainer.trainer import RoutedTrainer
-from utils.logging import get_logger
+from utils.logging import configure_logging, get_logger
 from utils.seed import set_seed
 
 
@@ -62,6 +65,7 @@ def main() -> None:
     runtime = create_accelerator(config) if should_train else None
     accelerator = runtime.accelerator if runtime is not None else None
     is_main_process = bool(getattr(accelerator, "is_main_process", True)) if accelerator is not None else True
+    configure_logging(is_main_process=is_main_process)
 
     tracker = ExperimentTracker.from_config(config)
     if not is_main_process:
@@ -132,6 +136,7 @@ def main() -> None:
             logger.info("startup preprocessing and dataloader build complete; training skipped")
             return
 
+        validate_sft_only_training_inputs(config, dataloaders)
         run_training(config, dataloaders, tracker, runtime=runtime)
 
     logger.info("training pipeline complete")
@@ -171,16 +176,22 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
     state = load_trainer_state(resume_checkpoint) if resume_checkpoint is not None else TrainerState()
     if resume_checkpoint is not None:
         accelerate_state = Path(resume_checkpoint) / "accelerate_state"
-        if accelerate_state.exists():
-            accelerator.load_state(str(accelerate_state))
+        if not accelerate_state.exists():
+            raise FileNotFoundError(f"resume checkpoint has no accelerate_state: {accelerate_state}")
+        load_training_state_without_model(
+            accelerator=accelerator,
+            model=model,
+            optimizer=optimizer,
+            input_dir=accelerate_state,
+        )
+    else:
+        from accelerate.utils import set_seed as set_accelerate_seed
+
+        set_accelerate_seed(int(config.section("project").get("seed", 0)), device_specific=True)
 
     async_worker = tracker.create_async_worker()
     async_context = async_worker if async_worker is not None else nullcontext()
-    registry_selector = (
-        CandidateWindowSelector.from_config(config)
-        if bool(config.section("registry").get("enabled", False))
-        else None
-    )
+    registry_selector = restore_registry_selector(config, state) if bool(config.section("registry").get("enabled", False)) else None
     progress_config = config.section("progress") if "progress" in config.raw else {}
     progress = TrainingProgress(
         total_steps=int(config.section("training")["max_steps"]),
@@ -236,6 +247,7 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
         checkpoint_path = save_adapter_checkpoint(
             root_dir=checkpointing["root_dir"],
             model=model,
+            optimizer=optimizer,
             state=state,
             metrics=metrics,
             accelerator=accelerator,
@@ -311,6 +323,48 @@ def maybe_register_candidate(
     else:
         subprocess.run(args, check=True)
     return decision
+
+
+def restore_registry_selector(config, state: TrainerState) -> CandidateWindowSelector:
+    """Restore candidate numbering and an incomplete selection window after resume."""
+
+    registry = config.section("registry")
+    window_size = int(registry["register_every_n_checkpoints"])
+    selector = CandidateWindowSelector.from_config(
+        config,
+        next_candidate_index=state.checkpoint_index // window_size + 1,
+    )
+    pending_count = state.checkpoint_index % window_size
+    if pending_count == 0:
+        return selector
+
+    first_pending_index = state.checkpoint_index - pending_count + 1
+    restored = []
+    for checkpoint_path in list_checkpoints(config.section("checkpointing")["root_dir"]):
+        manifest = load_checkpoint_manifest(checkpoint_path)
+        checkpoint_index = int(manifest.get("checkpoint_index", 0))
+        if checkpoint_index < first_pending_index or checkpoint_index > state.checkpoint_index:
+            continue
+        metrics = manifest.get("metrics")
+        if not isinstance(metrics, dict):
+            metrics = {}
+        restored.append((checkpoint_index, checkpoint_path, manifest, metrics))
+
+    if len(restored) != pending_count:
+        raise FileNotFoundError(
+            "cannot restore incomplete registry selection window: "
+            f"expected {pending_count} checkpoints, found {len(restored)}"
+        )
+    for checkpoint_index, checkpoint_path, manifest, metrics in sorted(restored):
+        decision = selector.observe_checkpoint(
+            checkpoint_path=checkpoint_path,
+            checkpoint_index=checkpoint_index,
+            global_step=int(manifest["global_step"]),
+            metrics=metrics,
+        )
+        if decision is not None:
+            raise RuntimeError("restoring an incomplete registry selection window unexpectedly produced a decision")
+    return selector
 
 
 def configure_model_source_without_side_effects(config) -> None:

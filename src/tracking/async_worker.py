@@ -29,11 +29,15 @@ class AsyncTrackingWorker:
         tracking_uri: str | None = None,
         run_id: str | None = None,
         queue_max_items: int = 1024,
+        flush_timeout_seconds: float = 300,
         fail_on_worker_error: bool = True,
         client_factory: ClientFactory | None = None,
     ):
         self.tracking_uri = tracking_uri
         self.run_id = run_id
+        self.flush_timeout_seconds = float(flush_timeout_seconds)
+        if self.flush_timeout_seconds <= 0:
+            raise ValueError("flush_timeout_seconds must be positive")
         self.fail_on_worker_error = fail_on_worker_error
         self.client_factory = client_factory
         self._jobs: queue.Queue[tuple[str, JobFn] | None] = queue.Queue(maxsize=queue_max_items)
@@ -55,25 +59,36 @@ class AsyncTrackingWorker:
         if self._closed:
             raise RuntimeError("async tracking worker is closed")
         self.start()
-        self._jobs.put((name, fn))
+        try:
+            self._jobs.put((name, fn), timeout=self.flush_timeout_seconds)
+        except queue.Full as exc:
+            raise TimeoutError(f"async tracking queue remained full for {self.flush_timeout_seconds:g}s") from exc
 
     def flush(self) -> None:
-        self._jobs.join()
+        completed = threading.Event()
+        self.enqueue("worker.flush", completed.set)
+        if not completed.wait(self.flush_timeout_seconds):
+            raise TimeoutError(f"async tracking flush timed out after {self.flush_timeout_seconds:g}s")
         self._raise_if_needed()
 
     def close(self) -> None:
         if self._closed:
             return
         flush_error: BaseException | None = None
-        self._jobs.join()
         try:
-            self._raise_if_needed()
+            self.flush()
         except BaseException as exc:  # noqa: BLE001 - close must still stop the worker.
             flush_error = exc
         self._closed = True
-        self._jobs.put(None)
+        try:
+            self._jobs.put(None, timeout=self.flush_timeout_seconds)
+        except queue.Full:
+            if flush_error is None:
+                flush_error = TimeoutError("async tracking worker could not enqueue shutdown")
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=self.flush_timeout_seconds)
+            if self._thread.is_alive() and flush_error is None:
+                flush_error = TimeoutError("async tracking worker did not stop before timeout")
         if flush_error is not None:
             raise flush_error
         self._raise_if_needed()
@@ -118,7 +133,13 @@ class AsyncTrackingWorker:
 
     def run_modelctl_register(self, args: list[str]) -> None:
         def task() -> None:
-            subprocess.run(args, check=True, capture_output=True, text=True)
+            subprocess.run(
+                args,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.flush_timeout_seconds,
+            )
 
         self.enqueue("modelctl.register", task)
 

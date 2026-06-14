@@ -108,7 +108,15 @@ def validate_config(raw: dict[str, Any]) -> TrainingConfig:
         raise ConfigError("training.drop_last must be true or false")
     if "adamw_betas" in training:
         validate_adamw_betas(training["adamw_betas"])
-    validate_lora(raw.get("lora"), training_enabled=bool(training.get("enabled", True)))
+    for key in ("max_steps", "per_device_train_batch_size", "gradient_accumulation_steps"):
+        _require_positive_int(training.get(key), f"training.{key}")
+    _require_positive_float(training.get("learning_rate"), "training.learning_rate")
+    warmup_ratio = float(training.get("warmup_ratio", 0.0))
+    if warmup_ratio < 0.0 or warmup_ratio > 1.0:
+        raise ConfigError("training.warmup_ratio must be between 0 and 1")
+    if float(training.get("max_grad_norm", 0.0)) < 0.0:
+        raise ConfigError("training.max_grad_norm must be >= 0")
+    validate_lora(raw.get("lora"), model=model, training_enabled=bool(training.get("enabled", True)))
 
     eval_config = raw.get("eval")
     if eval_config is not None:
@@ -176,7 +184,7 @@ def validate_model_source(model: dict[str, Any]) -> None:
             raise ConfigError(f"model.source.{key} must be true or false")
 
 
-def validate_lora(lora: Any, *, training_enabled: bool) -> None:
+def validate_lora(lora: Any, *, model: dict[str, Any], training_enabled: bool) -> None:
     if lora is None:
         return
     if not isinstance(lora, dict):
@@ -190,6 +198,11 @@ def validate_lora(lora: Any, *, training_enabled: bool) -> None:
     target_modules = lora.get("target_modules")
     if not isinstance(target_modules, list) or not target_modules or not all(isinstance(item, str) and item for item in target_modules):
         raise ConfigError("lora.target_modules must be a non-empty list of module names when training is enabled")
+    modules_to_save = lora.get("modules_to_save") or []
+    if not isinstance(modules_to_save, list) or not all(isinstance(item, str) and item for item in modules_to_save):
+        raise ConfigError("lora.modules_to_save must be a list of module names")
+    if bool(model.get("freeze_lm_head", False)) and "lm_head" in modules_to_save:
+        raise ConfigError("lora.modules_to_save cannot include lm_head when model.freeze_lm_head=true")
 
 
 def validate_lineage(lineage: dict[str, Any]) -> None:
@@ -258,6 +271,12 @@ def validate_distributed(distributed: dict[str, Any]) -> None:
     if class_names is not None:
         if not isinstance(class_names, list) or not all(isinstance(item, str) and item for item in class_names):
             raise ConfigError("distributed.fsdp.transformer_cls_names_to_wrap must be a list of strings")
+    if fsdp.get("cpu_ram_efficient_loading") and fsdp.get("sync_module_states") is not True:
+        raise ConfigError("distributed.fsdp.cpu_ram_efficient_loading=true requires sync_module_states=true")
+    if fsdp.get("state_dict_type") != "sharded_state_dict":
+        raise ConfigError("distributed.fsdp.state_dict_type must be sharded_state_dict for distributed optimizer state")
+    if fsdp.get("use_orig_params") is not True:
+        raise ConfigError("distributed.fsdp.use_orig_params must be true for mixed frozen/trainable PEFT parameters")
 
 
 def validate_mlflow_async_logging(mlflow: dict[str, Any]) -> None:
@@ -307,4 +326,14 @@ def _require_positive_int(value: Any, name: str) -> int:
         raise ConfigError(f"{name} must be a positive integer") from exc
     if parsed <= 0:
         raise ConfigError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _require_positive_float(value: Any, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a positive number") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{name} must be a positive number")
     return parsed

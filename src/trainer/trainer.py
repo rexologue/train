@@ -171,11 +171,19 @@ class RoutedTrainer:
 
             state.global_step += 1
             elapsed = max(time.monotonic() - step_started_at, 1e-9)
+            step_totals = _gather_step_totals(
+                self.accelerator,
+                accumulated_loss=accumulated_loss,
+                samples=step_samples,
+                tokens=step_tokens,
+                supervised_tokens=step_supervised_tokens,
+                elapsed=elapsed,
+            )
             metrics = {
-                "train/loss": accumulated_loss / grad_accum,
-                "train/samples_per_second": step_samples / elapsed,
-                "train/tokens_per_second": step_tokens / elapsed,
-                "train/supervised_tokens_per_second": step_supervised_tokens / elapsed,
+                "train/loss": step_totals["accumulated_loss"] / (grad_accum * step_totals["processes"]),
+                "train/samples_per_second": step_totals["samples"] / step_totals["elapsed"],
+                "train/tokens_per_second": step_totals["tokens"] / step_totals["elapsed"],
+                "train/supervised_tokens_per_second": step_totals["supervised_tokens"] / step_totals["elapsed"],
             }
             lr = _current_lr(optimizer)
             if lr is not None:
@@ -234,6 +242,44 @@ def _current_lr(optimizer: Any) -> float | None:
     if not param_groups:
         return None
     return float(param_groups[0].get("lr", 0.0))
+
+
+def _gather_step_totals(
+    accelerator: Any,
+    *,
+    accumulated_loss: float,
+    samples: int,
+    tokens: int,
+    supervised_tokens: int,
+    elapsed: float,
+) -> dict[str, float]:
+    """Aggregate training metrics across ranks without changing gradient semantics."""
+
+    if not hasattr(accelerator, "gather_for_metrics"):
+        return {
+            "accumulated_loss": float(accumulated_loss),
+            "samples": float(samples),
+            "tokens": float(tokens),
+            "supervised_tokens": float(supervised_tokens),
+            "elapsed": float(elapsed),
+            "processes": 1.0,
+        }
+
+    import torch
+
+    values = torch.tensor(
+        [float(accumulated_loss), float(samples), float(tokens), float(supervised_tokens), float(elapsed)],
+        device=accelerator.device,
+    )
+    gathered = accelerator.gather_for_metrics(values).reshape(-1, 5)
+    return {
+        "accumulated_loss": float(gathered[:, 0].sum().item()),
+        "samples": float(gathered[:, 1].sum().item()),
+        "tokens": float(gathered[:, 2].sum().item()),
+        "supervised_tokens": float(gathered[:, 3].sum().item()),
+        "elapsed": max(float(gathered[:, 4].max().item()), 1e-9),
+        "processes": float(gathered.shape[0]),
+    }
 
 
 def _advance_iterator(iterator: Any, iterable: Iterable[Any], consumed_batches: int) -> Any:

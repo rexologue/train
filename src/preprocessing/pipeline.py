@@ -38,6 +38,7 @@ ASSISTANT_HEADER = "<|im_start|>assistant\n"
 IM_END = "<|im_end|>"
 THINK_BLOCK_RE = re.compile(r"<think>\s*(.*?)\s*</think>\s*", re.IGNORECASE | re.DOTALL)
 UNKNOWN_MODEL_CONTEXT_THRESHOLD = 1_000_000_000
+PREPROCESSING_SCHEMA_VERSION = 2
 
 
 def load_tokenizer(config: TrainingConfig) -> Any:
@@ -92,6 +93,29 @@ def validate_configured_max_seq_len(config: TrainingConfig, tokenizer: Any) -> i
     if model_context is not None and max_seq_len > model_context:
         raise ValueError(f"preprocessing.sequence.max_seq_len={max_seq_len} exceeds tokenizer model_max_length={model_context}")
     return max_seq_len
+
+
+def build_preprocessing_signature(config: TrainingConfig, tokenizer: Any) -> str:
+    """Hash the per-split tokenization/masking contract used for cache reuse."""
+
+    tokenizer_config = config.section("tokenizer")
+    return stable_hash(
+        {
+            "schema_version": PREPROCESSING_SCHEMA_VERSION,
+            "sequence": config.sequence,
+            "rendering": config.rendering,
+            "reasoning": config.reasoning,
+            "masking": config.preprocessing["masking"],
+            "tokenizer": {
+                "effective_id": effective_tokenizer_id(config),
+                "revision": tokenizer_config.get("tokenizer_revision"),
+                "use_fast": bool(tokenizer_config.get("use_fast", True)),
+                "add_special_tokens": bool(tokenizer_config.get("add_special_tokens", False)),
+                "class": tokenizer.__class__.__name__,
+                "chat_template_hash": sha256_text(getattr(tokenizer, "chat_template", "") or ""),
+            },
+        }
+    )
 
 
 def enforce_max_seq_len(processed: dict[str, Any], max_seq_len: int) -> None:
@@ -319,7 +343,7 @@ def select_sft_loss_blocks(
     stats: Counter[str] = Counter()
     include_thinking = bool(config.reasoning["enable_thinking"])
 
-    for assistant_order, (message_index, (start, _end, body)) in enumerate(zip(assistant_indices, blocks)):
+    for assistant_order, (message_index, (start, end, body)) in enumerate(zip(assistant_indices, blocks)):
         ranges, text, removed = assistant_loss_segments(start, body, include_thinking=include_thinking)
         stats["removed_think_blocks_from_loss"] += removed
         if row["loss_kind"] == "sft_tool":
@@ -342,6 +366,7 @@ def select_sft_loss_blocks(
                     stats["sft_target_short_kept"] += 1
         if keep:
             supervised_ranges.extend(ranges)
+            supervised_ranges.append((end, end + len(IM_END)))
             selected.append(
                 {
                     "assistant_order": assistant_order,
@@ -426,8 +451,9 @@ def last_assistant_loss_ranges(rendered: str, *, include_thinking: bool) -> tupl
     blocks = assistant_blocks(rendered)
     if not blocks:
         raise ValueError("rendered DPO completion has no assistant block")
-    start, _end, body = blocks[-1]
-    return assistant_loss_segments(start, body, include_thinking=include_thinking)
+    start, end, body = blocks[-1]
+    ranges, text, removed = assistant_loss_segments(start, body, include_thinking=include_thinking)
+    return [*ranges, (end, end + len(IM_END))], text + IM_END, removed
 
 
 def _preprocess_dpo_dataset_row(row: dict[str, Any], tokenizer: Any, config: TrainingConfig) -> tuple[dict[str, Any], dict[str, Any], Counter[str]]:
@@ -505,6 +531,7 @@ def preprocess_split(
     config: TrainingConfig,
     *,
     force: bool = False,
+    preprocessing_signature: str | None = None,
 ) -> PretokSplitResult:
     """Prepare or reuse one pretokenized split cache.
 
@@ -526,7 +553,7 @@ def preprocess_split(
     max_seq_len = configured_max_seq_len(config)
     reuse = bool(config.preprocessing["output"].get("reuse_if_hash_matches", True))
     if reuse and not force:
-        valid, manifest = split_cache_is_valid(output_dir, split, raw_hash)
+        valid, manifest = split_cache_is_valid(output_dir, split, raw_hash, preprocessing_signature)
         if valid and manifest is not None:
             logger.info("reusing pretokenized %s split from %s", split, pretok_path)
             row_counts = (manifest.get("rows") or {}).get(split) or {}
@@ -591,6 +618,7 @@ def preprocess_split(
         "rejected_counts": dict(rejected_counts),
         "rejected": rejected_rows,
         "stats": dict(stats),
+        "preprocessing_signature": preprocessing_signature,
     }
     write_split_cache(
         output_dir,
@@ -627,6 +655,7 @@ def prepare_pretokenized_splits(
     tokenizer = load_tokenizer(config)
     max_seq_len = validate_configured_max_seq_len(config, tokenizer)
     model_context = tokenizer_model_context(tokenizer)
+    preprocessing_signature = build_preprocessing_signature(config, tokenizer)
     logger.info(
         "tokenizer loaded: class=%s fast=%s template_hash=%s max_seq_len=%s model_context=%s",
         tokenizer.__class__.__name__,
@@ -638,7 +667,16 @@ def prepare_pretokenized_splits(
 
     results: list[PretokSplitResult] = []
     for split, raw_path in resolve_split_paths(config, splits):
-        results.append(preprocess_split(split, raw_path, tokenizer, config, force=force))
+        results.append(
+            preprocess_split(
+                split,
+                raw_path,
+                tokenizer,
+                config,
+                force=force,
+                preprocessing_signature=preprocessing_signature,
+            )
+        )
     return results
 
 

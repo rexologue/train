@@ -18,6 +18,7 @@ def save_adapter_checkpoint(
     *,
     root_dir: str | Path,
     model: Any,
+    optimizer: Any | None = None,
     state: TrainerState,
     metrics: dict[str, Any] | None = None,
     accelerator: Any,
@@ -45,7 +46,12 @@ def save_adapter_checkpoint(
 
     accelerator.wait_for_everyone()
 
-    accelerator.save_state(str(tmp_dir / "accelerate_state"))
+    save_training_state_without_model(
+        accelerator=accelerator,
+        model=model,
+        optimizer=optimizer if optimizer is not None else getattr(accelerator, "_optimizers", [None])[0],
+        output_dir=tmp_dir / "accelerate_state",
+    )
     accelerator.wait_for_everyone()
 
     if not is_main_process:
@@ -74,3 +80,36 @@ def save_adapter_checkpoint(
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def save_training_state_without_model(*, accelerator: Any, model: Any, optimizer: Any, output_dir: str | Path) -> None:
+    """Save optimizer/scheduler/RNG state without duplicating the fixed base model."""
+
+    if optimizer is None or not hasattr(accelerator, "distributed_type"):
+        accelerator.save_state(str(output_dir))
+        return
+
+    from accelerate.checkpointing import save_accelerator_state
+    from accelerate.utils import DistributedType
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    optimizers = [optimizer]
+    if accelerator.distributed_type == DistributedType.FSDP:
+        from accelerate.utils.fsdp_utils import save_fsdp_optimizer
+
+        save_fsdp_optimizer(accelerator.state.fsdp_plugin, accelerator, optimizer, model, str(output_path), 0)
+        optimizers = []
+
+    save_accelerator_state(
+        str(output_path),
+        model_states=[],
+        optimizers=optimizers,
+        schedulers=list(getattr(accelerator, "_schedulers", [])),
+        dataloaders=list(getattr(accelerator, "_dataloaders", [])),
+        process_index=int(accelerator.process_index),
+        step=int(accelerator.step),
+        scaler=getattr(accelerator, "scaler", None),
+        save_on_each_node=bool(accelerator.project_configuration.save_on_each_node),
+        safe_serialization=True,
+    )

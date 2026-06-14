@@ -8,7 +8,7 @@ import torch
 from config import load_config
 from trainer.callbacks import TrainerHooks
 from trainer.state import TrainerState
-from trainer.trainer import RoutedTrainer, TrainerCadence
+from trainer.trainer import RoutedTrainer, TrainerCadence, _gather_step_totals
 
 
 class DummyModel(torch.nn.Module):
@@ -206,3 +206,30 @@ def test_routed_trainer_respects_eval_disabled():
     assert state.global_step == 2
     assert state.validation_index == 0
     assert events == []
+
+
+def test_training_step_metrics_are_aggregated_across_ranks():
+    class GatherAccelerator:
+        device = torch.device("cpu")
+
+        def gather_for_metrics(self, values):
+            remote = torch.tensor([4.0, 3.0, 7.0, 5.0, 2.0])
+            return torch.cat([values, remote])
+
+    totals = _gather_step_totals(
+        GatherAccelerator(),
+        accumulated_loss=2.0,
+        samples=1,
+        tokens=3,
+        supervised_tokens=2,
+        elapsed=1.0,
+    )
+
+    assert totals == {
+        "accumulated_loss": 6.0,
+        "samples": 4.0,
+        "tokens": 10.0,
+        "supervised_tokens": 7.0,
+        "elapsed": 2.0,
+        "processes": 2.0,
+    }

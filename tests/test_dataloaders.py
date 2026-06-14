@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from config import load_config
-from data.dataloaders import build_dataloaders
+from data.dataloaders import build_dataloaders, validate_sft_only_training_inputs
 from data.inspection import inspect_random_batch
 from preprocessing.io import PretokSplitResult
 
@@ -127,3 +127,19 @@ def test_inspect_random_batch_reports_shapes_and_element(tmp_path):
     tensor_previews = [value for value in report["element"].values() if isinstance(value, dict) and value.get("num_values")]
     assert tensor_previews
     assert all(len(preview["values"]) <= 1 for preview in tensor_previews)
+
+
+def test_sft_only_training_rejects_dpo_rows(tmp_path):
+    train_path = tmp_path / "train.parquet"
+    valid_path = tmp_path / "valid.parquet"
+    _write_pretok(train_path)
+    _write_pretok(valid_path)
+    config = load_config("configs/config.preprocess.yaml")
+    bundle = build_dataloaders(
+        config,
+        [_pretok_result("train", train_path), _pretok_result("valid", valid_path)],
+        pad_token_id=0,
+    )
+
+    with pytest.raises(ValueError, match="does not support train loss kinds"):
+        validate_sft_only_training_inputs(config, bundle)

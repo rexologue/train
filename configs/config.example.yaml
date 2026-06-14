@@ -85,8 +85,7 @@ lora:
     - v_proj
     - o_proj
   # Дополнительные модули для сохранения вместе с adapter. Обычно пусто.
-  modules_to_save:
-    - lm_head
+  modules_to_save: []
 
 preprocessing:
   raw:
@@ -159,7 +158,8 @@ training:
   max_steps: 100
   # Batch size на один process/GPU до gradient accumulation.
   per_device_train_batch_size: 1
-  # false сохраняет короткие хвостовые routed batches.
+  # false сохраняет короткие хвостовые routed batches. При batch_size>1 SFT-only
+  # startup требует отсутствие коротких route tails, иначе нужен drop_last=true.
   drop_last: false
   # Сколько micro-batches копить перед optimizer.step().
   gradient_accumulation_steps: 16
@@ -207,8 +207,8 @@ distributed:
     # реальный class name в transformers 4.57.0.dev0: Qwen3_5MoeDecoderLayer.
     transformer_cls_names_to_wrap:
       - Qwen3_5MoeDecoderLayer
-    # Экономная загрузка модели по CPU RAM. Обычно требует корректной distributed init.
-    cpu_ram_efficient_loading: false
+    # Только rank 0 загружает полные веса в CPU RAM; остальные ranks получают их через FSDP sync.
+    cpu_ram_efficient_loading: true
     # Синхронизировать параметры между ranks при init. Для FSDP обычно true.
     sync_module_states: true
 
@@ -241,7 +241,7 @@ eval:
     rows_out: eval/bfcl_rows.jsonl
 
 checkpointing:
-  # Где хранятся step-NNNNNN adapter checkpoints.
+  # Где хранятся step-NNNNNN adapter checkpoints и adapter-only training state.
   root_dir: checkpoints/dummy-qwen35-a3b-run
   # Save cadence в validation units, не в train steps.
   # 1 = каждый validation boundary, 2 = каждый второй validation boundary.

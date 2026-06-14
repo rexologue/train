@@ -13,7 +13,9 @@ import inspect
 import json
 import os
 import shutil
+import sys
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +25,6 @@ import mlflow
 from mlflow import MlflowClient
 from mlflow.exceptions import MlflowException
 
-from .generic_pyfunc import GenericDirectoryPyFunc
 from .tags import flatten_for_mlflow_tags
 
 DEFAULT_HOST = "localhost"
@@ -136,7 +137,7 @@ def register_model_directory(
         Registered model name in MLflow.
     kind:
         Registration mode: ``generic``, ``hf`` or ``pytorch``. Generic mode is
-        always directory-based and wraps the payload in a modelctl PyFunc model.
+        always directory-based and stores the payload as an opaque artifact-store directory.
     aliases:
         Aliases to point at the newly created version. When omitted, the first
         version receives ``baseline`` and ``champion``; later versions receive
@@ -180,7 +181,9 @@ def register_model_directory(
 
     general_tags = general_tags or {}
     training_tags = training_tags or {}
-    source_hash = hash_directory(source_path)
+    emit_status(f"hashing source directory: {source_path}")
+    source_hash = hash_directory(source_path, progress=True)
+    emit_status(f"source hash computed: {source_hash}")
     created_at = utc_now_iso()
 
     ensure_registered_model(client, name)
@@ -206,6 +209,7 @@ def register_model_directory(
     )
 
     run_name = f"register:{name}:{kind}"
+    emit_status(f"starting MLflow run: {run_name}")
     with mlflow.start_run(run_name=run_name) as run:
         run_id = run.info.run_id
         mlflow.set_tags(build_run_tags(name=name, kind=kind, source_hash=source_hash))
@@ -214,6 +218,7 @@ def register_model_directory(
         mlflow.log_dict(manifest, "modelctl_metadata/manifest.json")
         mlflow.log_params({"model_name": name, "kind": kind, "source_dir_hash": source_hash})
 
+        emit_status(f"logging model artifact: kind={kind}, artifact_path={DEFAULT_MODEL_ARTIFACT_NAME}")
         model_info = log_model_by_kind(
             source_path=source_path,
             kind=kind,
@@ -225,6 +230,7 @@ def register_model_directory(
         )
 
         source_uri = f"runs:/{run_id}/{DEFAULT_MODEL_ARTIFACT_NAME}"
+        emit_status(f"creating MLflow model version: name={name}, source={source_uri}")
         model_version = client.create_model_version(
             name=name,
             source=source_uri,
@@ -237,13 +243,16 @@ def register_model_directory(
     # ``models:/m-...`` and not every backend/search path reliably exposes tags
     # that were passed to ``create_model_version`` immediately. Re-setting them
     # through the dedicated API keeps the registry metadata stable.
+    emit_status(f"setting model version tags: name={name}, version={model_version.version}")
     for key, value in version_tags.items():
         client.set_model_version_tag(name=name, version=str(model_version.version), key=key, value=value)
 
+    emit_status(f"setting aliases: {selected_aliases}")
     for alias in selected_aliases:
         client.set_registered_model_alias(name=name, alias=alias, version=str(model_version.version))
 
     model_uri = f"models:/{name}/{model_version.version}"
+    emit_status(f"registered model version: name={name}, version={model_version.version}")
     return RegisterResult(
         name=name,
         version=str(model_version.version),
@@ -325,10 +334,41 @@ def pull_model(
         else:
             output_path.unlink()
 
-    with tempfile.TemporaryDirectory(prefix="modelctl_pull_") as temp_dir:
-        downloaded = Path(mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=temp_dir)).resolve()
-        source_to_copy = choose_pull_source(downloaded, payload_only=payload_only)
-        copy_path(source_to_copy, output_path)
+    client = MlflowClient()
+    model_version = resolve_model_version(client, ref)
+    source_uri = str(getattr(model_version, "source", None) or model_uri)
+    tags = dict(getattr(model_version, "tags", {}) or {})
+    kind = tags.get("modelctl.kind")
+    if payload_only and kind == "generic":
+        # Fast path for modelctl generic packages. Download the original payload
+        # artifact directly into a staging directory placed next to output_path,
+        # then rename it into place. This avoids downloading the whole package to
+        # /tmp and avoids holding two full payload copies on the destination host.
+        for artifact_uri in generic_payload_artifact_uris(source_uri):
+            try:
+                download_artifact_to_output(artifact_uri, output_path)
+                return PullResult(
+                    ref=ref,
+                    model_uri=model_uri,
+                    downloaded_path=None,
+                    output_path=str(output_path),
+                    payload_only=payload_only,
+                )
+            except Exception:
+                # Try the next known direct layout and fall back to full package extraction below.
+                if output_path.exists():
+                    if output_path.is_dir():
+                        shutil.rmtree(output_path)
+                    else:
+                        output_path.unlink()
+                continue
+
+    # Generic fallback and native model path. The download still lands next to the
+    # final destination rather than in system /tmp. If payload_only=True, the
+    # payload directory is moved out of the downloaded model package and the small
+    # metadata wrapper is discarded.
+    package_uri = model_uri if source_uri.startswith("models:/") else source_uri
+    download_model_package_to_output(package_uri, output_path, payload_only=payload_only)
 
     return PullResult(
         ref=ref,
@@ -415,28 +455,56 @@ def log_model_by_kind(
     raise ValueError(f"Unsupported kind: {kind}")
 
 
-def log_generic_model(source_path: Path, manifest: dict[str, Any], general_tags: dict[str, Any], training_tags: dict[str, Any]) -> Any:
-    """Log an arbitrary directory as a modelctl generic PyFunc model."""
+def log_generic_model(
+    source_path: Path,
+    manifest: dict[str, Any],
+    general_tags: dict[str, Any],
+    training_tags: dict[str, Any],
+) -> dict[str, str]:
+    """Log an arbitrary directory as a modelctl generic artifact.
 
-    with tempfile.TemporaryDirectory(prefix="modelctl_pkg_") as temp_dir:
-        package_dir = Path(temp_dir) / "package"
-        payload_dir = package_dir / "payload"
-        metadata_dir = package_dir / "metadata"
+    Generic mode is artifact-store-first: the original directory is stored as an
+    opaque payload under ``model/payload`` in the configured MLflow artifact
+    store. The payload is not wrapped in any inference-specific flavor and is not copied to a
+    full local staging package before upload. Only small metadata files are
+    staged locally.
+    """
+
+    return log_generic_direct_model(source_path, manifest, general_tags, training_tags)
+
+
+def log_generic_direct_model(
+    source_path: Path, manifest: dict[str, Any], general_tags: dict[str, Any], training_tags: dict[str, Any]
+) -> dict[str, str]:
+    """Log a generic model without creating a full local payload copy."""
+
+    with tempfile.TemporaryDirectory(prefix="modelctl_meta_") as temp_dir:
+        model_dir = Path(temp_dir) / DEFAULT_MODEL_ARTIFACT_NAME
+        metadata_dir = model_dir / "metadata"
         metadata_dir.mkdir(parents=True, exist_ok=True)
 
-        copy_path(source_path, payload_dir)
-        write_json(package_dir / "manifest.json", manifest)
+        write_json(model_dir / "manifest.json", manifest)
         write_json(metadata_dir / "general_tags.json", general_tags)
         write_json(metadata_dir / "training_tags.json", training_tags)
+        write_text(model_dir / "MLmodel", build_generic_mlmodel_text(manifest))
 
-        return call_log_model(
-            mlflow.pyfunc.log_model,
-            name=DEFAULT_MODEL_ARTIFACT_NAME,
-            python_model=GenericDirectoryPyFunc(),
-            artifacts={"package": str(package_dir)},
-            metadata={"modelctl_kind": "generic", "modelctl_schema_version": DEFAULT_SCHEMA_VERSION},
-            pip_requirements=["mlflow", "pandas"],
-        )
+        emit_status("logging generic metadata files")
+        mlflow.log_artifacts(str(model_dir), artifact_path=DEFAULT_MODEL_ARTIFACT_NAME)
+
+    # This is the only large operation. MLflow uploads/copies the original
+    # source tree straight into the run artifact store under model/payload.
+    # modelctl intentionally does not create a full local package copy first.
+    emit_status(f"logging generic payload directory: {source_path} -> {DEFAULT_MODEL_ARTIFACT_NAME}/payload")
+    mlflow.log_artifacts(str(source_path), artifact_path=f"{DEFAULT_MODEL_ARTIFACT_NAME}/payload")
+    emit_status("generic payload logged")
+
+    active_run = mlflow.active_run()
+    run_id = active_run.info.run_id if active_run is not None else ""
+    return {
+        "artifact_path": DEFAULT_MODEL_ARTIFACT_NAME,
+        "model_uri": f"runs:/{run_id}/{DEFAULT_MODEL_ARTIFACT_NAME}" if run_id else DEFAULT_MODEL_ARTIFACT_NAME,
+        "layout": "modelctl_generic_direct",
+    }
 
 
 def log_hf_model(source_path: Path, manifest: dict[str, Any], hf_task: str | None) -> Any:
@@ -579,15 +647,22 @@ def build_version_tags(
     return tags
 
 
-def hash_directory(path: Path) -> str:
+def hash_directory(path: Path, *, progress: bool = False) -> str:
     """Compute a stable SHA256 hash for all files in a directory.
 
     The hash includes relative file paths and file bytes. Directory mtimes,
     owners and permissions are intentionally ignored, which makes the digest more
     stable across machines, NFS mounts and containerized environments.
+
+    When ``progress`` is true, coarse progress is printed to stderr. This is
+    intentionally dependency-free and useful for large model directories where a
+    full hash pass can take noticeable time.
     """
 
     digest = hashlib.sha256()
+    processed_bytes = 0
+    next_report_bytes = 5 * 1024**3
+    report_step_bytes = 5 * 1024**3
     for file_path in sorted(item for item in path.rglob("*") if item.is_file()):
         relative_path = file_path.relative_to(path).as_posix()
         digest.update(relative_path.encode("utf-8"))
@@ -595,9 +670,15 @@ def hash_directory(path: Path) -> str:
         with file_path.open("rb") as file:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
                 digest.update(chunk)
+                if progress:
+                    processed_bytes += len(chunk)
+                    if processed_bytes >= next_report_bytes:
+                        emit_status(f"hashed {format_bytes(processed_bytes)} so far")
+                        next_report_bytes += report_step_bytes
         digest.update(b"\0")
+    if progress:
+        emit_status(f"hashed total {format_bytes(processed_bytes)}")
     return f"sha256:{digest.hexdigest()}"
-
 
 def resolve_pytorch_file(source_path: Path, pytorch_file: str | Path | None) -> Path:
     """Resolve a TorchScript file from explicit CLI input or common names."""
@@ -662,15 +743,83 @@ def split_registry_ref(ref: str) -> tuple[str, str, Literal["alias", "version"]]
     raise ValueError("Model ref must be name@alias, name:version or models:/... URI")
 
 
+
+def resolve_model_version(client: MlflowClient, ref: str) -> Any:
+    """Resolve a user-facing reference to a concrete MLflow ModelVersion."""
+
+    name, value, ref_kind = split_registry_ref(ref)
+    if ref_kind == "alias":
+        return client.get_model_version_by_alias(name=name, alias=value)
+    return client.get_model_version(name=name, version=str(value))
+
+
+def generic_payload_artifact_uris(source_uri: str) -> list[str]:
+    """Return known payload artifact locations for the modelctl generic layout."""
+
+    return [
+        f"{source_uri}/payload",
+        f"{source_uri}/artifacts/payload",
+    ]
+
+
+def make_output_staging_dir(output_path: Path) -> Path:
+    """Create a temporary staging directory on the output filesystem."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = output_path.parent / f".modelctl_download_{output_path.name}_{uuid.uuid4().hex}"
+    staging_dir.mkdir(parents=False, exist_ok=False)
+    return staging_dir
+
+
+def download_artifact_to_output(artifact_uri: str, output_path: Path) -> None:
+    """Download one artifact directory and atomically move it into output_path."""
+
+    staging_dir = make_output_staging_dir(output_path)
+    try:
+        downloaded = Path(mlflow.artifacts.download_artifacts(artifact_uri=artifact_uri, dst_path=str(staging_dir))).resolve()
+        shutil.move(str(downloaded), str(output_path))
+    except Exception:
+        if output_path.exists():
+            if output_path.is_dir():
+                shutil.rmtree(output_path, ignore_errors=True)
+            else:
+                output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def download_model_package_to_output(model_uri: str, output_path: Path, *, payload_only: bool) -> None:
+    """Download a model package next to output_path and move the selected tree."""
+
+    staging_dir = make_output_staging_dir(output_path)
+    try:
+        downloaded = Path(mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=str(staging_dir))).resolve()
+        source_to_move = choose_pull_source(downloaded, payload_only=payload_only)
+        shutil.move(str(source_to_move), str(output_path))
+    except Exception:
+        if output_path.exists():
+            if output_path.is_dir():
+                shutil.rmtree(output_path, ignore_errors=True)
+            else:
+                output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
 def choose_pull_source(downloaded: Path, *, payload_only: bool) -> Path:
     """Choose what should be copied from a downloaded MLflow model package."""
 
     if not payload_only:
         return downloaded
 
-    generic_payload = downloaded / "artifacts" / "package" / "payload"
-    if generic_payload.exists():
-        return generic_payload
+    direct_payload = downloaded / "payload"
+    if direct_payload.exists():
+        return direct_payload
+
+    direct_payload_in_artifacts = downloaded / "artifacts" / "payload"
+    if direct_payload_in_artifacts.exists():
+        return direct_payload_in_artifacts
 
     # Be tolerant to MLflow layout changes and look for the modelctl package.
     for manifest_path in downloaded.rglob("manifest.json"):
@@ -686,21 +835,42 @@ def choose_pull_source(downloaded: Path, *, payload_only: bool) -> Path:
     return downloaded
 
 
-def copy_path(source: Path, destination: Path) -> None:
-    """Copy a file or directory to ``destination``."""
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.is_dir():
-        shutil.copytree(source, destination)
-    else:
-        shutil.copy2(source, destination)
-
-
 def write_json(path: Path, data: dict[str, Any]) -> None:
     """Write a dictionary as pretty UTF-8 JSON."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_text(path: Path, text: str) -> None:
+    """Write UTF-8 text."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def build_generic_mlmodel_text(manifest: dict[str, Any]) -> str:
+    """Return a small MLmodel descriptor for direct generic artifacts.
+
+    This is intentionally not a Python flavor. ``modelctl pull`` is the supported
+    consumer interface for generic artifacts. The file makes the artifact folder
+    self-describing in MLflow UIs and when inspected manually.
+    """
+
+    model_name = str(manifest.get("model_name") or "")
+    source_hash = str(manifest.get("source_dir_hash") or "")
+    return (
+        f"artifact_path: {DEFAULT_MODEL_ARTIFACT_NAME}\n"
+        "flavors:\n"
+        "  modelctl_generic:\n"
+        f"    schema_version: {DEFAULT_SCHEMA_VERSION}\n"
+        "    payload_path: payload\n"
+        "    manifest_path: manifest.json\n"
+        f"    model_name: {json.dumps(model_name, ensure_ascii=False)}\n"
+        f"    source_dir_hash: {json.dumps(source_hash, ensure_ascii=False)}\n"
+        f"modelctl_kind: generic\n"
+        f"modelctl_schema_version: {DEFAULT_SCHEMA_VERSION}\n"
+    )
 
 
 def fetch_model_version(client: MlflowClient, name: str, version: str) -> Any:
@@ -769,6 +939,23 @@ def timestamp_ms_to_iso(timestamp_ms: int | None) -> str | None:
     except Exception:
         return None
 
+
+
+def emit_status(message: str) -> None:
+    """Write a human-readable modelctl status line to stderr."""
+
+    print(f"[modelctl] {message}", file=sys.stderr, flush=True)
+
+
+def format_bytes(value: int) -> str:
+    """Format a byte count using binary units."""
+
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{value} B"
 
 def utc_now_iso() -> str:
     """Return current UTC time as an ISO-8601 string."""

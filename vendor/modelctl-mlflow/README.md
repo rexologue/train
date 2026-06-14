@@ -1,34 +1,27 @@
 # modelctl-mlflow
 
-`modelctl` is a small CLI wrapper around MLflow Model Registry. It gives projects one simple way to version model folders, regardless of whether the payload is a raw directory, a Hugging Face Transformers checkpoint, or a TorchScript PyTorch model.
+`modelctl` is a small CLI wrapper around MLflow Model Registry. It gives a project one stable interface for registering, promoting and pulling model directories through MLflow, without forcing every model to have the same framework format.
 
-The utility always creates technical MLflow runs in one dedicated experiment:
+The default and most important mode is `generic`: an arbitrary local directory is stored as an opaque payload in the MLflow artifact store and registered as a Model Registry version.
 
-```text
-__model_registry_uploads__
-```
-
-You do not need to think about that experiment during normal usage. It exists only to keep registry upload runs separate from real training experiments.
-
-## What this solves
-
-Instead of manually creating folders like this:
+Detailed documentation for the generic artifact-store workflow is available here:
 
 ```text
-models/model_v1
-models/model_v2
-models/final_best
+docs/modelctl_generic_artifact_store.md
 ```
 
-use stable MLflow Registry names and aliases:
+## Core idea
+
+`modelctl` treats MLflow as two separate systems working together:
 
 ```text
-sentiment_text_classifier@baseline
-sentiment_text_classifier@candidate
-sentiment_text_classifier@champion
+MLflow backend store / PostgreSQL -> registry metadata, runs, versions, aliases, tags
+MLflow artifact store             -> actual model files and payload directories
 ```
 
-A model consumer can pull or load `sentiment_text_classifier@champion` and does not care which exact version number is behind it.
+The database is not expected to store model weights. It stores metadata only. The artifact store is the durable source of truth for model files.
+
+That is the reason `generic` exists: it lets you put any model bundle into the artifact store and later pull it from another server through MLflow, even if that server does not have direct access to the original training machine or original NFS/source path.
 
 ## Supported kinds
 
@@ -36,30 +29,45 @@ A model consumer can pull or load `sentiment_text_classifier@champion` and does 
 
 Default mode. Works with any local directory.
 
-The utility creates a generic PyFunc MLflow model by itself. You do not write any PyFunc class. The original directory is stored under the modelctl payload package.
-
-Use this for:
+Use it for:
 
 ```text
-raw PyTorch checkpoints
+Hugging Face checkpoints
+raw PyTorch checkpoint folders
 ONNX exports
 tokenizer folders
+LoRA adapter folders
 custom inference bundles
 configs + weights
 any arbitrary model directory
 ```
 
+Generic mode stores the original directory under this artifact layout:
+
+```text
+model/
+├── MLmodel
+├── manifest.json
+├── metadata/
+│   ├── general_tags.json
+│   └── training_tags.json
+└── payload/
+    └── ... original directory contents ...
+```
+
+The large payload is logged directly into the configured MLflow artifact store under `model/payload`. `modelctl` does not create a full local temporary copy of the source directory before upload.
+
 ### `hf`
 
 Native Hugging Face Transformers logging through MLflow Transformers flavor.
 
-The source directory should be a valid local Transformers checkpoint directory, usually containing `config.json`.
+Use this only when you specifically want MLflow's Transformers flavor. For large production LLM bundles where the goal is artifact-store durability and simple `pull`, `generic` is usually simpler.
 
 ### `pytorch`
 
 Native MLflow PyTorch logging for TorchScript models.
 
-This mode needs a scripted/traced model file loadable with `torch.jit.load`. A raw `.pth` state dict is not enough because the Python model class cannot be reconstructed from weights alone. For raw PyTorch checkpoint folders, use `generic`.
+This mode needs a scripted/traced model file loadable with `torch.jit.load`. A raw `.pth` state dict is not enough because the Python model class cannot be reconstructed from weights alone. For raw checkpoint folders, use `generic`.
 
 ## Installation
 
@@ -69,7 +77,7 @@ From the project directory:
 pip install -e .
 ```
 
-With Hugging Face / PyTorch extras:
+With optional ML framework dependencies:
 
 ```bash
 pip install -e '.[all]'
@@ -95,8 +103,6 @@ Or pass a full URI:
 modelctl list my_model --tracking-uri http://127.0.0.1:5000
 ```
 
-## Authentication
-
 MLflow Basic Auth credentials are read by MLflow itself from environment variables:
 
 ```bash
@@ -117,17 +123,23 @@ Minimal command:
 modelctl register ./exported_model sentiment_text_classifier
 ```
 
+Explicit kind:
+
+```bash
+modelctl register ./exported_model sentiment_text_classifier --kind generic
+```
+
 What happens:
 
 ```text
-1. modelctl connects to MLflow at http://localhost:5000
-2. modelctl creates/uses experiment __model_registry_uploads__
-3. modelctl creates a short technical run
-4. modelctl computes a stable SHA256 hash of the source directory
-5. modelctl generates manifest.json
-6. modelctl logs the payload as a generic PyFunc MLflow model
-7. modelctl creates a new Model Registry version
-8. modelctl sets aliases
+1. modelctl connects to MLflow.
+2. modelctl creates/uses the technical experiment __model_registry_uploads__.
+3. modelctl computes a stable SHA256 hash of the source directory.
+4. modelctl starts a short MLflow run.
+5. modelctl writes manifest.json, MLmodel and metadata JSON files.
+6. modelctl logs the original source directory to model/payload in the artifact store.
+7. modelctl creates a new MLflow Model Registry version whose source is runs:/<run_id>/model.
+8. modelctl attaches aliases and searchable tags to the new version.
 ```
 
 Default alias behavior:
@@ -145,7 +157,7 @@ sentiment_text_classifier@baseline -> version 1
 sentiment_text_classifier@champion -> version 1
 ```
 
-A later registration without explicit alias creates:
+A later registration without explicit aliases creates:
 
 ```text
 sentiment_text_classifier/2
@@ -166,13 +178,11 @@ modelctl register ./baseline_model sentiment_text_classifier --alias baseline --
 
 ## Register with metadata tags
 
-Tags are optional.
-
-There are two metadata namespaces:
+Tags are optional. There are two namespaces:
 
 ```text
-general  - general model information
-training - training/experiment/dataset information
+general  - stable model information
+training - training, dataset, metrics and experiment information
 ```
 
 The full dictionaries are logged as JSON artifacts. A flattened searchable projection is also written to MLflow Model Version tags.
@@ -219,66 +229,10 @@ Inline values are parsed as JSON when possible, so numbers, booleans and lists w
 modelctl register ./hf_model sentiment_text_classifier --kind hf --hf-task text-classification --alias candidate
 ```
 
-For text generation:
-
-```bash
-modelctl register ./qwen_export qwen_chat_model --kind hf --hf-task text-generation --alias candidate
-```
-
 ## Register a TorchScript PyTorch model
 
-If the directory contains `model.pt`:
-
 ```bash
-modelctl register ./torchscript_export face_detector --kind pytorch --alias candidate
-```
-
-If the file has another name:
-
-```bash
-modelctl register ./torchscript_export face_detector --kind pytorch --pytorch-file traced_model.pt --alias candidate
-```
-
-For arbitrary PyTorch checkpoint folders, use generic mode:
-
-```bash
-modelctl register ./checkpoint_dir face_detector --kind generic --alias candidate
-```
-
-## Promote a version
-
-Promotion is just alias movement.
-
-```bash
-modelctl promote sentiment_text_classifier 2 champion
-```
-
-After that:
-
-```text
-sentiment_text_classifier@champion -> version 2
-```
-
-## Pull a model
-
-Pull current champion:
-
-```bash
-modelctl pull sentiment_text_classifier@champion ./models/sentiment_text_classifier --overwrite
-```
-
-Pull exact version:
-
-```bash
-modelctl pull sentiment_text_classifier:2 ./models/sentiment_text_classifier_v2 --overwrite
-```
-
-For generic models, the default is to copy only the original payload directory into the destination. This is usually what project code wants.
-
-To copy the full MLflow model package:
-
-```bash
-modelctl pull sentiment_text_classifier@champion ./models/sentiment_full_package --full-package --overwrite
+modelctl register ./torchscript_bundle image_classifier --kind pytorch --pytorch-file model.pt --alias candidate
 ```
 
 ## List versions
@@ -287,117 +241,124 @@ modelctl pull sentiment_text_classifier@champion ./models/sentiment_full_package
 modelctl list sentiment_text_classifier
 ```
 
-## Show info
+Example output:
+
+```json
+[
+  {
+    "aliases": ["champion"],
+    "created_at": "2026-06-14T09:00:00Z",
+    "kind": "generic",
+    "name": "sentiment_text_classifier",
+    "run_id": "...",
+    "source": "runs:/.../model",
+    "source_dir_hash": "sha256:...",
+    "status": "READY",
+    "version": "3"
+  }
+]
+```
+
+## Show one model ref
 
 ```bash
 modelctl info sentiment_text_classifier@champion
 ```
 
-```bash
-modelctl info sentiment_text_classifier:2
-```
-
-## Internal artifact structure for generic models
-
-A generic model is stored as an MLflow PyFunc model. Inside the modelctl package, the structure is:
+Supported refs:
 
 ```text
-package/
-  manifest.json
-  metadata/
-    general_tags.json
-    training_tags.json
-  payload/
-    ... original source directory ...
+name@alias
+name:version
+models:/name@alias
+models:/name/version
 ```
 
-The generated `manifest.json` contains:
+## Promote aliases
 
-```json
-{
-  "schema_version": "1.0",
-  "created_by": "modelctl",
-  "model_name": "sentiment_text_classifier",
-  "kind": "generic",
-  "source_dir_hash": "sha256:...",
-  "payload_path": "payload",
-  "general_tags_path": "metadata/general_tags.json",
-  "training_tags_path": "metadata/training_tags.json"
-}
+Promotion is alias reassignment. It does not copy files and does not modify model artifacts.
+
+```bash
+modelctl promote sentiment_text_classifier 3 champion
 ```
 
-## Design rules
+After that, consumers pulling `sentiment_text_classifier@champion` receive version `3`.
+
+## Pull a model
+
+Pull the payload only, which is the default for `generic` models:
+
+```bash
+modelctl pull sentiment_text_classifier@champion ./local_model --overwrite
+```
+
+For a generic model, the output directory receives the original registered payload contents, not the small MLflow wrapper metadata:
 
 ```text
-Every register creates one MLflow model version.
-Every register creates one technical run in __model_registry_uploads__.
-Generic mode accepts any directory.
-Native HF mode is explicit: --kind hf.
-Native PyTorch mode is explicit: --kind pytorch.
-All metadata tags are optional.
-Full metadata dictionaries are stored as JSON artifacts.
-Searchable metadata is stored as flattened MLflow tags.
-Production code should consume aliases, not latest versions.
+./local_model/
+└── ... original directory contents ...
 ```
 
-## Recommended workflow
-
-First version:
+To download the full MLflow artifact package with `MLmodel`, `manifest.json`, metadata and `payload`, use:
 
 ```bash
-modelctl register ./model_export sentiment_text_classifier --general-tag task=sentiment
+modelctl pull sentiment_text_classifier@champion ./local_package --full-package --overwrite
 ```
 
-New candidate:
+`pull` downloads into a staging directory placed next to the final output directory and then moves the result into place. This avoids using system `/tmp` for large model downloads.
 
-```bash
-modelctl register ./new_model_export sentiment_text_classifier --alias candidate --training-tag dataset_version=v5 --training-tag f1_weighted=0.927
-```
+## Status output
 
-Check it:
-
-```bash
-modelctl pull sentiment_text_classifier@candidate ./tmp/candidate --overwrite
-```
-
-Promote it:
-
-```bash
-modelctl promote sentiment_text_classifier 2 champion
-```
-
-Use it in a project:
-
-```bash
-modelctl pull sentiment_text_classifier@champion ./models/sentiment_text_classifier --overwrite
-```
-
-## Notes
-
-`modelctl` is intentionally small. It does not replace training tracking. Real training runs should stay in their own MLflow experiments. Registry upload runs are separate technical records that connect a model version to the exact artifact package, source hash and metadata used during registration.
-
-## Notes about `list`
-
-`modelctl list` prints registered model versions newest first. Internally it enriches the raw MLflow search results with `get_model_version` and the registered model alias map. This avoids empty aliases/tags in MLflow backends where `search_model_versions` returns partially populated entities.
+`register` prints coarse status lines to stderr. This makes long operations visible while keeping stdout as machine-readable JSON.
 
 Example:
 
+```text
+[modelctl] hashing source directory: /mnt/nfs_share/models-pool/baselines/Qwen3.5-35B-A3B
+[modelctl] hashed 5.0 GiB so far
+[modelctl] hashed 10.0 GiB so far
+[modelctl] source hash computed: sha256:...
+[modelctl] starting MLflow run: register:qwen35_35b_a3b_cc:generic
+[modelctl] logging generic payload directory: ... -> model/payload
+[modelctl] creating MLflow model version: name=qwen35_35b_a3b_cc, source=runs:/.../model
+```
+
+## Operational notes
+
+For large model directories, make sure the MLflow artifact store has enough space. PostgreSQL only needs space for metadata and WAL/checkpoint files, but it still must have some free local disk space because it is the MLflow backend store.
+
+For the Docker Compose setup in this repository, the intended split is:
+
+```text
+PostgreSQL volume -> local Docker volume, metadata only
+MLflow artifacts  -> /mlflow/artifacts inside container
+Host artifact dir -> MLFLOW_ARTIFACTS_DIR from .env
+```
+
+If `.env` contains:
+
+```text
+MLFLOW_ARTIFACTS_DIR=/mnt/nfs_share/mlflow/artifacts
+```
+
+then the actual payload files are stored under the NFS-mounted artifact directory on the host.
+
+## Troubleshooting
+
+Check that the CLI is importing the expected source tree:
+
 ```bash
-modelctl list sentiment_text_classifier
+which modelctl && python -c "import sys, modelctl, modelctl.cli, modelctl.core; print('python=', sys.executable); print('modelctl=', modelctl.__file__); print('cli=', modelctl.cli.__file__); print('core=', modelctl.core.__file__)"
 ```
 
-Expected output shape:
+Check backend and artifact store free space:
 
-```json
-[
-  {
-    "name": "sentiment_text_classifier",
-    "version": "2",
-    "aliases": ["candidate"],
-    "kind": "generic",
-    "source_dir_hash": "sha256:..."
-  }
-]
+```bash
+df -h / /mnt/nfs_share
 ```
 
-If old versions were registered before modelctl metadata was written, fields such as `kind` and `source_dir_hash` can remain `null`. New registrations write these fields explicitly as Model Version tags.
+Check PostgreSQL readiness:
+
+```bash
+docker exec mlflow-postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+```

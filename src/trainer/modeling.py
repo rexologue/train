@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ def load_base_model(config: Any) -> Any:
     from transformers import AutoModelForCausalLM
 
     model_config = config.section("model")
+    validate_model_runtime_requirements(model_config)
     kwargs: dict[str, Any] = {
         "revision": model_config.get("base_model_revision"),
         "trust_remote_code": bool(model_config.get("trust_remote_code", True)),
@@ -54,6 +56,14 @@ def load_base_model(config: Any) -> Any:
         model.gradient_checkpointing_enable()
     freeze_configured_modules(model, model_config)
     return model
+
+
+def validate_model_runtime_requirements(model_config: dict[str, Any]) -> None:
+    if model_config.get("attn_implementation") == "flash_attention_2" and find_spec("flash_attn") is None:
+        raise ImportError(
+            "model.attn_implementation=flash_attention_2 requires the flash_attn package; "
+            "install it in the training environment or select another attention implementation"
+        )
 
 
 def precision_to_dtype(precision: str) -> Any:

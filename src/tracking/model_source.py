@@ -43,7 +43,9 @@ def resolve_model_source(config: TrainingConfig, *, tracking_uri: str | None = N
     if not isinstance(source_config, dict) or source_config.get("kind", "local_or_hf") == "local_or_hf":
         local_dir = source_config.get("local_dir") if isinstance(source_config, dict) else None
         if local_dir:
-            resolved_local = str(Path(str(local_dir)).expanduser().resolve())
+            resolved_path = Path(str(local_dir)).expanduser().resolve()
+            validate_model_payload(resolved_path)
+            resolved_local = str(resolved_path)
             return ModelSourceResolution(
                 kind="local_or_hf",
                 effective_model_id=resolved_local,
@@ -130,6 +132,7 @@ def use_existing_registry_model(
 ) -> ModelSourceResolution:
     """Use a non-empty local model directory and optionally verify its sidecar/hash."""
 
+    validate_model_payload(local_dir)
     sidecar_path = registry_metadata_path(local_dir)
     sidecar = read_registry_metadata(sidecar_path)
     if require_registry_metadata and not sidecar:
@@ -203,6 +206,7 @@ def pull_registry_model_if_missing(
         _pull_model(ref, temp_payload, tracking_uri)
         if not directory_has_payload(temp_payload):
             raise ValueError(f"modelctl pull produced an empty payload for {ref}")
+        validate_model_payload(temp_payload)
         local_hash = _hash_directory(temp_payload)
         if source_hash and local_hash != source_hash:
             raise ValueError(f"pulled model hash mismatch: expected {source_hash}, got {local_hash}")
@@ -249,6 +253,36 @@ def registry_metadata_path(local_dir: Path) -> Path:
     return local_dir.with_name(f"{local_dir.name}.estadel_registry.json")
 
 
+def validate_model_payload(path: Path) -> None:
+    """Reject incomplete Transformers payloads before expensive model loading."""
+
+    if not path.exists() or not path.is_dir():
+        raise FileNotFoundError(f"model payload directory does not exist: {path}")
+    found_weight_index = False
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = path / index_name
+        if not index_path.exists():
+            continue
+        found_weight_index = True
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"model weight index is not valid JSON: {index_path}") from exc
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"model weight index has no weight_map: {index_path}")
+        referenced_files = sorted({str(value) for value in weight_map.values()})
+        missing = [name for name in referenced_files if not (path / name).is_file()]
+        if missing:
+            preview = missing[:5]
+            suffix = "" if len(missing) <= len(preview) else f" (+{len(missing) - len(preview)} more)"
+            raise FileNotFoundError(f"incomplete model payload {path}: missing weight shards {preview}{suffix}")
+    if (path / "config.json").exists() and not found_weight_index:
+        weight_files = [*path.glob("*.safetensors"), *path.glob("pytorch_model*.bin")]
+        if not any(candidate.is_file() for candidate in weight_files):
+            raise FileNotFoundError(f"incomplete model payload {path}: no Transformers weight files found")
+
+
 def read_registry_metadata(path: Path) -> dict[str, Any]:
     """Read a registry sidecar if present."""
 
@@ -293,7 +327,7 @@ def _get_model_info(ref: str, tracking_uri: str) -> dict[str, Any]:
 def _pull_model(ref: str, output_dir: Path, tracking_uri: str) -> Any:
     from modelctl.core import pull_model
 
-    return pull_model(ref, output_dir, tracking_uri=tracking_uri)
+    return pull_model(ref, output_dir, payload_only=True, tracking_uri=tracking_uri)
 
 
 def _hash_directory(path: Path) -> str:

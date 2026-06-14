@@ -5,6 +5,8 @@ import json
 from config import load_config
 from registry.package import build_candidate_registration_args
 from registry.selection import CandidateWindowSelector
+from train import restore_registry_selector
+from trainer.state import TrainerState
 
 
 def test_candidate_window_selector_registers_best_checkpoint_after_window(tmp_path):
@@ -81,7 +83,7 @@ def test_build_candidate_registration_args_uses_adapter_checkpoint_package(tmp_p
     args = build_candidate_registration_args(config, decision)
 
     assert args[:2] == ["modelctl", "register"]
-    assert str(decision.checkpoint.path) in args
+    assert str(decision.checkpoint.path / "adapter") in args
     assert "candidate-000001" in args
     assert "candidate-latest" in args
     assert "champion" not in args
@@ -99,3 +101,33 @@ def test_build_candidate_registration_args_uses_adapter_checkpoint_package(tmp_p
     assert training_tags_path == str(tag_dir / "training_tags.json")
     assert general_tags["artifact.kind"] == "peft_adapter_checkpoint"
     assert training_tags["training.registry_role"] == "candidate"
+
+
+def test_restore_registry_selector_preserves_incomplete_window(tmp_path):
+    config = load_config("configs/config.preprocess.yaml")
+    config.raw["checkpointing"]["root_dir"] = str(tmp_path)
+    for index in range(1, 5):
+        checkpoint = tmp_path / f"step-{index * 10:06d}"
+        checkpoint.mkdir()
+        (checkpoint / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "global_step": index * 10,
+                    "checkpoint_index": index,
+                    "metrics": {"eval/bfcl/accuracy": index / 10},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    selector = restore_registry_selector(config, TrainerState(global_step=40, checkpoint_index=4))
+    decision = selector.observe_checkpoint(
+        checkpoint_path=tmp_path / "step-000050",
+        checkpoint_index=5,
+        global_step=50,
+        metrics={"eval/bfcl/accuracy": 0.1},
+    )
+
+    assert decision is not None
+    assert decision.candidate_index == 1
+    assert decision.checkpoint.checkpoint_index == 4

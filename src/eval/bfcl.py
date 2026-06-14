@@ -30,17 +30,15 @@ def run_bfcl_eval(
         _write_rows(config, summary)
         return _summary_metrics(summary)
 
-    local_predictions: dict[str, Any] = {}
-    with accelerator.split_between_processes(validator.samples, apply_padding=False) as local_samples:
-        local_predictions = _predict_samples(local_samples, predictor)
-
-    from accelerate.utils import gather_object
-
-    gathered = gather_object(list(local_predictions.items()))
+    # FSDP forward/generate calls are collective. Every rank must execute the
+    # same requests in the same order; splitting variable-length/multi-turn
+    # samples between ranks can deadlock when ranks perform different numbers
+    # of generate calls.
+    predictions_by_id = _predict_samples(validator.samples, predictor)
+    accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return {}
 
-    predictions_by_id = merge_prediction_items(gathered)
     summary = validator.evaluate_predictions(predictions_by_id)
     _write_rows(config, summary)
     return _summary_metrics(summary)

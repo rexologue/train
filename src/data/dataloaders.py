@@ -12,6 +12,7 @@ from preprocessing.io import PretokSplitResult
 
 
 REQUIRED_TRAINING_SPLITS = {"train", "valid"}
+SFT_LOSS_KINDS = {"sft_target", "sft_tool"}
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,13 @@ def build_dataloaders(
         # The Dataset owns parquet normalization; sampler and collator operate
         # only on the normalized row contract.
         dataset = PretokenizedDataset.from_parquet(result.pretok_path, split=split)
+        if split in REQUIRED_TRAINING_SPLITS and len(dataset) == 0:
+            raise ValueError(f"pretokenized {split} split is empty: {result.pretok_path}")
         sampler = RoutedBatchSampler(dataset.loss_kinds, batch_size, seed=seed, drop_last=drop_last, shuffle=True)
+        if split in REQUIRED_TRAINING_SPLITS and len(sampler) == 0:
+            raise ValueError(
+                f"{split} routed sampler produced zero batches; check training.drop_last and per-device batch size"
+            )
         dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collator)
         summary = sampler.summary()
         summary.update(
@@ -117,3 +124,23 @@ def build_dataloaders(
         )
         split_loaders[split] = SplitDataLoader(split, result.pretok_path, dataset, sampler, dataloader, summary)
     return DataLoaderBundle(split_loaders)
+
+
+def validate_sft_only_training_inputs(config: TrainingConfig, dataloaders: DataLoaderBundle) -> None:
+    """Reject routes and sampler shapes that the current SFT-only trainer cannot run safely."""
+
+    configured_routes = set(config.section("loss_routing").get("routes") or {})
+    unsupported_routes = configured_routes - SFT_LOSS_KINDS
+    if unsupported_routes:
+        raise ValueError(f"SFT-only training does not support configured routes: {sorted(unsupported_routes)}")
+
+    for split in sorted(REQUIRED_TRAINING_SPLITS):
+        split_loader = dataloaders[split]
+        unsupported_data = set(split_loader.dataset.loss_kinds) - SFT_LOSS_KINDS
+        if unsupported_data:
+            raise ValueError(f"SFT-only training does not support {split} loss kinds: {sorted(unsupported_data)}")
+        if split_loader.summary["num_short_batches"] and split_loader.summary["batch_size"] > 1:
+            raise ValueError(
+                f"{split} contains short routed batches with per-device batch size > 1; "
+                "Accelerate even-batch padding can mix loss routes. Set training.drop_last=true or use batch size 1."
+            )

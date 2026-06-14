@@ -36,6 +36,7 @@ class BFCLModelPredictor:
                 do_sample=bool(generation.get("do_sample", False)),
                 pad_token_id=getattr(self.tokenizer, "pad_token_id", None),
                 eos_token_id=getattr(self.tokenizer, "eos_token_id", None),
+                synced_gpus=bool(self.accelerator is not None and getattr(self.accelerator, "num_processes", 1) > 1),
             )
         generated_ids = output_ids[0, input_length:]
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)

@@ -53,10 +53,11 @@ PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/pytho
 Принудительный training run на debug config:
 
 ```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/python -m train --config configs/config.preprocess.yaml --train
+PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/accelerate launch --use_fsdp --num_processes <GPU_COUNT> -m train --config configs/config.preprocess.yaml --train
 ```
 
 `configs/config.preprocess.yaml` сейчас имеет `training.enabled: false`, поэтому без `--train` обучение не начнется.
+Training startup fail-fast проверяет, что активный Accelerate runtime действительно использует FSDP.
 
 ## Конфиги
 
@@ -135,7 +136,7 @@ Checkpoint создается на validation boundary:
 ordinary eval -> BFCL eval -> checkpoint save
 ```
 
-Сохраняется adapter-only package:
+Сохраняется adapter-only package. `accelerate_state/` содержит optimizer/scheduler/RNG state для LoRA-параметров, но не дублирует base-model shards:
 
 ```text
 {checkpointing.root_dir}/step-000012/
@@ -186,6 +187,8 @@ src/eval/bfcl.py
 ```
 
 BFCL eval строит prompts через tokenizer chat template, генерирует tool calls, нормализует predictions и сравнивает с expected calls offline.
+
+При FSDP все ranks выполняют одинаковую последовательность BFCL requests в lockstep. Это дороже распределенного sharding eval-набора, но предотвращает deadlock на variable-length и multi-turn generation.
 
 ## Структура
 

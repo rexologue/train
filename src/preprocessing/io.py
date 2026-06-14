@@ -188,8 +188,9 @@ def split_cache_is_valid(
     root: Path,
     split: str,
     raw_hash: str,
+    preprocessing_signature: str | None = None,
 ) -> tuple[bool, dict[str, Any] | None]:
-    """Return whether `{root}/{split}.parquet` matches the current raw split hash."""
+    """Return whether one cached split matches its raw data, processing contract, and content hash."""
 
     manifest = load_manifest(root)
     if manifest is None:
@@ -202,7 +203,17 @@ def split_cache_is_valid(
     if not isinstance(split_hash, str):
         return False, manifest
     pretok_path = split_parquet_path(root, split)
-    valid = split_hash == raw_hash and pretok_path.exists()
+    expected_pretok_hash = (manifest.get("pretokenized") or {}).get(split)
+    if not isinstance(expected_pretok_hash, str) or not pretok_path.exists():
+        return False, manifest
+    if file_sha256(pretok_path) != expected_pretok_hash:
+        return False, manifest
+    if preprocessing_signature is not None:
+        signatures = manifest.get("preprocessing_signatures")
+        cached_signature = signatures.get(split) if isinstance(signatures, dict) else None
+        if cached_signature != preprocessing_signature:
+            return False, manifest
+    valid = split_hash == raw_hash
     return valid, manifest
 
 
@@ -287,7 +298,9 @@ def write_split_cache(
 
     root.mkdir(parents=True, exist_ok=True)
     pretok_path = split_parquet_path(root, split)
-    pd.DataFrame(rows).to_parquet(pretok_path, index=False)
+    pretok_tmp = pretok_path.with_name(f"{pretok_path.stem}.tmp{pretok_path.suffix}")
+    pd.DataFrame(rows).to_parquet(pretok_tmp, index=False)
+    pretok_tmp.replace(pretok_path)
 
     pretok_hash = file_sha256(pretok_path)
 
@@ -295,6 +308,9 @@ def write_split_cache(
     splits[split] = split_manifest["input_sha256"]
     pretokenized = dict((base_manifest.get("pretokenized") or {}))
     pretokenized[split] = pretok_hash
+    preprocessing_signatures = dict((base_manifest.get("preprocessing_signatures") or {}))
+    if split_manifest.get("preprocessing_signature"):
+        preprocessing_signatures[split] = split_manifest["preprocessing_signature"]
     rows_summary = dict((base_manifest.get("rows") or {}))
     rows_summary[split] = {
         "raw": split_manifest["num_raw_rows"],
@@ -313,6 +329,7 @@ def write_split_cache(
     manifest = {
         "splits": splits,
         "pretokenized": pretokenized,
+        "preprocessing_signatures": preprocessing_signatures,
         "rows": rows_summary,
         "outputs": outputs,
     }
@@ -328,5 +345,7 @@ def write_split_cache(
         "examples_per_loss_kind_per_split": examples_per_loss_kind,
         "num_rows": len(all_debug_rows),
     }
-    manifest_path(root).write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    manifest_tmp = manifest_path(root).with_suffix(".json.tmp")
+    manifest_tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    manifest_tmp.replace(manifest_path(root))
     return manifest

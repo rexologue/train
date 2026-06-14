@@ -52,7 +52,20 @@ def create_accelerator(config: Any) -> DistributedRuntime:
         fsdp_plugin=fsdp_plugin,
         project_dir=str(config.section("project").get("output_dir")),
     )
+    validate_training_runtime(accelerator)
     return DistributedRuntime(accelerator=accelerator, fsdp_plugin=fsdp_plugin)
+
+
+def validate_training_runtime(accelerator: Any) -> None:
+    """Fail before model loading when training was not launched through FSDP."""
+
+    from accelerate.utils import DistributedType
+
+    if accelerator.distributed_type != DistributedType.FSDP:
+        raise RuntimeError(
+            "training requires Accelerate/FSDP, but the active runtime is "
+            f"{accelerator.distributed_type}; launch with `accelerate launch --use_fsdp ...`"
+        )
 
 
 def prepare_with_accelerator(runtime: DistributedRuntime, *objects: Any) -> tuple[Any, ...]:

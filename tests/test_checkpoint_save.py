@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
-from checkpointing.load import adapter_dir, find_latest_checkpoint, load_trainer_state, prune_old_checkpoints, validate_resume_checkpoint
-from checkpointing.save import save_adapter_checkpoint
+from checkpointing.load import (
+    adapter_dir,
+    find_latest_checkpoint,
+    load_trainer_state,
+    prune_old_checkpoints,
+    resolve_resume_checkpoint,
+    validate_resume_checkpoint,
+)
+from checkpointing.load import load_training_state_without_model
+from checkpointing.save import save_adapter_checkpoint, save_training_state_without_model
 from config import load_config
 from trainer.state import TrainerState
 
@@ -145,3 +155,51 @@ def test_validate_resume_checkpoint_enforces_strict_hashes(tmp_path):
     current_hashes["dataset"] = "sha256:dataset-b"
     with pytest.raises(ValueError, match="resume hash mismatch"):
         validate_resume_checkpoint(config, checkpoint, current_hashes)
+
+
+def test_explicit_missing_resume_checkpoint_is_an_error(tmp_path):
+    config = load_config("configs/config.preprocess.yaml")
+    config.raw["checkpointing"]["resume"]["path"] = str(tmp_path / "missing")
+
+    with pytest.raises(FileNotFoundError, match="explicit resume checkpoint"):
+        resolve_resume_checkpoint(config)
+
+
+def test_training_state_save_excludes_model_weights_and_restores_optimizer(tmp_path):
+    from accelerate.utils import DistributedType
+
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    accelerator = SimpleNamespace(
+        distributed_type=DistributedType.NO,
+        process_index=0,
+        num_processes=1,
+        step=7,
+        scaler=None,
+        project_configuration=SimpleNamespace(save_on_each_node=False),
+        _schedulers=[scheduler],
+        _dataloaders=[],
+    )
+
+    save_training_state_without_model(
+        accelerator=accelerator,
+        model=torch.nn.Linear(1, 1),
+        optimizer=optimizer,
+        output_dir=tmp_path,
+    )
+
+    assert not list(tmp_path.glob("model*"))
+    assert (tmp_path / "optimizer.bin").exists()
+    optimizer.param_groups[0]["lr"] = 0.5
+    accelerator.step = 0
+
+    load_training_state_without_model(
+        accelerator=accelerator,
+        model=torch.nn.Linear(1, 1),
+        optimizer=optimizer,
+        input_dir=tmp_path,
+    )
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    assert accelerator.step == 7

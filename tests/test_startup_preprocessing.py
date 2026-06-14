@@ -54,7 +54,7 @@ def sft_row(sample_id: str, user_content: str = "q", assistant_content: str = "l
     }
 
 
-def test_split_cache_reuse_depends_only_on_that_raw_split_hash(tmp_path):
+def test_split_cache_reuse_depends_on_split_hash_signature_and_content_hash(tmp_path):
     root = tmp_path / "pretok"
     manifest = write_split_cache(
         root,
@@ -67,6 +67,7 @@ def test_split_cache_reuse_depends_only_on_that_raw_split_hash(tmp_path):
             "num_rows": 1,
             "num_rejected_rows": 1,
             "rejected_counts": {"ValueError: bad row": 1},
+            "preprocessing_signature": "sha256:signature-a",
         },
         base_manifest={"splits": {"train": "sha256:train-a"}},
         examples_per_loss_kind=5,
@@ -74,9 +75,13 @@ def test_split_cache_reuse_depends_only_on_that_raw_split_hash(tmp_path):
 
     assert manifest["splits"] == {"train": "sha256:train-a", "valid": "sha256:valid-a"}
     assert manifest["rejections"]["valid"] == {"ValueError: bad row": 1}
-    assert split_cache_is_valid(root, "valid", "sha256:valid-a")[0] is True
+    assert split_cache_is_valid(root, "valid", "sha256:valid-a", "sha256:signature-a")[0] is True
+    assert split_cache_is_valid(root, "valid", "sha256:valid-a", "sha256:signature-b")[0] is False
     assert split_cache_is_valid(root, "valid", "sha256:valid-b")[0] is False
     assert split_cache_is_valid(root, "train", "sha256:train-a")[0] is False
+
+    (root / "valid.parquet").write_bytes(b"corrupt")
+    assert split_cache_is_valid(root, "valid", "sha256:valid-a", "sha256:signature-a")[0] is False
 
 
 def test_load_pretokenized_split_results_from_existing_manifest(tmp_path):
@@ -141,7 +146,7 @@ def test_startup_debug_loss_only_text_is_decoded_from_labels():
 
     expected = "".join(chr(token_id) for token_id, label in zip(processed["input_ids"], processed["labels"]) if label != config.ignore_index)
     assert debug["loss_only_text"] == expected
-    assert debug["loss_only_text"] == "long answer " * 10
+    assert debug["loss_only_text"] == "long answer " * 10 + "<|im_end|>"
 
 
 def test_think_block_is_excluded_from_loss_when_thinking_disabled():
@@ -153,7 +158,7 @@ def test_think_block_is_excluded_from_loss_when_thinking_disabled():
         config,
     )
 
-    assert debug["loss_only_text"] == visible
+    assert debug["loss_only_text"] == visible + "<|im_end|>"
 
 
 def test_think_block_is_included_in_loss_when_thinking_enabled():
@@ -166,7 +171,7 @@ def test_think_block_is_included_in_loss_when_thinking_enabled():
         config,
     )
 
-    assert debug["loss_only_text"] == f"<think>hidden</think>{visible}"
+    assert debug["loss_only_text"] == f"<think>hidden</think>{visible}<|im_end|>"
 
 
 def test_startup_route_rejects_raw_template_markers():

@@ -35,7 +35,7 @@ def build_candidate_registration_args(config: Any, decision: RegistrationDecisio
     return build_modelctl_register_args(
         str(registry.get("modelctl_path", "modelctl")),
         str(registry["model_name"]),
-        str(checkpoint.path),
+        str(checkpoint.path / "adapter"),
         decision.aliases,
         kind=str(registry.get("kind", "generic")),
         tracking_uri=str(mlflow.get("tracking_uri")) if mlflow.get("tracking_uri") else None,

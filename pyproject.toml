@@ -9,7 +9,7 @@ description = "Production-grade SFT/DPO training contour for Qwen3.5-35B-A3B LoR
 readme = "AGENTS.md"
 requires-python = ">=3.10"
 dependencies = [
-  "accelerate>=0.30",
+  "accelerate>=1.13,<1.14",
   "datasets>=2.19",
   "mlflow>=2.12",
   "numpy>=1.24",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from tracking.async_worker import AsyncTrackingWorker
@@ -60,3 +62,15 @@ def test_async_tracking_worker_surfaces_job_error_and_closes():
         worker.close()
 
     assert worker.errors[0].name == "broken"
+
+
+def test_async_tracking_worker_flush_times_out_instead_of_hanging():
+    release = threading.Event()
+    worker = AsyncTrackingWorker(flush_timeout_seconds=0.05)
+    worker.enqueue("blocked", release.wait)
+
+    with pytest.raises(TimeoutError, match="flush timed out"):
+        worker.flush()
+
+    release.set()
+    worker.close()
