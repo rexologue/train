@@ -87,7 +87,7 @@ def test_routed_trainer_validation_checkpoint_cadence():
         model,
         optimizer,
         [batch(1), batch(2), batch(3)],
-        max_steps=5,
+        total_steps=5,
         gradient_accumulation_steps=2,
     )
 
@@ -134,7 +134,7 @@ def test_routed_trainer_does_not_predivide_loss_for_accelerator():
         model,
         optimizer,
         [batch(2), batch(4)],
-        max_steps=1,
+        total_steps=1,
         gradient_accumulation_steps=2,
     )
 
@@ -160,7 +160,7 @@ def test_routed_trainer_fast_forwards_consumed_batches_on_resume():
         optimizer,
         [batch(1), batch(2), batch(3)],
         state=TrainerState(global_step=0, consumed_batches=1),
-        max_steps=1,
+        total_steps=1,
         gradient_accumulation_steps=1,
     )
 
@@ -168,44 +168,62 @@ def test_routed_trainer_fast_forwards_consumed_batches_on_resume():
     assert metrics_log[0]["train/loss"] == 2.0
 
 
-def test_routed_trainer_respects_eval_disabled():
-    config = load_config("configs/config.preprocess.yaml")
-    config.raw["eval"]["enabled"] = False
+def test_routed_trainer_consumes_exact_epoch_micro_batches():
     model = DummyModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    events: list[str] = []
-
-    def on_phase(name, state):
-        del state
-        events.append(name)
-
-    def standard_eval(model, dataloader, state):
-        del model, dataloader, state
-        raise AssertionError("standard eval should not run when eval.enabled is false")
-
     trainer = RoutedTrainer(
-        config=config,
         accelerator=FakeAccelerator(),
-        hooks=TrainerHooks(on_phase=on_phase, run_standard_eval=standard_eval),
         cadence=TrainerCadence(
-            eval_every_train_steps=1,
+            eval_every_train_steps=10,
             checkpoint_every_n_validations=1,
-            bfcl_every_n_validations=1,
+            bfcl_every_n_validations=None,
         ),
     )
 
     state = trainer.fit(
         model,
         optimizer,
-        [batch(1), batch(2)],
-        valid_dataloader=[batch(3)],
-        max_steps=2,
-        gradient_accumulation_steps=1,
+        [batch(1), batch(2), batch(3)],
+        total_steps=4,
+        total_micro_batches=6,
+        gradient_accumulation_steps=2,
     )
 
-    assert state.global_step == 2
-    assert state.validation_index == 0
-    assert events == []
+    assert state.global_step == 4
+    assert state.consumed_batches == 6
+
+
+def test_partial_epoch_accumulation_rescales_accelerate_backward_loss():
+    seen_backward_losses: list[float] = []
+
+    class ScalingAccelerator(FakeAccelerator):
+        gradient_accumulation_steps = 4
+
+        def backward(self, loss):
+            seen_backward_losses.append(float(loss.detach().item()))
+            (loss / self.gradient_accumulation_steps).backward()
+
+    model = DummyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    trainer = RoutedTrainer(
+        accelerator=ScalingAccelerator(),
+        cadence=TrainerCadence(
+            eval_every_train_steps=10,
+            checkpoint_every_n_validations=1,
+            bfcl_every_n_validations=None,
+        ),
+    )
+
+    trainer.fit(
+        model,
+        optimizer,
+        [batch(1), batch(2)],
+        total_steps=1,
+        total_micro_batches=2,
+        gradient_accumulation_steps=4,
+    )
+
+    assert seen_backward_losses == [2.0, 4.0]
 
 
 def test_training_step_metrics_are_aggregated_across_ranks():

@@ -8,7 +8,7 @@ from conftest import CharTokenizer
 
 
 def test_preprocess_raw_rows_rejects_zero_supervised_without_aborting():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     rows = [
         {
             "sample_id": "short-dropped",

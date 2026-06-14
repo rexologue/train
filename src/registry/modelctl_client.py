@@ -4,12 +4,10 @@ from registry.tags import validate_training_aliases
 
 
 def build_modelctl_register_args(
-    modelctl_path: str,
     model_name: str,
     artifact_path: str,
     aliases: list[str],
     *,
-    kind: str = "generic",
     tracking_uri: str | None = None,
     training_tags_json: str | None = None,
     general_tags_json: str | None = None,
@@ -22,7 +20,7 @@ def build_modelctl_register_args(
     """
 
     validate_training_aliases(aliases)
-    args = [modelctl_path, "register", artifact_path, model_name, "--kind", kind]
+    args = ["modelctl", "register", artifact_path, model_name, "--kind", "generic"]
     for alias in aliases:
         args.extend(["--alias", alias])
     if tracking_uri:
@@ -31,22 +29,4 @@ def build_modelctl_register_args(
         args.extend(["--general-tags-json", general_tags_json])
     if training_tags_json:
         args.extend(["--training-tags-json", training_tags_json])
-    return args
-
-
-def build_modelctl_pull_args(modelctl_path: str, ref: str, output_dir: str, *, tracking_uri: str | None = None) -> list[str]:
-    """Build args for `modelctl pull REF OUTPUT_DIR` without overwrite by default."""
-
-    args = [modelctl_path, "pull", ref, output_dir]
-    if tracking_uri:
-        args.extend(["--tracking-uri", tracking_uri])
-    return args
-
-
-def build_modelctl_info_args(modelctl_path: str, ref: str, *, tracking_uri: str | None = None) -> list[str]:
-    """Build args for `modelctl info REF`."""
-
-    args = [modelctl_path, "info", ref]
-    if tracking_uri:
-        args.extend(["--tracking-uri", tracking_uri])
     return args

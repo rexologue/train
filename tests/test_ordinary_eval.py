@@ -36,7 +36,7 @@ class FakeTrainerAccelerator:
 
 
 def test_standard_eval_respects_max_batches_and_counts_supervised_tokens():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     config.raw["eval"]["standard"]["max_batches"] = 1
     trainer = RoutedTrainer(
         accelerator=FakeTrainerAccelerator(),
@@ -66,7 +66,7 @@ def test_standard_eval_respects_max_batches_and_counts_supervised_tokens():
 
 
 def test_standard_eval_weights_loss_by_supervised_tokens():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     config.raw["eval"]["standard"]["max_batches"] = None
     trainer = RoutedTrainer(
         accelerator=FakeTrainerAccelerator(),

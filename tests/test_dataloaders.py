@@ -7,7 +7,6 @@ import pytest
 
 from config import load_config
 from data.dataloaders import build_dataloaders, validate_sft_only_training_inputs
-from data.inspection import inspect_random_batch
 from preprocessing.io import PretokSplitResult
 
 
@@ -77,7 +76,7 @@ def _write_pretok(path: Path) -> None:
 def test_build_dataloaders_requires_train_and_valid(tmp_path):
     valid_path = tmp_path / "valid.parquet"
     _write_pretok(valid_path)
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
 
     with pytest.raises(ValueError, match="missing=\\['train'\\]"):
         build_dataloaders(config, [_pretok_result("valid", valid_path)], pad_token_id=0)
@@ -88,7 +87,7 @@ def test_build_dataloaders_from_pretokenized_parquet(tmp_path):
     valid_path = tmp_path / "valid.parquet"
     _write_pretok(train_path)
     _write_pretok(valid_path)
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     config.raw["training"]["per_device_train_batch_size"] = 2
     config.raw["training"]["drop_last"] = False
 
@@ -105,36 +104,12 @@ def test_build_dataloaders_from_pretokenized_parquet(tmp_path):
             assert batch["loss_kind"] in {"sft_target", "sft_tool", "dpo_target"}
 
 
-def test_inspect_random_batch_reports_shapes_and_element(tmp_path):
-    train_path = tmp_path / "train.parquet"
-    valid_path = tmp_path / "valid.parquet"
-    _write_pretok(train_path)
-    _write_pretok(valid_path)
-    config = load_config("configs/config.preprocess.yaml")
-    config.raw["training"]["per_device_train_batch_size"] = 2
-
-    bundle = build_dataloaders(
-        config,
-        [_pretok_result("train", train_path), _pretok_result("valid", valid_path)],
-        pad_token_id=0,
-    )
-    report = inspect_random_batch(bundle, split="train", seed=1, token_limit=1)
-
-    assert report["split"] == "train"
-    assert report["keys"]
-    assert report["shapes"]
-    assert report["element"]
-    tensor_previews = [value for value in report["element"].values() if isinstance(value, dict) and value.get("num_values")]
-    assert tensor_previews
-    assert all(len(preview["values"]) <= 1 for preview in tensor_previews)
-
-
 def test_sft_only_training_rejects_dpo_rows(tmp_path):
     train_path = tmp_path / "train.parquet"
     valid_path = tmp_path / "valid.parquet"
     _write_pretok(train_path)
     _write_pretok(valid_path)
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     bundle = build_dataloaders(
         config,
         [_pretok_result("train", train_path), _pretok_result("valid", valid_path)],

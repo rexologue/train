@@ -16,7 +16,7 @@ def supervised_text(rendered: str, input_ids: list[int], labels: list[int]) -> s
 
 
 def test_sft_masks_all_long_assistant_replies_for_sft_target():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     tokenizer = CharTokenizer()
     renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(
@@ -41,7 +41,7 @@ def test_sft_masks_all_long_assistant_replies_for_sft_target():
 
 
 def test_tool_policy_supervises_tool_call_and_final_answer_not_tool_response():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     tokenizer = CharTokenizer()
     renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(
@@ -78,7 +78,7 @@ def test_tool_policy_supervises_tool_call_and_final_answer_not_tool_response():
 
 
 def test_tool_policy_supervises_text_answer_after_user_when_no_tool_needed():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     tokenizer = CharTokenizer()
     renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(
@@ -101,7 +101,7 @@ def test_tool_policy_supervises_text_answer_after_user_when_no_tool_needed():
 
 
 def test_dpo_masks_only_chosen_and_rejected_completion_text():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     tokenizer = CharTokenizer()
     renderer = QwenTemplateRenderer(None, config.rendering)
     row = canonicalize_row(

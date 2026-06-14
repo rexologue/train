@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 from config import TrainingConfig
-from config.model_source import effective_tokenizer_id
 from preprocessing.io import PretokSplitResult, debug_path, load_manifest
 from tracking.lineage import collect_code_metadata, collect_tracking_lineage
 from tracking.model_source import ModelSourceResolution, resolve_model_source
@@ -19,7 +18,7 @@ class ExperimentTracker:
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.mlflow_config = config.raw.get("mlflow") if isinstance(config.raw.get("mlflow"), dict) else {}
-        self.enabled = bool(self.mlflow_config.get("enabled", False))
+        self.enabled = True
         self.tracking_uri = str(self.mlflow_config.get("tracking_uri") or "")
         self.mlflow: Any = None
         self.run: Any = None
@@ -35,7 +34,7 @@ class ExperimentTracker:
 
         self.mlflow = mlflow
         mlflow.set_tracking_uri(self.tracking_uri)
-        mlflow.set_experiment(str(self.mlflow_config["experiment_name"]))
+        mlflow.set_experiment(str(self.config.section("project")["name"]))
         resume_run_id = self.mlflow_config.get("resume_run_id")
         run_name = self.config.section("project").get("run_name")
         self.run = mlflow.start_run(run_id=resume_run_id or None, run_name=str(run_name) if run_name else None)
@@ -50,9 +49,6 @@ class ExperimentTracker:
 
         resolution = resolve_model_source(self.config, tracking_uri=self.tracking_uri or None)
         self.config.raw.setdefault("model", {})["resolved_model_id"] = resolution.effective_model_id
-        tokenizer_config = self.config.raw.get("tokenizer")
-        if isinstance(tokenizer_config, dict):
-            tokenizer_config["effective_tokenizer_id"] = effective_tokenizer_id(self.config)
         self.log_model_source_resolution(resolution)
         return resolution
 
@@ -73,7 +69,8 @@ class ExperimentTracker:
             "stage": "training_pipeline",
             "project.name": str(project.get("name")),
             "project.run_name": str(project.get("run_name")),
-            "model.base_model_id": str(model.get("base_model_id")),
+            "model.registry_name": str(model.get("name")),
+            "model.registry_alias": str(model.get("alias")),
             "model.resolved_model_id": str(model.get("resolved_model_id")),
             "code.git_commit": str(code.get("commit")),
             "code.git_dirty": "true" if code.get("dirty") else "false",
@@ -109,14 +106,14 @@ class ExperimentTracker:
         return lineage
 
     def log_model_source_resolution(self, resolution: ModelSourceResolution) -> None:
-        """Log local/HF or registry model source resolution."""
+        """Log registry model resolution."""
 
         if not self.enabled:
             return
         data = resolution.to_dict()
         self.mlflow.log_dict(data, "model/source_resolution.json")
         tags = {
-            "model.source.kind": resolution.kind,
+            "model.registry_source": "true",
             "model.effective_model_id": resolution.effective_model_id,
         }
         if resolution.ref:

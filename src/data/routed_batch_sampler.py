@@ -60,7 +60,7 @@ class RoutedBatchSampler:
         return len(self.batches)
 
     def summary(self) -> dict[str, object]:
-        """Return lightweight routing stats for startup logging and audits."""
+        """Return lightweight routing stats for logging and audits."""
 
         rows_by_loss_kind = {loss_kind: len(indices) for loss_kind, indices in sorted(self.groups.items())}
         batches_by_loss_kind: dict[str, int] = {loss_kind: 0 for loss_kind in rows_by_loss_kind}

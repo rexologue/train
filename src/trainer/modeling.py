@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
-from config import effective_tokenizer_id
+from config import effective_model_id
 
 
 @dataclass(frozen=True)
@@ -22,8 +23,7 @@ def load_tokenizer(config: Any) -> Any:
     tokenizer_config = config.section("tokenizer")
     model_config = config.section("model")
     tokenizer = AutoTokenizer.from_pretrained(
-        effective_tokenizer_id(config),
-        revision=tokenizer_config.get("tokenizer_revision"),
+        effective_model_id(config),
         use_fast=bool(tokenizer_config.get("use_fast", True)),
         trust_remote_code=bool(model_config.get("trust_remote_code", True)),
         padding_side=tokenizer_config.get("padding_side", "right"),
@@ -42,7 +42,6 @@ def load_base_model(config: Any) -> Any:
     model_config = config.section("model")
     validate_model_runtime_requirements(model_config)
     kwargs: dict[str, Any] = {
-        "revision": model_config.get("base_model_revision"),
         "trust_remote_code": bool(model_config.get("trust_remote_code", True)),
         "torch_dtype": precision_to_dtype(str(model_config.get("precision", "bf16"))),
     }
@@ -92,12 +91,8 @@ def freeze_configured_modules(model: Any, model_config: dict[str, Any]) -> None:
 
 def apply_lora(config: Any, model: Any) -> Any:
     lora = config.section("lora")
-    if not bool(lora.get("enabled", False)):
-        return model
     from peft import LoraConfig, TaskType, get_peft_model
 
-    if lora.get("target_modules_policy") != "whitelist":
-        raise ValueError("only lora.target_modules_policy=whitelist is supported")
     target_modules = lora.get("target_modules")
     if not target_modules:
         raise ValueError("lora.target_modules must be configured for training")
@@ -129,17 +124,25 @@ def build_optimizer(config: Any, model: Any) -> Any:
     )
 
 
-def build_scheduler(config: Any, optimizer: Any) -> Any:
+def training_steps_for_epochs(config: Any, train_dataloader: Any, *, num_processes: int = 1) -> int:
+    """Resolve epoch count into optimizer steps for the distributed DataLoader."""
+
+    training = config.section("training")
+    micro_batches_per_process = math.ceil(len(train_dataloader) / max(int(num_processes), 1))
+    steps_per_epoch = math.ceil(micro_batches_per_process / int(training.get("gradient_accumulation_steps", 1)))
+    return steps_per_epoch * int(training["num_epochs"])
+
+
+def build_scheduler(config: Any, optimizer: Any, *, total_steps: int) -> Any:
     from transformers import get_scheduler
 
     training = config.section("training")
-    max_steps = int(training["max_steps"])
-    warmup_steps = int(max_steps * float(training.get("warmup_ratio", 0.0)))
+    warmup_steps = int(total_steps * float(training.get("warmup_ratio", 0.0)))
     return get_scheduler(
         str(training.get("lr_scheduler_type", "cosine")),
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=max_steps,
+        num_training_steps=total_steps,
     )
 
 
@@ -150,12 +153,18 @@ def load_lora_adapter(config: Any, model: Any, adapter_path: str | Path) -> Any:
     return PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
 
 
-def build_training_objects(config: Any, *, resume_adapter_path: str | Path | None = None, tokenizer: Any | None = None) -> TrainingObjects:
+def build_training_objects(
+    config: Any,
+    *,
+    total_steps: int,
+    resume_adapter_path: str | Path | None = None,
+    tokenizer: Any | None = None,
+) -> TrainingObjects:
     tokenizer = load_tokenizer(config) if tokenizer is None else tokenizer
     base_model = load_base_model(config)
     model = load_lora_adapter(config, base_model, resume_adapter_path) if resume_adapter_path is not None else apply_lora(config, base_model)
     optimizer = build_optimizer(config, model)
-    scheduler = build_scheduler(config, optimizer)
+    scheduler = build_scheduler(config, optimizer, total_steps=total_steps)
     return TrainingObjects(tokenizer=tokenizer, model=model, optimizer=optimizer, scheduler=scheduler)
 
 

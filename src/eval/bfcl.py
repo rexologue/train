@@ -17,7 +17,7 @@ def run_bfcl_eval(
     eval_config = config.section("eval")
     bfcl_config = eval_config["bfcl"]
     validator = BFCLValidator.from_jsonl(
-        bfcl_config.get("eval_path"),
+        None,
         categories=set(bfcl_config["categories"]) if bfcl_config.get("categories") else None,
         include_multi_turn=bool(bfcl_config.get("include_multi_turn", True)),
         limit=bfcl_config.get("limit"),
@@ -85,14 +85,7 @@ def _summary_metrics(summary: dict[str, Any]) -> dict[str, float]:
 
 
 def _write_rows(config: Any, summary: dict[str, Any]) -> None:
-    rows_out = config.section("eval")["bfcl"].get("rows_out")
-    if not rows_out:
-        return
-    output_dir = Path(config.section("project")["output_dir"])
-    path = Path(rows_out)
-    if not path.is_absolute():
-        path = output_dir / path
-    dump_jsonl(path, summary["rows"])
+    dump_jsonl(config.bfcl_rows_path, summary["rows"])
 
 
 def merge_prediction_items(items: list[tuple[str, Any]]) -> dict[str, Any]:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 from contextlib import nullcontext
 from numbers import Number
@@ -21,17 +20,15 @@ from checkpointing import (
     validate_resume_checkpoint,
 )
 from data.dataloaders import build_dataloaders, validate_sft_only_training_inputs
-from data.inspection import inspect_random_batch
 from eval.bfcl import run_bfcl_eval
 from eval.ordinary import run_standard_eval
-from preprocessing.io import load_pretokenized_split_results
 from preprocessing.pipeline import prepare_pretokenized_splits
 from registry.package import build_candidate_registration_args
 from registry.selection import CandidateWindowSelector, RegistrationDecision
 from tracking import ExperimentTracker
 from trainer.callbacks import TrainerHooks
 from trainer.distributed import create_accelerator, prepare_with_accelerator
-from trainer.modeling import build_training_objects, load_tokenizer
+from trainer.modeling import build_training_objects, load_tokenizer, training_steps_for_epochs
 from trainer.progress import TrainingProgress
 from trainer.state import TrainerState
 from trainer.trainer import RoutedTrainer
@@ -43,14 +40,7 @@ def main() -> None:
     """Top-level training orchestrator."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/config.preprocess.yaml")
-    parser.add_argument("--splits", nargs="+", default=["train", "valid"], choices=["train", "valid", "test"])
-    parser.add_argument("--force-preprocess", action="store_true")
-    parser.add_argument("--preprocess-only", action="store_true")
-    parser.add_argument("--train", action="store_true", help="Run training even when training.enabled=false.")
-    parser.add_argument("--inspect-random-batch", action="store_true")
-    parser.add_argument("--inspect-split", default="train", choices=["train", "valid", "test"])
-    parser.add_argument("--inspect-token-limit", type=int, default=32)
+    parser.add_argument("--config", required=True)
 
     args = parser.parse_args()
 
@@ -60,11 +50,9 @@ def main() -> None:
     logger.info("config loaded: project=%s run_name=%s", config.section("project")["name"], config.section("project").get("run_name"))
     set_seed(int(config.section("project").get("seed", 0)))
 
-    training_enabled = bool(config.section("training").get("enabled", True))
-    should_train = args.train or (training_enabled and not args.preprocess_only)
-    runtime = create_accelerator(config) if should_train else None
-    accelerator = runtime.accelerator if runtime is not None else None
-    is_main_process = bool(getattr(accelerator, "is_main_process", True)) if accelerator is not None else True
+    runtime = create_accelerator(config)
+    accelerator = runtime.accelerator
+    is_main_process = bool(getattr(accelerator, "is_main_process", True))
     configure_logging(is_main_process=is_main_process)
 
     tracker = ExperimentTracker.from_config(config)
@@ -74,8 +62,7 @@ def main() -> None:
         if is_main_process:
             model_source = tracker.resolve_model_source()
             logger.info(
-                "model source resolved: kind=%s effective_model_id=%s ref=%s pulled=%s used_local=%s",
-                model_source.kind,
+                "registry model resolved: effective_model_id=%s ref=%s pulled=%s used_local=%s",
                 model_source.effective_model_id,
                 model_source.ref,
                 model_source.pulled,
@@ -83,14 +70,13 @@ def main() -> None:
             )
             tracker.log_run_start(config_path=args.config)
             tracker.log_lineage()
-        if accelerator is not None:
-            accelerator.wait_for_everyone()
+        accelerator.wait_for_everyone()
         if not is_main_process:
             configure_model_source_without_side_effects(config)
 
         if is_main_process:
-            logger.info("preparing pretokenized splits: %s", ",".join(args.splits))
-            results = prepare_pretokenized_splits(config, args.splits, force=args.force_preprocess)
+            logger.info("building training data cache")
+            results = prepare_pretokenized_splits(config, ["train", "valid", "test"])
             for result in results:
                 logger.info(
                     "split ready: split=%s reused=%s rows=%s rejected=%s pretok=%s manifest=%s",
@@ -102,10 +88,11 @@ def main() -> None:
                     result.manifest_path,
                 )
             tracker.log_preprocessing_results(results)
-        if accelerator is not None:
-            accelerator.wait_for_everyone()
+        accelerator.wait_for_everyone()
         if not is_main_process:
-            results = load_pretokenized_split_results(config, args.splits)
+            from preprocessing.io import load_pretokenized_split_results
+
+            results = load_pretokenized_split_results(config, ["train", "valid", "test"])
 
         logger.info("building routed dataloaders")
         dataloaders = build_dataloaders(config, results)
@@ -122,19 +109,6 @@ def main() -> None:
             )
         if is_main_process:
             tracker.log_dataloaders(dataloaders)
-
-        if args.inspect_random_batch and is_main_process:
-            report = inspect_random_batch(
-                dataloaders,
-                split=args.inspect_split,
-                seed=int(config.section("project").get("seed", 0)),
-                token_limit=args.inspect_token_limit,
-            )
-            logger.info("random dataloader batch inspection:\n%s", json.dumps(report, ensure_ascii=False, indent=2))
-
-        if not should_train:
-            logger.info("startup preprocessing and dataloader build complete; training skipped")
-            return
 
         validate_sft_only_training_inputs(config, dataloaders)
         run_training(config, dataloaders, tracker, runtime=runtime)
@@ -154,9 +128,19 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
     if resume_checkpoint is not None:
         validate_resume_checkpoint(config, resume_checkpoint, current_resume_hashes)
 
-    logger.info("loading tokenizer, model, LoRA adapter, optimizer, scheduler")
+    total_steps = training_steps_for_epochs(
+        config,
+        dataloaders["train"].dataloader,
+        num_processes=int(getattr(accelerator, "num_processes", 1)),
+    )
+    logger.info(
+        "loading tokenizer, model, LoRA adapter, optimizer, scheduler: epochs=%s optimizer_steps=%s",
+        config.section("training")["num_epochs"],
+        total_steps,
+    )
     objects = build_training_objects(
         config,
+        total_steps=total_steps,
         resume_adapter_path=adapter_dir(resume_checkpoint) if resume_checkpoint is not None else None,
         tokenizer=resume_hash_tokenizer,
     )
@@ -173,6 +157,13 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
         valid_loader,
         objects.scheduler,
     )
+    prepared_total_steps = training_steps_for_epochs(config, train_loader)
+    if prepared_total_steps != total_steps:
+        raise RuntimeError(
+            "resolved optimizer-step count changed after Accelerate DataLoader sharding: "
+            f"before_prepare={total_steps} after_prepare={prepared_total_steps}"
+        )
+    total_micro_batches = len(train_loader) * int(config.section("training")["num_epochs"])
     state = load_trainer_state(resume_checkpoint) if resume_checkpoint is not None else TrainerState()
     if resume_checkpoint is not None:
         accelerate_state = Path(resume_checkpoint) / "accelerate_state"
@@ -191,10 +182,10 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
 
     async_worker = tracker.create_async_worker()
     async_context = async_worker if async_worker is not None else nullcontext()
-    registry_selector = restore_registry_selector(config, state) if bool(config.section("registry").get("enabled", False)) else None
+    registry_selector = restore_registry_selector(config, state)
     progress_config = config.section("progress") if "progress" in config.raw else {}
     progress = TrainingProgress(
-        total_steps=int(config.section("training")["max_steps"]),
+        total_steps=total_steps,
         enabled=bool(progress_config.get("enabled", True)),
         main_process=bool(getattr(accelerator, "is_main_process", True)),
     )
@@ -245,7 +236,7 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
     def checkpoint_hook(model, optimizer, state: TrainerState, metrics: dict[str, float]) -> str | None:
         checkpointing = config.section("checkpointing")
         checkpoint_path = save_adapter_checkpoint(
-            root_dir=checkpointing["root_dir"],
+            root_dir=config.checkpoint_dir,
             model=model,
             optimizer=optimizer,
             state=state,
@@ -262,7 +253,7 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
         if registry_selector is not None:
             protected_paths.update(registry_selector.window_checkpoint_paths())
         deleted = prune_old_checkpoints(
-            checkpointing["root_dir"],
+            config.checkpoint_dir,
             checkpointing.get("save_total_limit"),
             protected_paths=protected_paths,
         )
@@ -287,13 +278,15 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
             scheduler=scheduler,
             valid_dataloader=valid_loader,
             state=state,
+            total_steps=total_steps,
+            total_micro_batches=total_micro_batches,
         )
         accelerator.wait_for_everyone()
         if async_worker is not None:
             async_worker.flush()
         if is_main_process():
             checkpointing = config.section("checkpointing")
-            deleted = prune_old_checkpoints(checkpointing["root_dir"], checkpointing.get("save_total_limit"))
+            deleted = prune_old_checkpoints(config.checkpoint_dir, checkpointing.get("save_total_limit"))
             for deleted_path in deleted:
                 logger.info("pruned old checkpoint after async flush: %s", deleted_path)
     return state
@@ -340,7 +333,7 @@ def restore_registry_selector(config, state: TrainerState) -> CandidateWindowSel
 
     first_pending_index = state.checkpoint_index - pending_count + 1
     restored = []
-    for checkpoint_path in list_checkpoints(config.section("checkpointing")["root_dir"]):
+    for checkpoint_path in list_checkpoints(config.checkpoint_dir):
         manifest = load_checkpoint_manifest(checkpoint_path)
         checkpoint_index = int(manifest.get("checkpoint_index", 0))
         if checkpoint_index < first_pending_index or checkpoint_index > state.checkpoint_index:
@@ -369,13 +362,7 @@ def restore_registry_selector(config, state: TrainerState) -> CandidateWindowSel
 
 def configure_model_source_without_side_effects(config) -> None:
     model = config.section("model")
-    source = model.get("source")
-    if isinstance(source, dict):
-        local_dir = source.get("local_dir")
-        if local_dir:
-            model["resolved_model_id"] = str(Path(str(local_dir)).expanduser().resolve())
-            return
-    model["resolved_model_id"] = str(model["base_model_id"])
+    model["resolved_model_id"] = str(Path(str(model["cache_dir"])).expanduser().resolve())
 
 
 if __name__ == "__main__":

@@ -55,12 +55,13 @@ class CandidateWindowSelector:
     @classmethod
     def from_config(cls, config: Any, *, next_candidate_index: int = 1) -> "CandidateWindowSelector":
         registry = config.section("registry")
+        selection = registry["selection"]
         return cls(
             register_every_n_checkpoints=int(registry["register_every_n_checkpoints"]),
-            selection_metric=str(registry["selection_metric"]),
-            greater_is_better=bool(registry.get("greater_is_better", True)),
-            candidate_alias_template=str(registry["candidate_alias_template"]),
-            rolling_candidate_alias=registry.get("rolling_candidate_alias"),
+            selection_metric=str(selection["metric"]),
+            greater_is_better=str(selection["mode"]) == "max",
+            candidate_alias_template="candidate-{candidate_index:06d}",
+            rolling_candidate_alias="candidate-latest",
             next_candidate_index=next_candidate_index,
         )
 

@@ -63,12 +63,9 @@ def resolve_resume_checkpoint(config) -> Path | None:
     if not isinstance(resume, dict) or not resume.get("enabled", False):
         return None
     raw_path = resume.get("path")
-    if raw_path in (None, "", "auto"):
-        return find_latest_checkpoint(config.section("checkpointing")["root_dir"])
-    path = Path(raw_path)
-    if not path.exists():
-        raise FileNotFoundError(f"explicit resume checkpoint does not exist: {path}")
-    return path
+    if raw_path not in (None, "", "auto"):
+        raise ValueError("checkpointing.resume.path is no longer configurable")
+    return find_latest_checkpoint(config.checkpoint_dir)
 
 
 def build_resume_hashes(config, *, tokenizer=None) -> dict[str, str]:

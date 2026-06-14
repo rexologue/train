@@ -12,8 +12,8 @@ from preprocessing.pipeline import (
 from preprocessing.rendering import RenderingAuditError
 
 
-class StartupTokenizer:
-    chat_template = "startup-test-template"
+class TrainingDataTokenizer:
+    chat_template = "training-data-test-template"
     model_max_length = 32
 
     def __call__(self, text: str, add_special_tokens: bool = False, return_offsets_mapping: bool = False):
@@ -38,7 +38,7 @@ class StartupTokenizer:
         return "".join(parts)
 
 
-class ThinkingTokenizer(StartupTokenizer):
+class ThinkingDataTokenizer(TrainingDataTokenizer):
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, tools=None):
         return "<think>hidden</think>\n" + super().apply_chat_template(messages, tokenize, add_generation_prompt, tools)
 
@@ -55,7 +55,7 @@ def sft_row(sample_id: str, user_content: str = "q", assistant_content: str = "l
 
 
 def test_split_cache_reuse_depends_on_split_hash_signature_and_content_hash(tmp_path):
-    root = tmp_path / "pretok"
+    root = tmp_path / "pretokenized"
     manifest = write_split_cache(
         root,
         "valid",
@@ -85,7 +85,7 @@ def test_split_cache_reuse_depends_on_split_hash_signature_and_content_hash(tmp_
 
 
 def test_load_pretokenized_split_results_from_existing_manifest(tmp_path):
-    root = tmp_path / "pretok"
+    root = tmp_path / "pretokenized"
     raw_train = tmp_path / "train.parquet"
     raw_valid = tmp_path / "valid.parquet"
     raw_train.write_bytes(b"train")
@@ -120,8 +120,8 @@ def test_load_pretokenized_split_results_from_existing_manifest(tmp_path):
         base_manifest=load_manifest(root) or {},
         examples_per_loss_kind=5,
     )
-    config = load_config("configs/config.preprocess.yaml")
-    config.raw["preprocessing"]["output"]["root_dir"] = str(root)
+    config = load_config("configs/config.example.yaml")
+    config.raw["project"]["output_dir"] = str(tmp_path)
     config.raw["preprocessing"]["raw"]["train_path"] = str(raw_train)
     config.raw["preprocessing"]["raw"]["valid_path"] = str(raw_valid)
 
@@ -132,17 +132,17 @@ def test_load_pretokenized_split_results_from_existing_manifest(tmp_path):
     assert results[0].manifest["input_sha256"] == "sha256:train"
 
 
-def test_startup_template_falls_back_when_no_thinking_kwarg_is_unsupported():
-    config = load_config("configs/config.preprocess.yaml")
+def test_training_data_template_falls_back_when_no_thinking_kwarg_is_unsupported():
+    config = load_config("configs/config.example.yaml")
 
-    _processed, debug, stats = _preprocess_sft_dataset_row(sft_row("fallback"), StartupTokenizer(), config)
+    _processed, debug, stats = _preprocess_sft_dataset_row(sft_row("fallback"), TrainingDataTokenizer(), config)
     assert debug["unsupported_apply_chat_template_kwargs"] == ["enable_thinking"]
     assert stats["unsupported_apply_chat_template_kwargs/enable_thinking"] == 1
 
 
-def test_startup_debug_loss_only_text_is_decoded_from_labels():
-    config = load_config("configs/config.preprocess.yaml")
-    processed, debug, _stats = _preprocess_sft_dataset_row(sft_row("loss-only"), StartupTokenizer(), config)
+def test_training_data_debug_loss_only_text_is_decoded_from_labels():
+    config = load_config("configs/config.example.yaml")
+    processed, debug, _stats = _preprocess_sft_dataset_row(sft_row("loss-only"), TrainingDataTokenizer(), config)
 
     expected = "".join(chr(token_id) for token_id, label in zip(processed["input_ids"], processed["labels"]) if label != config.ignore_index)
     assert debug["loss_only_text"] == expected
@@ -150,11 +150,11 @@ def test_startup_debug_loss_only_text_is_decoded_from_labels():
 
 
 def test_think_block_is_excluded_from_loss_when_thinking_disabled():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     visible = "visible " * 20
     _processed, debug, _stats = _preprocess_sft_dataset_row(
         sft_row("think-off", assistant_content=f"<think>hidden</think>{visible}"),
-        StartupTokenizer(),
+        TrainingDataTokenizer(),
         config,
     )
 
@@ -162,27 +162,27 @@ def test_think_block_is_excluded_from_loss_when_thinking_disabled():
 
 
 def test_think_block_is_included_in_loss_when_thinking_enabled():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     config.raw["preprocessing"]["reasoning"]["enable_thinking"] = True
     visible = "visible " * 20
     _processed, debug, _stats = _preprocess_sft_dataset_row(
         sft_row("think-on", assistant_content=f"<think>hidden</think>{visible}"),
-        StartupTokenizer(),
+        TrainingDataTokenizer(),
         config,
     )
 
     assert debug["loss_only_text"] == f"<think>hidden</think>{visible}<|im_end|>"
 
 
-def test_startup_route_rejects_raw_template_markers():
-    config = load_config("configs/config.preprocess.yaml")
+def test_training_data_route_rejects_raw_template_markers():
+    config = load_config("configs/config.example.yaml")
 
     with pytest.raises(RenderingAuditError):
-        _preprocess_sft_dataset_row(sft_row("raw-marker", user_content="bad <|im_start|> marker"), StartupTokenizer(), config)
+        _preprocess_sft_dataset_row(sft_row("raw-marker", user_content="bad <|im_start|> marker"), TrainingDataTokenizer(), config)
 
 
-def test_overlong_startup_row_is_rejected_by_max_seq_len():
-    config = load_config("configs/config.preprocess.yaml")
+def test_overlong_training_row_is_rejected_by_max_seq_len():
+    config = load_config("configs/config.example.yaml")
     processed = {"input_ids": list(range(33))}
 
     with pytest.raises(ValueError, match="exceeds preprocessing.sequence.max_seq_len"):
@@ -190,8 +190,8 @@ def test_overlong_startup_row_is_rejected_by_max_seq_len():
 
 
 def test_configured_max_seq_len_must_not_exceed_model_context():
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     config.raw["preprocessing"]["sequence"]["max_seq_len"] = 64
 
     with pytest.raises(ValueError, match="preprocessing.sequence.max_seq_len"):
-        validate_configured_max_seq_len(config, StartupTokenizer())
+        validate_configured_max_seq_len(config, TrainingDataTokenizer())

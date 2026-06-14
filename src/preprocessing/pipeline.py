@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from config import TrainingConfig, effective_tokenizer_id, file_sha256, sha256_text, stable_hash
+from config import TrainingConfig, effective_model_id, file_sha256, sha256_text, stable_hash
 from preprocessing.io import (
     PretokSplitResult,
     cache_root,
@@ -39,6 +39,7 @@ IM_END = "<|im_end|>"
 THINK_BLOCK_RE = re.compile(r"<think>\s*(.*?)\s*</think>\s*", re.IGNORECASE | re.DOTALL)
 UNKNOWN_MODEL_CONTEXT_THRESHOLD = 1_000_000_000
 PREPROCESSING_SCHEMA_VERSION = 2
+AUDIT_EXAMPLES_PER_LOSS_KIND = 5
 
 
 def load_tokenizer(config: TrainingConfig) -> Any:
@@ -49,8 +50,7 @@ def load_tokenizer(config: TrainingConfig) -> Any:
     tokenizer_config = config.section("tokenizer")
     model_config = config.section("model")
     return AutoTokenizer.from_pretrained(
-        effective_tokenizer_id(config),
-        revision=tokenizer_config.get("tokenizer_revision"),
+        effective_model_id(config),
         use_fast=bool(tokenizer_config.get("use_fast", True)),
         trust_remote_code=bool(model_config.get("trust_remote_code", True)),
     )
@@ -107,8 +107,7 @@ def build_preprocessing_signature(config: TrainingConfig, tokenizer: Any) -> str
             "reasoning": config.reasoning,
             "masking": config.preprocessing["masking"],
             "tokenizer": {
-                "effective_id": effective_tokenizer_id(config),
-                "revision": tokenizer_config.get("tokenizer_revision"),
+                "effective_id": effective_model_id(config),
                 "use_fast": bool(tokenizer_config.get("use_fast", True)),
                 "add_special_tokens": bool(tokenizer_config.get("add_special_tokens", False)),
                 "class": tokenizer.__class__.__name__,
@@ -383,7 +382,7 @@ def _preprocess_sft_dataset_row(row: dict[str, Any], tokenizer: Any, config: Tra
     """Render, tokenize, and label one raw SFT/tool dataset row.
 
     This is the main per-row route for `sft_target` and `sft_tool` in the real
-    startup preprocessing path. It keeps the raw parquet payload immutable,
+    training-data pipeline. It keeps the raw parquet payload immutable,
     normalizes only the copy passed to Qwen's template, selects supervised
     assistant spans according to `loss_kind`, tokenizes the full rendered text
     with offsets, and finally builds labels that only expose selected assistant
@@ -530,14 +529,13 @@ def preprocess_split(
     tokenizer: Any,
     config: TrainingConfig,
     *,
-    force: bool = False,
     preprocessing_signature: str | None = None,
 ) -> PretokSplitResult:
     """Prepare or reuse one pretokenized split cache.
 
-    The split path is resolved by the caller. This function owns the core
-    startup lifecycle for a split: cache validation, dataframe read, row
-    preprocessing with a progress bar, flat parquet/debug/manifest writes, and
+    The split path is resolved by the caller. This function owns cache
+    validation, dataframe read, row
+    processing with a progress bar, flat parquet/debug/manifest writes, and
     rejected-row accounting.
     """
 
@@ -551,24 +549,22 @@ def preprocess_split(
 
     raw_hash = file_sha256(raw_path)
     max_seq_len = configured_max_seq_len(config)
-    reuse = bool(config.preprocessing["output"].get("reuse_if_hash_matches", True))
-    if reuse and not force:
-        valid, manifest = split_cache_is_valid(output_dir, split, raw_hash, preprocessing_signature)
-        if valid and manifest is not None:
-            logger.info("reusing pretokenized %s split from %s", split, pretok_path)
-            row_counts = (manifest.get("rows") or {}).get(split) or {}
-            legacy_split = (manifest.get("splits") or {}).get(split)
-            legacy_split = legacy_split if isinstance(legacy_split, dict) else {}
-            split_manifest = {
-                "split": split,
-                "raw_path": str(raw_path),
-                "input_sha256": raw_hash,
-                "pretok_sha256": (manifest.get("pretokenized") or {}).get(split) or legacy_split.get("pretok_sha256"),
-                "num_raw_rows": row_counts.get("raw", legacy_split.get("num_raw_rows")),
-                "num_rows": row_counts.get("processed", legacy_split.get("num_rows")),
-                "num_rejected_rows": row_counts.get("rejected", legacy_split.get("num_rejected_rows")),
-            }
-            return PretokSplitResult(split, raw_path, output_dir, pretok_path, cache_manifest_path, True, split_manifest)
+    valid, manifest = split_cache_is_valid(output_dir, split, raw_hash, preprocessing_signature)
+    if valid and manifest is not None:
+        logger.info("reusing pretokenized %s split from %s", split, pretok_path)
+        row_counts = (manifest.get("rows") or {}).get(split) or {}
+        legacy_split = (manifest.get("splits") or {}).get(split)
+        legacy_split = legacy_split if isinstance(legacy_split, dict) else {}
+        split_manifest = {
+            "split": split,
+            "raw_path": str(raw_path),
+            "input_sha256": raw_hash,
+            "pretok_sha256": (manifest.get("pretokenized") or {}).get(split) or legacy_split.get("pretok_sha256"),
+            "num_raw_rows": row_counts.get("raw", legacy_split.get("num_raw_rows")),
+            "num_rows": row_counts.get("processed", legacy_split.get("num_rows")),
+            "num_rejected_rows": row_counts.get("rejected", legacy_split.get("num_rejected_rows")),
+        }
+        return PretokSplitResult(split, raw_path, output_dir, pretok_path, cache_manifest_path, True, split_manifest)
 
     logger.info("reading %s raw dataframe from %s", split, raw_path)
     frame = read_raw_dataframe(raw_path)
@@ -606,7 +602,6 @@ def preprocess_split(
         stats["tokens"] += int(processed.get("length") or 0)
         stats["supervised_tokens"] += int(processed.get("num_supervised_tokens") or 0)
 
-    pretok_config = config.preprocessing["output"]
     base_manifest = load_manifest(output_dir) or {}
     split_manifest = {
         "split": split,
@@ -627,7 +622,7 @@ def preprocess_split(
         debug_rows,
         split_manifest,
         base_manifest=base_manifest,
-        examples_per_loss_kind=int(pretok_config.get("debug_examples_per_loss_kind", 5)),
+        examples_per_loss_kind=AUDIT_EXAMPLES_PER_LOSS_KIND,
     )
     logger.info("%s preprocessing complete: rows=%s rejected=%s pretok=%s", split, len(processed_rows), len(rejected_rows), pretok_path)
     if rejected_counts:
@@ -638,20 +633,17 @@ def preprocess_split(
 def prepare_pretokenized_splits(
     config: TrainingConfig,
     splits: list[str],
-    *,
-    force: bool = False,
 ) -> list[PretokSplitResult]:
-    """Top-level startup preprocessing entry used by `src/train.py`.
+    """Build or reuse the tokenized training-data cache.
 
-    Training startup calls this before any model-side trainer work. The function
-    loads exactly one tokenizer from config, logs the effective template hash,
-    resolves configured raw splits, and delegates each split to cache-aware
+    The function loads exactly one tokenizer from the resolved model directory,
+    logs the effective template hash, resolves configured raw splits, and delegates each split to cache-aware
     preprocessing. If hashes match an existing pretokenized split, the split is
     reused; otherwise the raw parquet is rendered/tokenized into the flat cache.
     """
 
     logger = get_logger(__name__)
-    logger.info("loading tokenizer: %s", effective_tokenizer_id(config))
+    logger.info("loading tokenizer from model directory: %s", effective_model_id(config))
     tokenizer = load_tokenizer(config)
     max_seq_len = validate_configured_max_seq_len(config, tokenizer)
     model_context = tokenizer_model_context(tokenizer)
@@ -673,7 +665,6 @@ def prepare_pretokenized_splits(
                 raw_path,
                 tokenizer,
                 config,
-                force=force,
                 preprocessing_signature=preprocessing_signature,
             )
         )

@@ -60,7 +60,8 @@ def test_candidate_window_selector_registers_best_checkpoint_after_window(tmp_pa
 
 
 def test_build_candidate_registration_args_uses_adapter_checkpoint_package(tmp_path):
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
+    config.raw["registry"]["selection"] = {"metric": "eval/bfcl/accuracy", "mode": "max"}
     selector = CandidateWindowSelector.from_config(config)
     decision = selector.observe_checkpoint(
         checkpoint_path=tmp_path / "step-000100",
@@ -104,10 +105,13 @@ def test_build_candidate_registration_args_uses_adapter_checkpoint_package(tmp_p
 
 
 def test_restore_registry_selector_preserves_incomplete_window(tmp_path):
-    config = load_config("configs/config.preprocess.yaml")
-    config.raw["checkpointing"]["root_dir"] = str(tmp_path)
+    config = load_config("configs/config.example.yaml")
+    config.raw["registry"]["selection"] = {"metric": "eval/bfcl/accuracy", "mode": "max"}
+    config.raw["project"]["output_dir"] = str(tmp_path.parent)
+    checkpoint_root = config.checkpoint_dir
+    checkpoint_root.mkdir()
     for index in range(1, 5):
-        checkpoint = tmp_path / f"step-{index * 10:06d}"
+        checkpoint = checkpoint_root / f"step-{index * 10:06d}"
         checkpoint.mkdir()
         (checkpoint / "manifest.json").write_text(
             json.dumps(
@@ -122,7 +126,7 @@ def test_restore_registry_selector_preserves_incomplete_window(tmp_path):
 
     selector = restore_registry_selector(config, TrainerState(global_step=40, checkpoint_index=4))
     decision = selector.observe_checkpoint(
-        checkpoint_path=tmp_path / "step-000050",
+        checkpoint_path=checkpoint_root / "step-000050",
         checkpoint_index=5,
         global_step=50,
         metrics={"eval/bfcl/accuracy": 0.1},

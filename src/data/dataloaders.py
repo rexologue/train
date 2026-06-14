@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from config import TrainingConfig, effective_tokenizer_id
+from config import TrainingConfig, effective_model_id
 from data.collators import RoutedCollator
 from data.pretokenized_dataset import PretokenizedDataset
 from data.routed_batch_sampler import RoutedBatchSampler
@@ -29,7 +29,7 @@ class SplitDataLoader:
 
 @dataclass(frozen=True)
 class DataLoaderBundle:
-    """Container for all split DataLoader instances built at startup."""
+    """Container for all split DataLoader instances used by the run."""
 
     splits: dict[str, SplitDataLoader]
 
@@ -40,9 +40,8 @@ class DataLoaderBundle:
 def resolve_pad_token_id(config: TrainingConfig) -> int:
     """Load tokenizer metadata and return the configured padding token id.
 
-    Preprocessing already loads the tokenizer for rendering/tokenization. The
-    startup DataLoader stage currently reloads tokenizer metadata only to avoid
-    hardcoding padding behavior before a shared training context exists.
+    The tokenizer metadata is reloaded here to avoid hardcoding padding
+    behavior before the training objects are constructed.
     """
 
     from transformers import AutoTokenizer
@@ -50,8 +49,7 @@ def resolve_pad_token_id(config: TrainingConfig) -> int:
     tokenizer_config = config.section("tokenizer")
     model_config = config.section("model")
     tokenizer = AutoTokenizer.from_pretrained(
-        effective_tokenizer_id(config),
-        revision=tokenizer_config.get("tokenizer_revision"),
+        effective_model_id(config),
         use_fast=bool(tokenizer_config.get("use_fast", True)),
         trust_remote_code=bool(model_config.get("trust_remote_code", True)),
     )

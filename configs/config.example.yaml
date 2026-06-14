@@ -1,300 +1,163 @@
-# Самодокументированный пример production-конфига.
-# Комментарии описывают текущую реализацию, а не желаемое будущее состояние.
-# Если параметр не описан здесь, значит он не должен быть training-critical.
+# Единственный production-конфиг. Запуск всегда выполняет полный training contour.
 
 project:
-  # Логическое имя проекта/run family. Используется в логах и artifact paths.
-  name: dummy-qwen35-a3b-run
-  # Имя конкретного MLflow run. null разрешен, тогда MLflow сам назначит имя.
-  run_name: dummy-run
-  # Глобальный seed для Python/NumPy/Torch и deterministic sampler behavior.
+  # Одно имя для MLflow experiment и destination model в registry.
+  name: estadel-dialog-sft
+  # Имя MLflow run. null разрешен.
+  run_name: qwen35-a3b-lora-v1
   seed: 42
-  # Корень локальных output artifacts: progress/eval rows/etc.
-  output_dir: runs/dummy-qwen35-a3b-run
+  # Единственный output root. Pretokenized cache, checkpoints и eval rows
+  # автоматически пишутся в подпапки этого каталога.
+  output_dir: runs/estadel-dialog-sft/qwen35-a3b-lora-v1
 
 model:
-  # Base checkpoint для Transformers AutoModelForCausalLM.
-  # Для registry source фактический путь будет записан в model.resolved_model_id.
-  base_model_id: /path/to/base/model
-  # Optional HF/local revision. null значит "revision не фиксируем".
-  base_model_revision: dummy-revision
-  # Человеческая ссылка на source model для lineage; не используется как loader path.
-  source_model_ref: models:/dummy-source@baseline
-  source:
-    # local_or_hf: использовать base_model_id/local_dir напрямую.
-    # registry: подтянуть/проверить модель через modelctl/MLflow registry.
-    kind: local_or_hf
-    # Для registry: имя registered model.
-    model_name: null
-    # Для registry: ровно одно из alias/version должно быть задано.
-    alias: null
-    version: null
-    # Для local_or_hf: optional local path. Для registry: cache destination.
-    local_dir: null
-    # Сейчас поддержан только if_local_empty: не перетирать существующий cache.
-    pull_policy: if_local_empty
-    # Проверки registry/cache metadata. Для local_or_hf не являются обязательными.
+  # Source model всегда загружается из registry по alias.
+  name: estadel-llm
+  alias: champion
+  # Локальный cache destination для modelctl pull.
+  cache_dir: artifacts/model_cache/estadel-llm/champion
+  checks:
     verify_local_hash: true
     verify_remote_ref: false
     require_registry_metadata: true
-  # Precision загрузки base model. Поддержано: bf16, fp16, fp32/float32.
   precision: bf16
-  # FP8 base запрещен для quality-first LoRA path.
   use_fp8_base: false
-  # Нужно для Qwen custom code/tokenizer classes.
   trust_remote_code: true
-  # Передается в Transformers. Для H100 ожидаемый быстрый путь: flash_attention_2.
   attn_implementation: flash_attention_2
-  # Включает model.gradient_checkpointing_enable() и отключает use_cache.
   gradient_checkpointing: true
-  # Для MoE LoRA обычно не учим router/gate, embeddings и lm_head.
   freeze_router: true
   freeze_embeddings: true
   freeze_lm_head: true
 
 tokenizer:
-  # model: tokenizer берется из effective model path.
-  # explicit: tokenizer_id обязателен и используется отдельно от model.
-  source: model
-  tokenizer_id: null
-  tokenizer_revision: dummy-revision
+  # Tokenizer и official chat template всегда берутся из model.cache_dir.
   use_fast: true
   add_special_tokens: false
   padding_side: right
-  # Документирующее поле: ожидаем официальный template из tokenizer_config.
-  chat_template_source: tokenizer_config
-  # Optional guardrail. null или sha256:<hash>. Strict resume отдельно хэширует actual template.
-  template_hash_expected: sha256:0000000000000000000000000000000000000000000000000000000000000000
 
 lora:
-  # Сейчас training path рассчитан на PEFT LoRA adapter, не full finetune.
-  enabled: true
-  # Rank LoRA matrices. Больше r = больше capacity/VRAM.
   r: 32
-  # LoRA alpha scaling. Обычно alpha ~= 2*r.
   alpha: 64
-  # Dropout внутри LoRA layers.
   dropout: 0.05
-  # Передается в PEFT LoraConfig.bias. Обычно none.
   bias: none
-  # Сейчас поддержан только явный whitelist, чтобы не задеть router/gate случайно.
-  target_modules_policy: whitelist
   target_modules:
     - q_proj
     - k_proj
     - v_proj
     - o_proj
-  # Дополнительные модули для сохранения вместе с adapter. Обычно пусто.
   modules_to_save: []
 
 preprocessing:
   raw:
-    # Raw parquet split paths. train/valid обязательны для training contour.
-    train_path: data/raw/train.parquet
-    valid_path: data/raw/valid.parquet
-    # test optional, если test_required=false.
-    test_path: data/raw/test.parquet
+    train_path: data/train.parquet
+    valid_path: data/valid.parquet
+    test_path: data/test.parquet
     test_required: false
-  output:
-    # Единый cache root для pretokenized parquet/debug/manifest.
-    root_dir: artifacts/pretokenized/example
-    # Reuse split cache только если raw split hash совпал.
-    reuse_if_hash_matches: true
-    # Сколько debug examples на loss_kind писать в debug.jsonl.
-    debug_examples_per_loss_kind: 5
   sequence:
-    # Hard cap tokenized sample length. Сейчас overlong rows reject-ятся.
     max_seq_len: 8192
-    # Truncation/packing намеренно выключены, пока нет turn-aware policy и mask tests.
     truncation: false
     packing: false
   rendering:
-    # Reject raw messages с ручными chat-template markers, чтобы не ломать official template.
     reject_raw_special_markers: true
   reasoning:
-    # false: <think>...</think> вырезаются из supervised loss.
-    # true: reasoning остается supervised.
     enable_thinking: false
   masking:
-    # Label value, который игнорируется CE loss.
     ignore_index: -100
-    # Reject rows, где после masking нет ни одного supervised token.
     require_positive_supervised_tokens: true
     policies:
       sft_target:
-        # Длинные assistant replies всегда supervised.
         min_guaranteed_assistant_chars: 80
-        # Короткие assistant replies берутся в loss детерминированным sampling-ом.
         loss_on_short_assistant_reply_prob: 0.3
         short_response_sampling_seed: 42
-      # Tool route supervises all assistant messages in sft_tool rows.
       sft_tool: {}
 
 loss_routing:
-  # Homogeneous routed batches включены: один batch = один loss_kind.
-  enabled: true
-  # Fallback route для данных без явного route. Raw parquet type/target все равно authoritative.
-  default_route: sft_target
-  # Сейчас sampler сохраняет фактические частоты; weights документируют будущую политику.
-  sampler_weights:
-    sft_target: 1.0
-    sft_tool: 1.0
+  # Частота routes всегда определяется самим датасетом. Никаких sampler weights.
   routes:
-    # Реализованный SFT CE route.
     sft_target:
       type: sft_ce
-      weight: 1.0
-    # Реализованный SFT CE route для tool-calling data.
     sft_tool:
       type: sft_ce
-      weight: 1.0
-    # DPO preprocessing/data/collation частично есть, но trainer loss route пока не реализован.
-    # Не добавляй dpo_target сюда до реализации DPO logprob plumbing.
 
 training:
-  # false полезен для preprocess/debug startup runs. Для реального training true или CLI --train.
-  enabled: true
-  # Количество optimizer steps. Это не micro-batch count.
-  max_steps: 100
-  # Batch size на один process/GPU до gradient accumulation.
+  # Полное число проходов по train DataLoader.
+  num_epochs: 3
   per_device_train_batch_size: 1
-  # false сохраняет короткие хвостовые routed batches. При batch_size>1 SFT-only
-  # startup требует отсутствие коротких route tails, иначе нужен drop_last=true.
   drop_last: false
-  # Сколько micro-batches копить перед optimizer.step().
   gradient_accumulation_steps: 16
-  # AdamW learning rate.
   learning_rate: 0.00005
-  # AdamW betas. [0.9, 0.999] сохраняет PyTorch default; для LLM часто пробуют beta2=0.95.
   adamw_betas:
     - 0.9
     - 0.999
-  # AdamW weight_decay.
   weight_decay: 0.0
-  # Warmup fraction от max_steps.
   warmup_ratio: 0.03
-  # Transformers scheduler name, например cosine, linear, constant, constant_with_warmup.
   lr_scheduler_type: cosine
-  # Global grad norm clipping через accelerator.clip_grad_norm_. 0 отключает clipping.
   max_grad_norm: 1.0
 
 progress:
-  # Main-process tqdm progress bar. Validation/checkpoint phases пишутся отдельными строками.
   enabled: true
 
 distributed:
-  # Единственный поддерживаемый runtime: Accelerate + FSDP.
   fsdp:
-    # FSDP sharding policy. full_shard = параметры, градиенты и optimizer state shard-ятся.
-    # Это самый memory-saving вариант для 35B на ограниченной VRAM.
     sharding_strategy: full_shard
-    # Mixed precision для Accelerator и FSDP policy. Для H100 основной путь bf16.
     mixed_precision: bf16
-    # true переносит shards на CPU, экономит VRAM, но обычно сильно замедляет training.
     cpu_offload: false
-    # FSDP activation checkpointing. Экономит activation memory ценой recompute.
     activation_checkpointing: true
-    # Формат FSDP state dict. sharded_state_dict нужен для distributed checkpoint state.
     state_dict_type: sharded_state_dict
-    # use_orig_params=true лучше совместим с PEFT/LoRA и mixed frozen/trainable params.
     use_orig_params: true
-    # Ограничивает одновременные all-gather операции, снижая peak memory.
     limit_all_gathers: true
-    # Accelerate auto-wrap policy. transformer_based_wrap оборачивает указанные decoder layers.
     auto_wrap_policy: transformer_based_wrap
-    # Классы transformer blocks, которые FSDP должен wrap-ить.
-    # Для локального Qwen3.5-35B-A3B cache model_type=qwen3_5_moe,
-    # реальный class name в transformers 4.57.0.dev0: Qwen3_5MoeDecoderLayer.
     transformer_cls_names_to_wrap:
       - Qwen3_5MoeDecoderLayer
-    # Только rank 0 загружает полные веса в CPU RAM; остальные ranks получают их через FSDP sync.
     cpu_ram_efficient_loading: true
-    # Синхронизировать параметры между ranks при init. Для FSDP обычно true.
     sync_module_states: true
 
 eval:
-  # false полностью отключает validation boundary и, соответственно, checkpointing.
-  enabled: true
-  # Cadence ordinary validation в optimizer steps.
   every_train_steps: 25
   standard:
-    # Ограничить ordinary eval первыми N validation batches. null = весь valid split.
     max_batches: 50
   bfcl:
-    # RU BFCL jsonl. null будет использовать bundled default из eval.ru_bfcl.data.
-    eval_path: src/eval/ru_bfcl/data/bfcl_eval.jsonl
-    # Запускать BFCL каждые N validation boundaries.
+    # false полностью отключает BFCL. Dataset всегда bundled в src/eval/ru_bfcl/data.
+    enabled: true
     run_every_n_validations: 1
     include_multi_turn: true
-    # null = все категории. Список строк = фильтр категорий.
-    categories:
-      - simple
-      - parallel
-    # null = все rows после filters. Число = debug subset.
-    limit: 100
+    categories: null
+    limit: null
     generation:
       max_new_tokens: 1024
       temperature: 0.0
       top_p: 1.0
       do_sample: false
-    # Relative path пишется под project.output_dir.
-    rows_out: eval/bfcl_rows.jsonl
 
 checkpointing:
-  # Где хранятся step-NNNNNN adapter checkpoints и adapter-only training state.
-  root_dir: checkpoints/dummy-qwen35-a3b-run
-  # Save cadence в validation units, не в train steps.
-  # 1 = каждый validation boundary, 2 = каждый второй validation boundary.
   save_every_n_validations: 1
-  # Оставлять последние N final checkpoints. .tmp не считается.
-  # Во время async registry registration выбранные candidate checkpoints защищаются от удаления.
   save_total_limit: 3
   resume:
     enabled: true
-    # auto = взять максимальный step-NNNNNN из root_dir. Можно указать explicit checkpoint path.
-    path: auto
-    # Strict checks сравнивают текущие hashes с manifest.json checkpoint-а до загрузки state.
     strict_config: true
     strict_dataset_hash: true
     strict_template_hash: true
 
 mlflow:
-  enabled: true
+  # MLflow всегда включен. Experiment/run names берутся из project.
   tracking_uri: http://localhost:5000
-  experiment_name: dummy-qwen35-a3b
-  # null = новый run. Иначе продолжить существующий MLflow run id.
-  resume_run_id: dummy-run-id
+  resume_run_id: null
   async_logging:
-    # true переносит MLflow metric/artifact/modelctl side effects в CPU-only worker thread.
     enabled: true
     queue_max_items: 1024
     flush_timeout_seconds: 300
-    # true = ошибка async worker-а валит training на flush/close.
     fail_on_worker_error: true
-  log_artifacts: true
   log_rendered_samples: true
-  log_model_candidates: true
-
-lineage:
-  dvc:
-    # Логгирует DVC/code lineage в MLflow. Не управляет preprocessing cache reuse.
-    enabled: true
-    repo_root: /path/to/dvc/repo
-    targets:
-      data: data.dvc
 
 registry:
-  # Registry registration работает только для candidate checkpoints, не champion promotion.
-  enabled: true
-  model_name: dummy-qwen35-a3b
-  kind: generic
-  # Каждые N checkpoint-ов выбрать лучший внутри окна и зарегистрировать candidate.
+  # Destination model = project.name. Aliases = candidate-NNNNNN и candidate-latest.
   register_every_n_checkpoints: 5
-  selection_metric: eval/bfcl/accuracy
-  greater_is_better: true
-  candidate_alias_template: candidate-{candidate_index:06d}
-  # Rolling alias на последнего зарегистрированного candidate.
-  rolling_candidate_alias: candidate-latest
-  # Promotion в champion/baseline запрещен в training loop.
-  promote_best_to: null
-  modelctl_path: modelctl
+  selection:
+    # Ordinary: eval/loss, eval/ppl, eval/batches, eval/tokens,
+    # eval/supervised_tokens.
+    # BFCL: eval/bfcl/accuracy, eval/bfcl/total, eval/bfcl/passed,
+    # eval/bfcl/failed, eval/bfcl/<category>/accuracy,
+    # eval/bfcl/<category>/total.
+    # Для отключенного BFCL выбирай eval/loss или eval/ppl.
+    metric: eval/loss
+    mode: min

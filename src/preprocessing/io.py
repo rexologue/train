@@ -148,10 +148,9 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def cache_root(config: TrainingConfig) -> Path:
-    """Return the configured pretokenized cache root."""
+    """Return the pretokenized cache below the project output root."""
 
-    pretok_config = config.preprocessing["output"]
-    return Path(pretok_config.get("root_dir", "artifacts/pretokenized"))
+    return config.pretokenized_dir
 
 
 def split_parquet_path(root: Path, split: str) -> Path:

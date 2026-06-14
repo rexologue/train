@@ -14,7 +14,7 @@ class TrainerCadence:
 
     eval_every_train_steps: int
     checkpoint_every_n_validations: int
-    bfcl_every_n_validations: int
+    bfcl_every_n_validations: int | None
 
     @classmethod
     def from_config(cls, config: Any) -> "TrainerCadence":
@@ -30,7 +30,7 @@ class TrainerCadence:
             raise ValueError("checkpointing.save_every_n_validations must be configured")
 
         bfcl = eval_config.get("bfcl") if isinstance(eval_config.get("bfcl"), dict) else {}
-        bfcl_every = bfcl.get("run_every_n_validations", 1)
+        bfcl_every = bfcl.get("run_every_n_validations", 1) if bfcl.get("enabled", True) else None
 
         return cls(
             eval_every_train_steps=_positive_int(eval_every, "eval.every_train_steps"),
@@ -38,7 +38,9 @@ class TrainerCadence:
                 checkpoint_every,
                 "checkpointing.save_every_n_validations",
             ),
-            bfcl_every_n_validations=_positive_int(bfcl_every, "eval.bfcl.run_every_n_validations"),
+            bfcl_every_n_validations=(
+                _positive_int(bfcl_every, "eval.bfcl.run_every_n_validations") if bfcl_every is not None else None
+            ),
         )
 
     def should_validate(self, global_step: int) -> bool:
@@ -48,7 +50,11 @@ class TrainerCadence:
         return validation_index > 0 and validation_index % self.checkpoint_every_n_validations == 0
 
     def should_run_bfcl(self, validation_index: int) -> bool:
-        return validation_index > 0 and validation_index % self.bfcl_every_n_validations == 0
+        return (
+            self.bfcl_every_n_validations is not None
+            and validation_index > 0
+            and validation_index % self.bfcl_every_n_validations == 0
+        )
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -109,7 +115,8 @@ class RoutedTrainer:
         scheduler: Any | None = None,
         valid_dataloader: Iterable[dict[str, Any]] | None = None,
         state: TrainerState | None = None,
-        max_steps: int | None = None,
+        total_steps: int | None = None,
+        total_micro_batches: int | None = None,
         gradient_accumulation_steps: int | None = None,
     ) -> TrainerState:
         """Run the routed training loop.
@@ -121,11 +128,11 @@ class RoutedTrainer:
 
         if self.cadence is None:
             raise ValueError("trainer cadence must be configured")
-        if self.config is None and max_steps is None:
-            raise ValueError("max_steps must be provided when trainer has no config")
+        if total_steps is None:
+            raise ValueError("total_steps must be provided")
 
         training = self.config.section("training") if self.config is not None else {}
-        max_steps = _positive_int(max_steps if max_steps is not None else training["max_steps"], "training.max_steps")
+        total_steps = _positive_int(total_steps, "total_steps")
         grad_accum = _positive_int(
             gradient_accumulation_steps
             if gradient_accumulation_steps is not None
@@ -134,40 +141,67 @@ class RoutedTrainer:
         )
         max_grad_norm = float(training.get("max_grad_norm", 0.0) or 0.0)
         ignore_index = int(getattr(self.config, "ignore_index", -100)) if self.config is not None else -100
-        eval_enabled = bool(self.config.section("eval").get("enabled", True)) if self.config is not None else True
-
         state = state or TrainerState()
         train_iterator = iter(train_dataloader)
         train_iterator = _advance_iterator(train_iterator, train_dataloader, state.consumed_batches)
+        exact_epoch_mode = total_micro_batches is not None
+        target_micro_batches = (
+            _positive_int(total_micro_batches, "total_micro_batches")
+            if total_micro_batches is not None
+            else state.consumed_batches + (total_steps - state.global_step) * grad_accum
+        )
+        batches_per_epoch = len(train_dataloader) if exact_epoch_mode else 0  # type: ignore[arg-type]
 
-        while state.global_step < max_steps:
-            if hasattr(model, "train"):
-                model.train()
-            optimizer.zero_grad(set_to_none=True)
+        accumulated_loss = 0.0
+        step_samples = 0
+        step_tokens = 0
+        step_supervised_tokens = 0
+        accumulated_batches = 0
+        accumulation_target = grad_accum
+        step_started_at = time.monotonic()
+        if hasattr(model, "train"):
+            model.train()
+        optimizer.zero_grad(set_to_none=True)
 
-            accumulated_loss = 0.0
-            step_samples = 0
-            step_tokens = 0
-            step_supervised_tokens = 0
-            step_started_at = time.monotonic()
-            for _ in range(grad_accum):
-                with self.accelerator.accumulate(model):
-                    batch, train_iterator = _cycle_next(train_iterator, train_dataloader)
-                    loss = self.compute_loss(model, batch)
-                    accumulated_loss += _detach_item(loss)
-                    batch_stats = _batch_stats(batch, ignore_index=ignore_index)
-                    step_samples += batch_stats["samples"]
-                    step_tokens += batch_stats["tokens"]
-                    step_supervised_tokens += batch_stats["supervised_tokens"]
-                    self.accelerator.backward(loss)
-                    state.consumed_batches += 1
+        while state.global_step < total_steps and state.consumed_batches < target_micro_batches:
+            if accumulated_batches == 0 and exact_epoch_mode:
+                batches_into_epoch = state.consumed_batches % batches_per_epoch
+                remaining_in_epoch = batches_per_epoch - batches_into_epoch
+                remaining_total = target_micro_batches - state.consumed_batches
+                accumulation_target = min(grad_accum, remaining_in_epoch, remaining_total)
+            with self.accelerator.accumulate(model):
+                batch, train_iterator = _cycle_next(train_iterator, train_dataloader)
+                loss = self.compute_loss(model, batch)
+                accumulated_loss += _detach_item(loss)
+                batch_stats = _batch_stats(batch, ignore_index=ignore_index)
+                step_samples += batch_stats["samples"]
+                step_tokens += batch_stats["tokens"]
+                step_supervised_tokens += batch_stats["supervised_tokens"]
+                backward_loss = loss
+                accelerator_grad_accum = int(getattr(self.accelerator, "gradient_accumulation_steps", 1))
+                if exact_epoch_mode and accumulation_target < accelerator_grad_accum:
+                    backward_loss = loss * (accelerator_grad_accum / accumulation_target)
+                self.accelerator.backward(backward_loss)
+                state.consumed_batches += 1
+                accumulated_batches += 1
+
+            epoch_boundary = exact_epoch_mode and state.consumed_batches % batches_per_epoch == 0
+            should_step = (
+                accumulated_batches >= accumulation_target
+                or epoch_boundary
+                or state.consumed_batches >= target_micro_batches
+            )
+            if not should_step:
+                continue
+            if hasattr(self.accelerator, "sync_gradients") and not self.accelerator.sync_gradients:
+                raise RuntimeError("Accelerate did not synchronize gradients at an optimizer-step boundary")
 
             if max_grad_norm > 0:
                 self.accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
-
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
             state.global_step += 1
             elapsed = max(time.monotonic() - step_started_at, 1e-9)
@@ -180,7 +214,7 @@ class RoutedTrainer:
                 elapsed=elapsed,
             )
             metrics = {
-                "train/loss": step_totals["accumulated_loss"] / (grad_accum * step_totals["processes"]),
+                "train/loss": step_totals["accumulated_loss"] / (accumulated_batches * step_totals["processes"]),
                 "train/samples_per_second": step_totals["samples"] / step_totals["elapsed"],
                 "train/tokens_per_second": step_totals["tokens"] / step_totals["elapsed"],
                 "train/supervised_tokens_per_second": step_totals["supervised_tokens"] / step_totals["elapsed"],
@@ -190,8 +224,17 @@ class RoutedTrainer:
                 metrics["train/lr"] = lr
             self.hooks.metrics(metrics, state)
 
-            if eval_enabled and self.cadence.should_validate(state.global_step):
+            if self.cadence.should_validate(state.global_step):
                 self.run_validation_boundary(model, optimizer, valid_dataloader, state)
+
+            accumulated_loss = 0.0
+            step_samples = 0
+            step_tokens = 0
+            step_supervised_tokens = 0
+            accumulated_batches = 0
+            step_started_at = time.monotonic()
+            if hasattr(model, "train"):
+                model.train()
 
         return state
 

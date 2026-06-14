@@ -6,23 +6,24 @@ import pytest
 from modelctl import core as modelctl_core
 
 from config import load_config
-from config.model_source import effective_tokenizer_id
+from config.model_source import effective_model_id
 from tracking.model_source import _pull_model, registry_metadata_path, resolve_model_source, validate_model_payload
 
 
 def _registry_config(tmp_path):
-    config = load_config("configs/config.preprocess.yaml")
-    config.raw["model"]["source"] = {
-        "kind": "registry",
-        "model_name": "qwen35",
-        "alias": "champion",
-        "version": None,
-        "local_dir": str(tmp_path / "models" / "qwen35"),
-        "pull_policy": "if_local_empty",
-        "verify_local_hash": True,
-        "verify_remote_ref": False,
-        "require_registry_metadata": True,
-    }
+    config = load_config("configs/config.example.yaml")
+    config.raw["model"].update(
+        {
+            "name": "qwen35",
+            "alias": "champion",
+            "cache_dir": str(tmp_path / "models" / "qwen35"),
+            "checks": {
+                "verify_local_hash": True,
+                "verify_remote_ref": False,
+                "require_registry_metadata": True,
+            },
+        }
+    )
     return config
 
 
@@ -56,29 +57,12 @@ def test_registry_model_source_uses_non_empty_local_dir_without_remote_calls(tmp
     assert resolution.effective_model_id == str(local_dir.resolve())
 
 
-def test_local_or_hf_model_source_can_use_local_dir_for_tokenizer(tmp_path):
-    config = load_config("configs/config.preprocess.yaml")
-    local_dir = tmp_path / "hf_stub"
-    local_dir.mkdir()
-    config.raw["model"]["source"] = {
-        "kind": "local_or_hf",
-        "model_name": None,
-        "alias": None,
-        "version": None,
-        "local_dir": str(local_dir),
-        "pull_policy": "if_local_empty",
-        "verify_local_hash": True,
-        "verify_remote_ref": False,
-        "require_registry_metadata": True,
-    }
-    config.raw["tokenizer"]["source"] = "model"
-    config.raw["tokenizer"]["tokenizer_id"] = None
+def test_tokenizer_always_uses_resolved_registry_model_dir(tmp_path):
+    config = load_config("configs/config.example.yaml")
+    local_dir = tmp_path / "registry_model"
+    config.raw["model"]["resolved_model_id"] = str(local_dir)
 
-    resolution = resolve_model_source(config, tracking_uri="http://mlflow:5000")
-    config.raw["model"]["resolved_model_id"] = resolution.effective_model_id
-
-    assert resolution.used_local is True
-    assert effective_tokenizer_id(config) == str(local_dir.resolve())
+    assert effective_model_id(config) == str(local_dir)
 
 
 def test_registry_model_source_pulls_when_local_dir_is_empty(tmp_path, monkeypatch):

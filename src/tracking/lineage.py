@@ -8,27 +8,27 @@ from config import TrainingConfig, file_sha256
 
 
 def collect_tracking_lineage(config: TrainingConfig) -> dict[str, Any]:
-    """Collect git and DVC provenance that belongs in experiment tracking."""
+    """Auto-discover data.dvc next to the configured train dataset."""
 
-    lineage_config = config.raw.get("lineage")
-    if not isinstance(lineage_config, dict):
-        return {"dvc": {"enabled": False}}
-
-    dvc_config = lineage_config.get("dvc")
-    if not isinstance(dvc_config, dict) or not bool(dvc_config.get("enabled", False)):
-        return {"dvc": {"enabled": False}}
-
-    repo_root = Path(str(dvc_config["repo_root"])).expanduser().resolve()
-    targets = dvc_config.get("targets")
-    if not isinstance(targets, dict) or not targets:
-        raise ValueError("lineage.dvc.targets must be a non-empty mapping when DVC lineage is enabled")
+    train_path = Path(str(config.preprocessing["raw"]["train_path"])).expanduser().resolve()
+    candidates = (train_path.parent / "data.dvc", train_path.parent.parent / "data.dvc")
+    dvc_path = next((path for path in candidates if path.is_file()), None)
+    if dvc_path is None:
+        return {
+            "dvc": {
+                "enabled": False,
+                "train_path": str(train_path),
+                "searched": [str(path) for path in candidates],
+            }
+        }
+    repo_root = dvc_path.parent
 
     return {
         "dvc": {
             "enabled": True,
             "repo_root": str(repo_root),
             "git": collect_git_metadata(repo_root),
-            "targets": {name: collect_dvc_target(repo_root, str(path)) for name, path in sorted(targets.items())},
+            "targets": {"data": collect_dvc_target(repo_root, dvc_path.name)},
         }
     }
 

@@ -1,145 +1,178 @@
 # estadel-trainer
 
-Production-grade контур для SFT LoRA дообучения Qwen3.5-35B-A3B с отдельной проверкой tool calling.
+Production-контур для LoRA-дообучения Qwen3.5-35B-A3B:
 
-Проект сейчас включает preprocessing, routed DataLoaders, custom training loop, Accelerate/FSDP, ordinary eval, RU BFCL eval, MLflow tracking, async registry logging, adapter-only checkpoints, strict resume и checkpoint pruning.
+- source model и tokenizer только из Model Registry;
+- official tokenizer chat template и проверяемая loss mask;
+- homogeneous batches по `loss_kind`;
+- Accelerate/FSDP-only training;
+- ordinary validation и опциональный bundled RU BFCL;
+- MLflow tracking, adapter-only checkpoints и candidate registration;
+- strict resume и автоматический DVC lineage.
 
-## Статус
-
-Реализовано:
-
-- raw parquet -> canonical rows -> official chat template -> tokenization -> labels mask;
-- pretokenized parquet cache с split-local reuse по raw split hash;
-- routed homogeneous batches по `loss_kind`;
-- SFT CE loss для `sft_target` и `sft_tool`;
-- Accelerate/FSDP-only training runtime;
-- AdamW optimizer с YAML-configurable `learning_rate`, `adamw_betas`, `weight_decay`;
-- scheduler через `transformers.get_scheduler`;
-- progress bar с validation/checkpoint phase messages;
-- ordinary eval с token-weighted validation loss;
-- RU BFCL offline eval с bundled `jsonl`;
-- adapter-only atomic checkpoints;
-- strict resume по config/data/template hashes;
-- `checkpointing.save_total_limit` pruning;
-- MLflow tracking и async CPU-only worker;
-- candidate registration через `modelctl` без champion/baseline promotion.
-
-DPO статус:
-
-- DPO preprocessing/collation частично готовы (`dpo_target`, `chosen_*`, `rejected_*`);
-- DPO trainer loss route пока не реализован;
-- включать `dpo_target` в active `loss_routing.routes` пока нельзя.
-
-## Быстрый запуск
-
-Локальное окружение, используемое в проекте:
+## Установка
 
 ```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/python -m pytest
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
-Preprocessing/DataLoader startup на текущем debug config:
+`modelctl` устанавливается вместе с проектом и должен быть доступен в `PATH`.
+
+## Конфигурация
+
+Единственный шаблон конфигурации: `configs/config.example.yaml`.
 
 ```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/python -m train --config configs/config.preprocess.yaml --force-preprocess
+cp configs/config.example.yaml configs/config.yaml
 ```
 
-С inspection random batch:
+Минимально перед запуском задаются:
 
-```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/python -m train --config configs/config.preprocess.yaml --force-preprocess --inspect-random-batch --inspect-split train --inspect-token-limit 32
-```
+- `project.name`: MLflow experiment и destination model в registry;
+- `project.run_name`: имя MLflow run;
+- `project.output_dir`: единый корень локальных результатов;
+- `model.name`, `model.alias`, `model.cache_dir`: source model из registry;
+- `preprocessing.raw.train_path` и `preprocessing.raw.valid_path`;
+- `training.num_epochs`;
+- `mlflow.tracking_uri`.
 
-Принудительный training run на debug config:
+Tokenizer всегда загружается из resolved model directory. Отдельный tokenizer
+source, revision и template hash в конфиге не поддерживаются.
 
-```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/accelerate launch --use_fsdp --num_processes <GPU_COUNT> -m train --config configs/config.preprocess.yaml --train
-```
-
-`configs/config.preprocess.yaml` сейчас имеет `training.enabled: false`, поэтому без `--train` обучение не начнется.
-Training startup fail-fast проверяет, что активный Accelerate runtime действительно использует FSDP.
-
-## Конфиги
-
-В `configs/` два основных файла:
-
-- `config.example.yaml` — самодокументированный production template с комментариями по каждому важному полю.
-- `config.preprocess.yaml` — локальный рабочий debug config с machine-specific paths.
-
-Training-critical значения должны жить в YAML и валидироваться в `src/config/schema.py`.
-
-Ключевые секции:
-
-- `project` — имя run family, seed, output directory.
-- `model` — base model/source registry/local settings, precision, freeze policy.
-- `tokenizer` — tokenizer source и chat template guardrails.
-- `lora` — PEFT LoRA параметры.
-- `preprocessing` — raw paths, cache root, max length, thinking mode, masking policies.
-- `loss_routing` — active loss routes.
-- `training` — optimizer steps, batch size, grad accumulation, AdamW params, scheduler, grad clipping.
-- `distributed.fsdp` — единственный supported distributed runtime.
-- `eval` — ordinary eval и RU BFCL cadence/settings.
-- `checkpointing` — atomic adapter checkpoint root, save cadence, pruning, strict resume.
-- `mlflow` — tracking и async logging.
-- `lineage` — DVC metadata tracking.
-- `registry` — candidate model registration.
-
-## Training step semantics
-
-`training.max_steps` считается в optimizer steps.
-
-Один optimizer step состоит из:
+Все локальные output paths выводятся из `project.output_dir`:
 
 ```text
-training.gradient_accumulation_steps
+{project.output_dir}/
+├── pretokenized/
+├── checkpoints/
+└── eval/
+    └── bfcl_rows.jsonl
 ```
 
-micro-batches на каждом GPU/process.
+## Запуск
 
-Effective global samples per optimizer step:
+Поддержан один entrypoint и один CLI-параметр:
 
-```text
-world_size * training.per_device_train_batch_size * training.gradient_accumulation_steps
+```bash
+accelerate launch --use_fsdp --num_processes <GPU_COUNT> \
+  -m train --config configs/config.yaml
 ```
 
-Например, на 2 GPU при `per_device_train_batch_size=1` и `gradient_accumulation_steps=16` один optimizer step соответствует 32 samples, если нет короткого хвостового batch-а.
+Запуск всегда выполняет полный контур: registry resolution, data cache,
+training, validation, checkpointing и candidate registration. Отдельных
+preprocess/debug/train режимов нет.
 
-## FSDP
+## Model Registry
 
-Проект поддерживает только Accelerate/FSDP training path.
-
-FSDP оборачивает decoder layers и shard-ит параметры между GPU. При `full_shard` shard-ятся параметры, градиенты и optimizer state. Перед forward конкретного wrapped block-а FSDP временно all-gather-ит нужные параметры, считает block, затем освобождает/reshard-ит их. На backward аналогично собираются нужные параметры и reduce-scatter-ятся gradients.
-
-Текущий локальный model cache:
-
-```text
-model_type: qwen3_5_moe
-architecture: Qwen3_5MoeForConditionalGeneration
-decoder layer class: Qwen3_5MoeDecoderLayer
-```
-
-Поэтому актуальный FSDP wrap config:
+Source model задается alias-ссылкой:
 
 ```yaml
-distributed:
-  fsdp:
-    auto_wrap_policy: transformer_based_wrap
-    transformer_cls_names_to_wrap:
-      - Qwen3_5MoeDecoderLayer
+model:
+  name: estadel-llm
+  alias: champion
+  cache_dir: artifacts/model_cache/estadel-llm/champion
+  checks:
+    verify_local_hash: true
+    verify_remote_ref: false
+    require_registry_metadata: true
 ```
 
-## Checkpoints и resume
-
-Checkpoint создается на validation boundary:
+Candidate checkpoints регистрируются в model с именем `project.name`.
+Aliases формируются автоматически:
 
 ```text
-ordinary eval -> BFCL eval -> checkpoint save
+candidate-000001
+candidate-latest
 ```
 
-Сохраняется adapter-only package. `accelerate_state/` содержит optimizer/scheduler/RNG state для LoRA-параметров, но не дублирует base-model shards:
+Promotion до `baseline` или `champion` не выполняется training loop-ом.
+
+## Epochs И Batches
+
+Продолжительность обучения задается через `training.num_epochs`.
+Число optimizer steps вычисляется автоматически из train DataLoader,
+числа процессов и `gradient_accumulation_steps`. Неполный accumulation-хвост
+завершается на границе каждой эпохи без повторного чтения первых batches.
+
+Частота route batches определяется только составом датасета.
+Sampler weights и искусственное повышение/понижение вероятности routes
+не поддерживаются.
+
+## Evaluation И Selection
+
+Ordinary validation возвращает:
 
 ```text
-{checkpointing.root_dir}/step-000012/
+eval/loss
+eval/ppl
+eval/batches
+eval/tokens
+eval/supervised_tokens
+```
+
+Bundled RU BFCL включается через `eval.bfcl.enabled`. Путь к dataset не
+настраивается: используется `src/eval/ru_bfcl/data/bfcl_eval.jsonl`.
+
+BFCL возвращает:
+
+```text
+eval/bfcl/accuracy
+eval/bfcl/total
+eval/bfcl/passed
+eval/bfcl/failed
+eval/bfcl/<category>/accuracy
+eval/bfcl/<category>/total
+```
+
+Registry selection задается явно:
+
+```yaml
+registry:
+  register_every_n_checkpoints: 5
+  selection:
+    metric: eval/loss
+    mode: min
+```
+
+Для запуска без BFCL:
+
+```yaml
+eval:
+  bfcl:
+    enabled: false
+
+registry:
+  selection:
+    metric: eval/loss
+    mode: min
+```
+
+## Dataset И DVC
+
+Raw parquet row:
+
+```python
+{
+    "data": "{\"messages\": [...], ...}",
+    "type": "sft_target" | "sft_tool" | "dpo_target",
+}
+```
+
+`target` поддерживается как alias для `type`; конфликт между ними является
+schema error. `loss_kind` никогда не выводится из содержимого `data`.
+
+DVC не имеет отдельной секции конфигурации. Проект ищет `data.dvc` сначала
+рядом с `preprocessing.raw.train_path`, затем на один уровень выше. Если файл
+не найден, run продолжается без DVC metadata.
+
+## Checkpoints И Resume
+
+Checkpoints сохраняются атомарно в:
+
+```text
+{project.output_dir}/checkpoints/step-000012/
 ├── adapter/
 ├── accelerate_state/
 ├── trainer_state.json
@@ -148,82 +181,17 @@ ordinary eval -> BFCL eval -> checkpoint save
 └── checksums.json
 ```
 
-Сохранение атомарное:
+Resume всегда ищет последний валидный `step-NNNNNN` в derived checkpoint
+directory. Strict checks сравнивают config, dataset manifest и actual tokenizer
+chat template hashes.
 
-```text
-step-000012.tmp -> step-000012
-```
+## DPO
 
-Auto-resume игнорирует `.tmp` и видит только final directories вида `step-\d+` с `manifest.json`.
-
-Strict resume сравнивает текущие hashes с checkpoint manifest до загрузки state:
-
-- config hash;
-- pretokenized dataset manifest hash;
-- tokenizer chat template hash.
-
-Позиция данных восстанавливается через `trainer_state.consumed_batches`: dataloader fast-forward-ится на количество уже потребленных micro-batches.
-
-`checkpointing.save_total_limit` удаляет старые final checkpoint-ы, оставляя последние N. Checkpoint-и, которые еще нужны registry window или async candidate registration, временно защищаются от pruning.
-
-## RU BFCL
-
-RU BFCL модуль лежит здесь:
-
-```text
-src/eval/ru_bfcl/
-```
-
-Bundled eval data:
-
-```text
-src/eval/ru_bfcl/data/bfcl_eval.jsonl
-```
-
-Training eval entrypoint:
-
-```text
-src/eval/bfcl.py
-```
-
-BFCL eval строит prompts через tokenizer chat template, генерирует tool calls, нормализует predictions и сравнивает с expected calls offline.
-
-При FSDP все ranks выполняют одинаковую последовательность BFCL requests в lockstep. Это дороже распределенного sharding eval-набора, но предотвращает deadlock на variable-length и multi-turn generation.
-
-## Структура
-
-```text
-src/
-├── train.py
-├── checkpointing/
-├── config/
-├── data/
-├── eval/
-├── losses/
-├── preprocessing/
-├── registry/
-├── tracking/
-├── trainer/
-└── utils/
-```
-
-Удаленные placeholder areas:
-
-- `src/dpo`;
-- `src/sampling`;
-- unused DPO/logprob/metrics loss helpers;
-- unused eval report/summarize helpers.
+DPO preprocessing и collation существуют, но DPO loss route пока не
+реализован. `dpo_target` нельзя добавлять в active `loss_routing.routes`.
 
 ## Тесты
 
-Полный suite:
-
 ```bash
-PYTHONPATH=src:vendor/modelctl-mlflow /home/duka/miniforge3/envs/train/bin/python -m pytest
-```
-
-Текущий результат:
-
-```text
-82 passed
+python -m pytest
 ```

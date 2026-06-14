@@ -25,8 +25,9 @@ def test_collect_tracking_lineage_reads_dvc_file_without_dvc_package(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "data.dvc"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, stdout=subprocess.DEVNULL)
 
-    config = load_config("configs/config.preprocess.yaml")
-    config.raw["lineage"]["dvc"]["repo_root"] = str(repo)
+    config = load_config("configs/config.example.yaml")
+    train_path = repo / "data" / "train.parquet"
+    config.raw["preprocessing"]["raw"]["train_path"] = str(train_path)
 
     lineage = collect_tracking_lineage(config)
 
@@ -35,6 +36,16 @@ def test_collect_tracking_lineage_reads_dvc_file_without_dvc_package(tmp_path):
     out = lineage["dvc"]["targets"]["data"]["outs"][0]
     assert out["md5"] == "abc123.dir"
     assert out["path"] == "data"
+
+
+def test_collect_tracking_lineage_is_optional_when_data_dvc_is_missing(tmp_path):
+    config = load_config("configs/config.example.yaml")
+    config.raw["preprocessing"]["raw"]["train_path"] = str(tmp_path / "data" / "train.parquet")
+
+    lineage = collect_tracking_lineage(config)
+
+    assert lineage["dvc"]["enabled"] is False
+    assert len(lineage["dvc"]["searched"]) == 2
 
 
 def test_flatten_config_params_drops_secret_like_keys():

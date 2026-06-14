@@ -12,6 +12,7 @@ def build_candidate_registration_args(config: Any, decision: RegistrationDecisio
     """Build explicit candidate registration args for an adapter checkpoint."""
 
     registry = config.section("registry")
+    selection = registry["selection"]
     mlflow = config.section("mlflow")
     checkpoint = decision.checkpoint
     training_tags = {
@@ -19,7 +20,7 @@ def build_candidate_registration_args(config: Any, decision: RegistrationDecisio
         "training.candidate_index": decision.candidate_index,
         "training.global_step": checkpoint.global_step,
         "training.checkpoint_index": checkpoint.checkpoint_index,
-        "training.selection_metric": registry["selection_metric"],
+        "training.selection_metric": selection["metric"],
         "training.selection_metric_value": checkpoint.metric_value,
     }
     general_tags = {
@@ -33,11 +34,9 @@ def build_candidate_registration_args(config: Any, decision: RegistrationDecisio
     write_json(training_tags_path, training_tags)
     write_json(general_tags_path, general_tags)
     return build_modelctl_register_args(
-        str(registry.get("modelctl_path", "modelctl")),
-        str(registry["model_name"]),
+        str(config.section("project")["name"]),
         str(checkpoint.path / "adapter"),
         decision.aliases,
-        kind=str(registry.get("kind", "generic")),
         tracking_uri=str(mlflow.get("tracking_uri")) if mlflow.get("tracking_uri") else None,
         training_tags_json=str(training_tags_path),
         general_tags_json=str(general_tags_path),

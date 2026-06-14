@@ -15,12 +15,10 @@ from config import TrainingConfig
 class ModelSourceResolution:
     """Effective model source selected for this run."""
 
-    kind: str
     effective_model_id: str
     ref: str | None = None
     model_name: str | None = None
     alias: str | None = None
-    version: str | None = None
     local_dir: str | None = None
     pulled: bool = False
     used_local: bool = False
@@ -36,48 +34,24 @@ class ModelSourceResolution:
 
 
 def resolve_model_source(config: TrainingConfig, *, tracking_uri: str | None = None) -> ModelSourceResolution:
-    """Resolve a local/HF model id or pull a registry model only when local cache is empty."""
+    """Resolve the configured registry alias into the local model cache."""
 
     model_config = config.section("model")
-    source_config = model_config.get("source")
-    if not isinstance(source_config, dict) or source_config.get("kind", "local_or_hf") == "local_or_hf":
-        local_dir = source_config.get("local_dir") if isinstance(source_config, dict) else None
-        if local_dir:
-            resolved_path = Path(str(local_dir)).expanduser().resolve()
-            validate_model_payload(resolved_path)
-            resolved_local = str(resolved_path)
-            return ModelSourceResolution(
-                kind="local_or_hf",
-                effective_model_id=resolved_local,
-                local_dir=resolved_local,
-                used_local=True,
-            )
-        base_model_id = str(model_config["base_model_id"])
-        return ModelSourceResolution(kind="local_or_hf", effective_model_id=base_model_id)
-
-    if source_config.get("kind") != "registry":
-        raise ValueError("model.source.kind must be local_or_hf or registry")
-
-    model_name = str(source_config["model_name"])
-    alias = source_config.get("alias")
-    version = source_config.get("version")
-    ref = build_registry_ref(model_name, alias=alias, version=version)
-    local_dir = Path(str(source_config["local_dir"])).expanduser().resolve()
-    pull_policy = str(source_config.get("pull_policy", "if_local_empty"))
-    if pull_policy != "if_local_empty":
-        raise ValueError("only model.source.pull_policy=if_local_empty is supported")
-
-    verify_local_hash = bool(source_config.get("verify_local_hash", True))
-    verify_remote_ref = bool(source_config.get("verify_remote_ref", False))
-    require_registry_metadata = bool(source_config.get("require_registry_metadata", True))
+    model_name = str(model_config["name"])
+    alias = str(model_config["alias"])
+    ref = build_registry_ref(model_name, alias)
+    local_dir = Path(str(model_config["cache_dir"])).expanduser().resolve()
+    checks = model_config["checks"]
+    verify_local_hash = bool(checks["verify_local_hash"])
+    verify_remote_ref = bool(checks["verify_remote_ref"])
+    require_registry_metadata = bool(checks["require_registry_metadata"])
     effective_tracking_uri = tracking_uri or str(config.section("mlflow").get("tracking_uri"))
 
     if directory_has_payload(local_dir):
         return use_existing_registry_model(
             local_dir=local_dir,
             model_name=model_name,
-            alias=str(alias) if alias is not None else None,
-            version=str(version) if version is not None else None,
+            alias=alias,
             ref=ref,
             tracking_uri=effective_tracking_uri,
             verify_local_hash=verify_local_hash,
@@ -88,24 +62,17 @@ def resolve_model_source(config: TrainingConfig, *, tracking_uri: str | None = N
     return pull_registry_model_if_missing(
         local_dir=local_dir,
         model_name=model_name,
-        alias=str(alias) if alias is not None else None,
-        version=str(version) if version is not None else None,
+        alias=alias,
         ref=ref,
         tracking_uri=effective_tracking_uri,
         require_registry_metadata=require_registry_metadata,
     )
 
 
-def build_registry_ref(model_name: str, *, alias: Any, version: Any) -> str:
-    """Build a models:/ URI from mutually exclusive alias/version fields."""
+def build_registry_ref(model_name: str, alias: str) -> str:
+    """Build the only supported source reference: a registry alias."""
 
-    has_alias = alias not in (None, "")
-    has_version = version not in (None, "")
-    if has_alias == has_version:
-        raise ValueError("model.source must configure exactly one of alias or version")
-    if has_alias:
-        return f"models:/{model_name}@{alias}"
-    return f"models:/{model_name}/{version}"
+    return f"models:/{model_name}@{alias}"
 
 
 def directory_has_payload(path: Path) -> bool:
@@ -114,7 +81,7 @@ def directory_has_payload(path: Path) -> bool:
     if not path.exists():
         return False
     if not path.is_dir():
-        raise ValueError(f"model.source.local_dir must be a directory: {path}")
+        raise ValueError(f"model.cache_dir must be a directory: {path}")
     return any(path.iterdir())
 
 
@@ -123,7 +90,6 @@ def use_existing_registry_model(
     local_dir: Path,
     model_name: str,
     alias: str | None,
-    version: str | None,
     ref: str,
     tracking_uri: str,
     verify_local_hash: bool,
@@ -161,12 +127,10 @@ def use_existing_registry_model(
         verified_remote_ref = bool(remote_hash or remote_version)
 
     return ModelSourceResolution(
-        kind="registry",
         effective_model_id=str(local_dir),
         ref=ref,
         model_name=model_name,
         alias=alias,
-        version=version,
         local_dir=str(local_dir),
         pulled=False,
         used_local=True,
@@ -184,7 +148,6 @@ def pull_registry_model_if_missing(
     local_dir: Path,
     model_name: str,
     alias: str | None,
-    version: str | None,
     ref: str,
     tracking_uri: str,
     require_registry_metadata: bool,
@@ -199,7 +162,7 @@ def pull_registry_model_if_missing(
 
     local_dir.parent.mkdir(parents=True, exist_ok=True)
     if local_dir.exists() and directory_has_payload(local_dir):
-        raise FileExistsError(f"model.source.local_dir became non-empty before pull: {local_dir}")
+        raise FileExistsError(f"model.cache_dir became non-empty before pull: {local_dir}")
 
     with tempfile.TemporaryDirectory(prefix=f".{local_dir.name}.pull.", dir=str(local_dir.parent)) as tmp_root:
         temp_payload = Path(tmp_root) / "payload"
@@ -219,7 +182,6 @@ def pull_registry_model_if_missing(
         "model_name": model_name,
         "ref": ref,
         "alias": alias,
-        "version": version,
         "resolved_version": resolved_version,
         "source_dir_hash": source_hash,
         "local_payload_hash": local_hash,
@@ -229,12 +191,10 @@ def pull_registry_model_if_missing(
     sidecar_path.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     return ModelSourceResolution(
-        kind="registry",
         effective_model_id=str(local_dir),
         ref=ref,
         model_name=model_name,
         alias=alias,
-        version=version,
         local_dir=str(local_dir),
         pulled=True,
         used_local=False,

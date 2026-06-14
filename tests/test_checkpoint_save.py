@@ -144,7 +144,7 @@ def test_validate_resume_checkpoint_enforces_strict_hashes(tmp_path):
         TrainerState(global_step=12),
         config_hashes=checkpoint_hashes,
     )
-    config = load_config("configs/config.preprocess.yaml")
+    config = load_config("configs/config.example.yaml")
     config.raw["checkpointing"]["resume"]["strict_config"] = True
     config.raw["checkpointing"]["resume"]["strict_dataset_hash"] = True
     config.raw["checkpointing"]["resume"]["strict_template_hash"] = True
@@ -157,12 +157,12 @@ def test_validate_resume_checkpoint_enforces_strict_hashes(tmp_path):
         validate_resume_checkpoint(config, checkpoint, current_hashes)
 
 
-def test_explicit_missing_resume_checkpoint_is_an_error(tmp_path):
-    config = load_config("configs/config.preprocess.yaml")
-    config.raw["checkpointing"]["resume"]["path"] = str(tmp_path / "missing")
+def test_resume_checkpoint_is_resolved_from_project_output_dir(tmp_path):
+    config = load_config("configs/config.example.yaml")
+    config.raw["project"]["output_dir"] = str(tmp_path)
+    checkpoint = save_dummy_checkpoint(config.checkpoint_dir, TrainerState(global_step=12))
 
-    with pytest.raises(FileNotFoundError, match="explicit resume checkpoint"):
-        resolve_resume_checkpoint(config)
+    assert resolve_resume_checkpoint(config) == checkpoint
 
 
 def test_training_state_save_excludes_model_weights_and_restores_optimizer(tmp_path):

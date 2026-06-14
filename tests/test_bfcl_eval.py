@@ -54,7 +54,6 @@ def test_distributed_bfcl_runs_all_samples_on_every_rank_in_lockstep(monkeypatch
         section=lambda name: {
             "eval": {
                 "bfcl": {
-                    "eval_path": None,
                     "categories": None,
                     "include_multi_turn": True,
                     "limit": None,
