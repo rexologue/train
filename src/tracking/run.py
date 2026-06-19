@@ -4,39 +4,40 @@ import json
 from pathlib import Path
 from typing import Any
 
-from config import TrainingConfig
+import mlflow
+
+from config import Config
 from preprocessing.io import PretokSplitResult, debug_path, load_manifest
+from tracking.async_worker import AsyncTrackingWorker
 from tracking.lineage import collect_code_metadata, collect_tracking_lineage
 from tracking.model_source import ModelSourceResolution, resolve_model_source
 from tracking.params import flatten_config_params
-from tracking.async_worker import AsyncTrackingWorker
 
 
 class ExperimentTracker:
     """Single facade for MLflow logging, data lineage, and model source metadata."""
 
-    def __init__(self, config: TrainingConfig):
+    def __init__(self, config: Config):
         self.config = config
-        self.mlflow_config = config.raw.get("mlflow") if isinstance(config.raw.get("mlflow"), dict) else {}
         self.enabled = True
-        self.tracking_uri = str(self.mlflow_config.get("tracking_uri") or "")
+        self.tracking_uri = config.mlflow.tracking_uri
         self.mlflow: Any = None
         self.run: Any = None
+        self.model_source_resolution: ModelSourceResolution | None = None
 
     @classmethod
-    def from_config(cls, config: TrainingConfig) -> "ExperimentTracker":
+    def from_config(cls, config: Config) -> "ExperimentTracker":
         return cls(config)
 
     def __enter__(self) -> "ExperimentTracker":
         if not self.enabled:
             return self
-        import mlflow
 
         self.mlflow = mlflow
         mlflow.set_tracking_uri(self.tracking_uri)
-        mlflow.set_experiment(str(self.config.section("project")["name"]))
-        resume_run_id = self.mlflow_config.get("resume_run_id")
-        run_name = self.config.section("project").get("run_name")
+        mlflow.set_experiment(self.config.project.name)
+        resume_run_id = self.config.mlflow.resume_run_id
+        run_name = self.config.project.run_name
         self.run = mlflow.start_run(run_id=resume_run_id or None, run_name=str(run_name) if run_name else None)
         return self
 
@@ -48,7 +49,7 @@ class ExperimentTracker:
         """Resolve/pull the configured model source and log the result."""
 
         resolution = resolve_model_source(self.config, tracking_uri=self.tracking_uri or None)
-        self.config.raw.setdefault("model", {})["resolved_model_id"] = resolution.effective_model_id
+        self.model_source_resolution = resolution
         self.log_model_source_resolution(resolution)
         return resolution
 
@@ -57,26 +58,28 @@ class ExperimentTracker:
 
         if not self.enabled:
             return
-        params = flatten_config_params(self.config.raw)
+        config_dict = self.config.to_dict()
+        params = flatten_config_params(config_dict)
         if config_path is not None:
             params["config.path"] = str(config_path)
         self._log_params(params)
 
-        project = self.config.section("project")
-        model = self.config.section("model")
         code = collect_code_metadata(Path.cwd())
+        resolved_model_id = (
+            self.model_source_resolution.effective_model_id if self.model_source_resolution is not None else None
+        )
         tags = {
             "stage": "training_pipeline",
-            "project.name": str(project.get("name")),
-            "project.run_name": str(project.get("run_name")),
-            "model.registry_name": str(model.get("name")),
-            "model.registry_alias": str(model.get("alias")),
-            "model.resolved_model_id": str(model.get("resolved_model_id")),
+            "project.name": self.config.project.name,
+            "project.run_name": str(self.config.project.run_name),
+            "model.registry_name": self.config.model.name,
+            "model.registry_alias": self.config.model.alias,
+            "model.resolved_model_id": str(resolved_model_id),
             "code.git_commit": str(code.get("commit")),
             "code.git_dirty": "true" if code.get("dirty") else "false",
         }
         self.mlflow.set_tags(tags)
-        self.mlflow.log_dict(self.config.raw, "config/effective_config.json")
+        self.mlflow.log_dict(config_dict, "config/effective_config.json")
         self.mlflow.log_dict({"code": code}, "lineage/code.json")
 
     def log_lineage(self) -> dict[str, Any]:
@@ -120,6 +123,8 @@ class ExperimentTracker:
             tags["model.registry_ref"] = resolution.ref
         if resolution.resolved_version:
             tags["model.resolved_version"] = resolution.resolved_version
+        if resolution.expected_payload_hash:
+            tags["model.expected_payload_hash"] = resolution.expected_payload_hash
         if resolution.source_dir_hash:
             tags["model.source_dir_hash"] = resolution.source_dir_hash
         self.mlflow.set_tags(tags)
@@ -155,7 +160,7 @@ class ExperimentTracker:
                 if full_manifest is not None:
                     self.mlflow.log_dict(full_manifest, "preprocessing/manifest.json")
                 manifests_logged.add(manifest_key)
-            if bool(self.mlflow_config.get("log_rendered_samples", False)):
+            if self.config.mlflow.log_rendered_samples:
                 path = debug_path(result.output_dir)
                 if path.exists():
                     self.mlflow.log_artifact(str(path), artifact_path="preprocessing")
@@ -180,17 +185,17 @@ class ExperimentTracker:
     def create_async_worker(self) -> AsyncTrackingWorker | None:
         """Create a CPU-only async worker for metrics, artifacts, and registry jobs."""
 
-        async_config = self.mlflow_config.get("async_logging")
-        if not self.enabled or not isinstance(async_config, dict) or not async_config.get("enabled"):
+        async_config = self.config.mlflow.async_logging
+        if not self.enabled or not async_config.enabled:
             return None
         if self.run is None:
             raise RuntimeError("MLflow run must be active before creating async tracking worker")
         return AsyncTrackingWorker(
             tracking_uri=self.tracking_uri,
             run_id=self.run.info.run_id,
-            queue_max_items=int(async_config.get("queue_max_items", 1024)),
-            flush_timeout_seconds=float(async_config.get("flush_timeout_seconds", 300)),
-            fail_on_worker_error=bool(async_config.get("fail_on_worker_error", True)),
+            queue_max_items=async_config.queue_max_items,
+            flush_timeout_seconds=float(async_config.flush_timeout_seconds),
+            fail_on_worker_error=async_config.fail_on_worker_error,
         )
 
     def _log_params(self, params: dict[str, str]) -> None:

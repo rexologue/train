@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config.hashing import file_sha256
+from utils.hashing import file_sha256
 
 
 def directory_checksums(root: str | Path) -> dict[str, str]:
@@ -12,4 +12,3 @@ def directory_checksums(root: str | Path) -> dict[str, str]:
         for path in sorted(root_path.rglob("*"))
         if path.is_file()
     }
-

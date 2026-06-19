@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
+import subprocess
 from typing import Any
 
-from config import TrainingConfig, file_sha256
+import yaml
+
+from config import Config
+from utils.hashing import file_sha256
 
 
-def collect_tracking_lineage(config: TrainingConfig) -> dict[str, Any]:
+def collect_tracking_lineage(config: Config) -> dict[str, Any]:
     """Auto-discover data.dvc next to the configured train dataset."""
 
-    train_path = Path(str(config.preprocessing["raw"]["train_path"])).expanduser().resolve()
+    train_path = config.preprocessing.raw.train_path.expanduser().resolve()
     candidates = (train_path.parent / "data.dvc", train_path.parent.parent / "data.dvc")
     dvc_path = next((path for path in candidates if path.is_file()), None)
     if dvc_path is None:
@@ -75,11 +78,6 @@ def run_git(repo_root: Path, *args: str) -> str | None:
 
 def collect_dvc_target(repo_root: Path, dvc_file: str) -> dict[str, Any]:
     """Read one .dvc metadata file without requiring the DVC Python package."""
-
-    try:
-        import yaml
-    except ImportError as exc:  # pragma: no cover - PyYAML is a project dependency.
-        raise RuntimeError("PyYAML is required to read DVC metadata") from exc
 
     dvc_path = (repo_root / dvc_file).resolve()
     with dvc_path.open("r", encoding="utf-8") as handle:

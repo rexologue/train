@@ -1,20 +1,12 @@
 from __future__ import annotations
 
+import random
+
+import numpy as np
+import torch
+
 
 def set_seed(seed: int) -> None:
-    import random
-
     random.seed(seed)
-    try:
-        import numpy as np
-
-        np.random.seed(seed)
-    except ImportError:
-        pass
-    try:
-        import torch
-
-        torch.manual_seed(seed)
-    except ImportError:
-        pass
-
+    np.random.seed(seed)
+    torch.manual_seed(seed)

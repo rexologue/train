@@ -1,36 +1,43 @@
-# Единственный production-конфиг. Запуск всегда выполняет полный training contour.
+# Production SFT/DPO training contour example.
+# The run always executes the full pipeline: model source resolution,
+# preprocessing cache, routed dataloaders, optional DPO reference-logprob cache,
+# training, eval, checkpointing, MLflow tracking, and candidate registration.
 
 project:
-  # Одно имя для MLflow experiment и destination model в registry.
-  name: estadel-dialog-sft
-  # Имя MLflow run. null разрешен.
-  run_name: qwen35-a3b-lora-v1
+  # MLflow experiment name and default destination registry model name.
+  name: estadel-dialog-tuning
+  # Optional MLflow run name.
+  run_name: qwen35-a3b-lora-sft-dpo-v1
   seed: 42
-  # Единственный output root. Pretokenized cache, checkpoints и eval rows
-  # автоматически пишутся в подпапки этого каталога.
-  output_dir: runs/estadel-dialog-sft/qwen35-a3b-lora-v1
+  # Single output root for pretokenized cache, ref-logprob cache, checkpoints,
+  # eval rows, and run-local artifacts.
+  output_dir: runs/estadel-dialog-tuning/qwen35-a3b-lora-sft-dpo-v1
 
 model:
-  # Source model всегда загружается из registry по alias.
+  # Source model is resolved from modelctl/MLflow registry by alias.
   name: estadel-llm
   alias: champion
-  # Локальный cache destination для modelctl pull.
+  # Local model payload cache. Main process verifies or pulls it through modelctl.
   cache_dir: artifacts/model_cache/estadel-llm/champion
+
   checks:
+    # Kept for config compatibility. Current resolution uses modelctl verify
+    # before pull and records the verified payload hash in the local sidecar.
     verify_local_hash: true
     verify_remote_ref: false
     require_registry_metadata: true
+
   precision: bf16
-  use_fp8_base: false
   trust_remote_code: true
   attn_implementation: flash_attention_2
+  experts_implementation: eager
   gradient_checkpointing: true
   freeze_router: true
   freeze_embeddings: true
   freeze_lm_head: true
 
 tokenizer:
-  # Tokenizer и official chat template всегда берутся из model.cache_dir.
+  # Tokenizer and official chat template are loaded from model.cache_dir.
   use_fast: true
   add_special_tokens: false
   padding_side: right
@@ -53,34 +60,55 @@ preprocessing:
     valid_path: data/valid.parquet
     test_path: data/test.parquet
     test_required: false
+
   sequence:
     max_seq_len: 8192
     truncation: false
     packing: false
+
   rendering:
+    use_system: true
     reject_raw_special_markers: true
+
   reasoning:
     enable_thinking: false
+
   masking:
     ignore_index: -100
     require_positive_supervised_tokens: true
+
     policies:
       sft_target:
         min_guaranteed_assistant_chars: 80
         loss_on_short_assistant_reply_prob: 0.3
         short_response_sampling_seed: 42
-      sft_tool: {}
 
 loss_routing:
-  # Частота routes всегда определяется самим датасетом. Никаких sampler weights.
+  # Route frequency is determined by dataset composition. No sampler weights.
+  # `dpo_target` is a supported active route; remove it only when the dataset
+  # and run are intentionally SFT-only.
   routes:
     sft_target:
       type: sft_ce
     sft_tool:
       type: sft_ce
+    dpo_target:
+      type: dpo
+
+  dpo:
+    beta: 0.1
+    reference:
+      # The reference policy is the prepared FSDP model with the active
+      # trainable LoRA adapter disabled through PEFT.
+      mode: disable_adapter
+      # Store reference logprobs in output_dir/ref_logprobs/<signature>.
+      cache_enabled: true
+      # Force recomputation even when a matching cache exists.
+      cache_refresh: false
+      # Fail if DPO rows cannot get cached reference logprobs.
+      cache_required: false
 
 training:
-  # Полное число проходов по train DataLoader.
   num_epochs: 3
   per_device_train_batch_size: 1
   drop_last: false
@@ -117,7 +145,6 @@ eval:
   standard:
     max_batches: 50
   bfcl:
-    # false полностью отключает BFCL. Dataset всегда bundled в src/eval/ru_bfcl/data.
     enabled: true
     run_every_n_validations: 1
     include_multi_turn: true
@@ -137,9 +164,9 @@ checkpointing:
     strict_config: true
     strict_dataset_hash: true
     strict_template_hash: true
+    strict_model_source_hash: true
 
 mlflow:
-  # MLflow всегда включен. Experiment/run names берутся из project.
   tracking_uri: http://localhost:5000
   resume_run_id: null
   async_logging:
@@ -150,14 +177,13 @@ mlflow:
   log_rendered_samples: true
 
 registry:
-  # Destination model = project.name. Aliases = candidate-NNNNNN и candidate-latest.
+  # Training registers candidate aliases only. Production promotion is separate.
   register_every_n_checkpoints: 5
   selection:
-    # Ordinary: eval/loss, eval/ppl, eval/batches, eval/tokens,
+    # Ordinary metrics: eval/loss, eval/ppl, eval/batches, eval/tokens,
     # eval/supervised_tokens.
-    # BFCL: eval/bfcl/accuracy, eval/bfcl/total, eval/bfcl/passed,
+    # BFCL metrics: eval/bfcl/accuracy, eval/bfcl/total, eval/bfcl/passed,
     # eval/bfcl/failed, eval/bfcl/<category>/accuracy,
     # eval/bfcl/<category>/total.
-    # Для отключенного BFCL выбирай eval/loss или eval/ppl.
     metric: eval/loss
     mode: min

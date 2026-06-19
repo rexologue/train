@@ -34,7 +34,9 @@ def file_sha256(path: str | Path) -> str:
     """Stream a file and return its prefixed SHA256."""
 
     digest = hashlib.sha256()
+    
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+            
     return "sha256:" + digest.hexdigest()

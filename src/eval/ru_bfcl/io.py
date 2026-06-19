@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 from importlib.resources import files
+import json
 from pathlib import Path
 from typing import Any, Iterable
 

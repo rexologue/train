@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
+import hashlib
 from typing import Any, Literal
 
-from config import stable_hash
+from utils.hashing import stable_hash
 
 
 LossKind = Literal["sft_target", "sft_tool", "dpo_target"]
@@ -84,7 +84,7 @@ def spans_to_ranges(spans: list[AssistantSpan]) -> list[tuple[int, int]]:
 def canonicalize_row(row: dict[str, Any], split: Split, row_index: int) -> CanonicalRow:
     """Convert a parsed raw row to the canonical shape used by legacy tests/helpers.
 
-    `loss_kind` must already be injected from the parquet `type`/`target` column.
+    `loss_kind` must already be injected from the parquet `type` column.
     The function intentionally does not infer it from payload contents because
     `sft_tool` may contain ordinary assistant text and no explicit tools.
     """
@@ -94,7 +94,7 @@ def canonicalize_row(row: dict[str, Any], split: Split, row_index: int) -> Canon
 
     loss_kind = row.get("loss_kind")
     if loss_kind not in {"sft_target", "sft_tool", "dpo_target"}:
-        raise CanonicalizationError("canonical row requires explicit loss_kind from parquet type/target column")
+        raise CanonicalizationError("canonical row requires explicit loss_kind from parquet type column")
 
     sample_id = str(row.get("sample_id") or row.get("id") or stable_hash({"split": split, "row_index": row_index, "row": row}))
     metadata = dict(row.get("metadata") or {})

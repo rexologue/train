@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
+from pathlib import Path
 import queue
-import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
+
+from mlflow.tracking import MlflowClient
+
+from registry.modelctl_client import ModelctlClient, ModelctlRegisterRequest
 
 
 JobFn = Callable[[], None]
@@ -42,20 +45,28 @@ class AsyncTrackingWorker:
         self.client_factory = client_factory
         self._jobs: queue.Queue[tuple[str, JobFn] | None] = queue.Queue(maxsize=queue_max_items)
         self._errors: list[AsyncJobError] = []
+        self._errors_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._closed = False
 
     @property
     def errors(self) -> list[AsyncJobError]:
-        return list(self._errors)
+        """Return background job errors collected so far."""
+
+        with self._errors_lock:
+            return list(self._errors)
 
     def start(self) -> "AsyncTrackingWorker":
+        """Start the worker thread on first use."""
+
         if self._thread is None:
             self._thread = threading.Thread(target=self._run, name="async-tracking-worker", daemon=True)
             self._thread.start()
         return self
 
     def enqueue(self, name: str, fn: JobFn) -> None:
+        """Queue a named background job."""
+
         if self._closed:
             raise RuntimeError("async tracking worker is closed")
         self.start()
@@ -65,6 +76,8 @@ class AsyncTrackingWorker:
             raise TimeoutError(f"async tracking queue remained full for {self.flush_timeout_seconds:g}s") from exc
 
     def flush(self) -> None:
+        """Wait until all previously queued jobs have run and surface errors."""
+
         completed = threading.Event()
         self.enqueue("worker.flush", completed.set)
         if not completed.wait(self.flush_timeout_seconds):
@@ -72,6 +85,8 @@ class AsyncTrackingWorker:
         self._raise_if_needed()
 
     def close(self) -> None:
+        """Flush pending jobs and stop the worker thread."""
+
         if self._closed:
             return
         flush_error: BaseException | None = None
@@ -94,12 +109,18 @@ class AsyncTrackingWorker:
         self._raise_if_needed()
 
     def __enter__(self) -> "AsyncTrackingWorker":
+        """Enter the worker context and start the thread."""
+
         return self.start()
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        """Close the worker context."""
+
         self.close()
 
     def log_metrics(self, metrics: dict[str, float], *, step: int | None = None) -> None:
+        """Log metrics to the active MLflow run in the background."""
+
         run_id = self._require_run_id()
 
         def task() -> None:
@@ -110,6 +131,8 @@ class AsyncTrackingWorker:
         self.enqueue("mlflow.log_metrics", task)
 
     def log_dict(self, data: dict[str, Any], artifact_file: str) -> None:
+        """Log a dictionary artifact to the active MLflow run in the background."""
+
         run_id = self._require_run_id()
 
         def task() -> None:
@@ -124,6 +147,8 @@ class AsyncTrackingWorker:
         self.enqueue("mlflow.log_dict", task)
 
     def log_artifact(self, local_path: str | Path, *, artifact_path: str | None = None) -> None:
+        """Log a local artifact to the active MLflow run in the background."""
+
         run_id = self._require_run_id()
 
         def task() -> None:
@@ -131,19 +156,21 @@ class AsyncTrackingWorker:
 
         self.enqueue("mlflow.log_artifact", task)
 
-    def run_modelctl_register(self, args: list[str]) -> None:
+    def run_modelctl_register(self, request: ModelctlRegisterRequest) -> None:
+        """Register a modelctl payload in the background."""
+
         def task() -> None:
-            subprocess.run(
-                args,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=self.flush_timeout_seconds,
+            client = ModelctlClient(
+                tracking_uri=self.tracking_uri,
+                timeout_seconds=self.flush_timeout_seconds,
             )
+            client.register(request)
 
         self.enqueue("modelctl.register", task)
 
     def _run(self) -> None:
+        """Run queued jobs until a shutdown sentinel is received."""
+
         while True:
             item = self._jobs.get()
             try:
@@ -153,23 +180,31 @@ class AsyncTrackingWorker:
                 try:
                     fn()
                 except BaseException as exc:  # noqa: BLE001 - preserved for surfacing on flush.
-                    self._errors.append(AsyncJobError(name=name, error=exc))
+                    with self._errors_lock:
+                        self._errors.append(AsyncJobError(name=name, error=exc))
             finally:
                 self._jobs.task_done()
 
     def _new_client(self) -> Any:
+        """Create an MLflow client for worker-side calls."""
+
         if self.client_factory is not None:
             return self.client_factory(self.tracking_uri)
-        from mlflow.tracking import MlflowClient
 
         return MlflowClient(tracking_uri=self.tracking_uri)
 
     def _require_run_id(self) -> str:
+        """Return the active MLflow run id or fail."""
+
         if not self.run_id:
             raise ValueError("run_id is required for asynchronous MLflow logging")
         return self.run_id
 
     def _raise_if_needed(self) -> None:
-        if self.fail_on_worker_error and self._errors:
-            first = self._errors[0]
+        """Raise the first collected worker error when configured to fail fast."""
+
+        with self._errors_lock:
+            errors = list(self._errors)
+        if self.fail_on_worker_error and errors:
+            first = errors[0]
             raise RuntimeError(f"async tracking job failed: {first.name}") from first.error

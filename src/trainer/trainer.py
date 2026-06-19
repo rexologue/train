@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
+import time
 from typing import Any, Iterable
 
+import torch
+
+from losses.dpo import dpo_loss
+from losses.sft import sft_cross_entropy_loss
 from trainer.callbacks import TrainerHooks
 from trainer.state import TrainerState
 
@@ -18,24 +22,12 @@ class TrainerCadence:
 
     @classmethod
     def from_config(cls, config: Any) -> "TrainerCadence":
-        eval_config = config.section("eval") if "eval" in config.raw else {}
-        checkpointing = config.section("checkpointing")
-
-        eval_every = eval_config.get("every_train_steps")
-        if eval_every is None:
-            raise ValueError("eval.every_train_steps must be configured")
-
-        checkpoint_every = checkpointing.get("save_every_n_validations")
-        if checkpoint_every is None:
-            raise ValueError("checkpointing.save_every_n_validations must be configured")
-
-        bfcl = eval_config.get("bfcl") if isinstance(eval_config.get("bfcl"), dict) else {}
-        bfcl_every = bfcl.get("run_every_n_validations", 1) if bfcl.get("enabled", True) else None
+        bfcl_every = config.eval.bfcl.run_every_n_validations if config.eval.bfcl.enabled else None
 
         return cls(
-            eval_every_train_steps=_positive_int(eval_every, "eval.every_train_steps"),
+            eval_every_train_steps=_positive_int(config.eval.every_train_steps, "eval.every_train_steps"),
             checkpoint_every_n_validations=_positive_int(
-                checkpoint_every,
+                config.checkpointing.save_every_n_validations,
                 "checkpointing.save_every_n_validations",
             ),
             bfcl_every_n_validations=(
@@ -95,15 +87,27 @@ class RoutedTrainer:
         self.accelerator = accelerator
         self.hooks = hooks or TrainerHooks()
         self.cadence = cadence or (TrainerCadence.from_config(config) if config is not None else None)
+        self.last_loss_metrics: dict[str, float] = {}
 
     def compute_loss(self, model, batch):
+        self.last_loss_metrics = {}
         loss_kind = batch.get("loss_kind")
         if loss_kind in {"sft_target", "sft_tool"}:
-            from losses.sft import sft_cross_entropy_loss
-
             return sft_cross_entropy_loss(model, batch)
         if loss_kind == "dpo_target":
-            raise NotImplementedError("DPO route requires chosen/rejected logprob plumbing")
+            if self.config is None:
+                raise ValueError("DPO loss requires trainer config")
+            result = dpo_loss(
+                model,
+                batch,
+                beta=float(self.config.loss_routing.dpo.beta),
+                ignore_index=int(self.config.ignore_index),
+                accelerator=self.accelerator,
+                reference_mode=self.config.loss_routing.dpo.reference.mode,
+                cache_required=bool(self.config.loss_routing.dpo.reference.cache_required),
+            )
+            self.last_loss_metrics = result.metrics
+            return result.loss
         raise ValueError(f"unknown loss_kind {loss_kind!r}")
 
     def fit(
@@ -131,15 +135,16 @@ class RoutedTrainer:
         if total_steps is None:
             raise ValueError("total_steps must be provided")
 
-        training = self.config.section("training") if self.config is not None else {}
         total_steps = _positive_int(total_steps, "total_steps")
         grad_accum = _positive_int(
             gradient_accumulation_steps
             if gradient_accumulation_steps is not None
-            else training.get("gradient_accumulation_steps", 1),
+            else self.config.training.gradient_accumulation_steps
+            if self.config is not None
+            else 1,
             "training.gradient_accumulation_steps",
         )
-        max_grad_norm = float(training.get("max_grad_norm", 0.0) or 0.0)
+        max_grad_norm = float(self.config.training.max_grad_norm if self.config is not None else 0.0)
         ignore_index = int(getattr(self.config, "ignore_index", -100)) if self.config is not None else -100
         state = state or TrainerState()
         train_iterator = iter(train_dataloader)
@@ -157,10 +162,13 @@ class RoutedTrainer:
         step_tokens = 0
         step_supervised_tokens = 0
         accumulated_batches = 0
+        accumulated_route_metrics: dict[str, float] = {}
+        accumulated_route_metric_count = 0
         accumulation_target = grad_accum
         step_started_at = time.monotonic()
         if hasattr(model, "train"):
             model.train()
+
         optimizer.zero_grad(set_to_none=True)
 
         while state.global_step < total_steps and state.consumed_batches < target_micro_batches:
@@ -169,9 +177,14 @@ class RoutedTrainer:
                 remaining_in_epoch = batches_per_epoch - batches_into_epoch
                 remaining_total = target_micro_batches - state.consumed_batches
                 accumulation_target = min(grad_accum, remaining_in_epoch, remaining_total)
+
             with self.accelerator.accumulate(model):
                 batch, train_iterator = _cycle_next(train_iterator, train_dataloader)
                 loss = self.compute_loss(model, batch)
+                if self.last_loss_metrics:
+                    for key, value in self.last_loss_metrics.items():
+                        accumulated_route_metrics[key] = accumulated_route_metrics.get(key, 0.0) + float(value)
+                    accumulated_route_metric_count += 1
                 accumulated_loss += _detach_item(loss)
                 batch_stats = _batch_stats(batch, ignore_index=ignore_index)
                 step_samples += batch_stats["samples"]
@@ -179,8 +192,10 @@ class RoutedTrainer:
                 step_supervised_tokens += batch_stats["supervised_tokens"]
                 backward_loss = loss
                 accelerator_grad_accum = int(getattr(self.accelerator, "gradient_accumulation_steps", 1))
+
                 if exact_epoch_mode and accumulation_target < accelerator_grad_accum:
                     backward_loss = loss * (accelerator_grad_accum / accumulation_target)
+
                 self.accelerator.backward(backward_loss)
                 state.consumed_batches += 1
                 accumulated_batches += 1
@@ -198,9 +213,12 @@ class RoutedTrainer:
 
             if max_grad_norm > 0:
                 self.accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+
             optimizer.step()
+            
             if scheduler is not None:
                 scheduler.step()
+
             optimizer.zero_grad(set_to_none=True)
 
             state.global_step += 1
@@ -222,6 +240,9 @@ class RoutedTrainer:
             lr = _current_lr(optimizer)
             if lr is not None:
                 metrics["train/lr"] = lr
+            if accumulated_route_metric_count:
+                for key, value in accumulated_route_metrics.items():
+                    metrics[f"train/{key}"] = value / accumulated_route_metric_count
             self.hooks.metrics(metrics, state)
 
             if self.cadence.should_validate(state.global_step):
@@ -232,6 +253,8 @@ class RoutedTrainer:
             step_tokens = 0
             step_supervised_tokens = 0
             accumulated_batches = 0
+            accumulated_route_metrics = {}
+            accumulated_route_metric_count = 0
             step_started_at = time.monotonic()
             if hasattr(model, "train"):
                 model.train()
@@ -274,9 +297,22 @@ def _batch_stats(batch: dict[str, Any], *, ignore_index: int) -> dict[str, int]:
     sample_id = batch.get("sample_id")
     samples = len(sample_id) if isinstance(sample_id, list) else int(batch["input_ids"].shape[0]) if "input_ids" in batch else 0
     attention_mask = batch.get("attention_mask")
-    tokens = int(attention_mask.sum().item()) if attention_mask is not None else 0
+    if attention_mask is not None:
+        tokens = int(attention_mask.sum().item())
+    elif "chosen_attention_mask" in batch and "rejected_attention_mask" in batch:
+        tokens = int(batch["chosen_attention_mask"].sum().item() + batch["rejected_attention_mask"].sum().item())
+    else:
+        tokens = 0
     labels = batch.get("labels")
-    supervised_tokens = int((labels != ignore_index).sum().item()) if labels is not None else 0
+    if labels is not None:
+        supervised_tokens = int((labels != ignore_index).sum().item())
+    elif "chosen_labels" in batch and "rejected_labels" in batch:
+        supervised_tokens = int(
+            (batch["chosen_labels"] != ignore_index).sum().item()
+            + (batch["rejected_labels"] != ignore_index).sum().item()
+        )
+    else:
+        supervised_tokens = 0
     return {"samples": samples, "tokens": tokens, "supervised_tokens": supervised_tokens}
 
 
@@ -307,8 +343,6 @@ def _gather_step_totals(
             "elapsed": float(elapsed),
             "processes": 1.0,
         }
-
-    import torch
 
     values = torch.tensor(
         [float(accumulated_loss), float(samples), float(tokens), float(supervised_tokens), float(elapsed)],

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tqdm.auto import tqdm
+
 
 def validation_marker(name: str) -> str:
     return f"validation:{name}:start"
@@ -14,8 +16,6 @@ class TrainingProgress:
 
     def __enter__(self) -> "TrainingProgress":
         if self.enabled:
-            from tqdm.auto import tqdm
-
             self._bar = tqdm(total=self.total_steps, desc="train", dynamic_ncols=True)
         return self
 
@@ -29,7 +29,9 @@ class TrainingProgress:
         if state.global_step > self._last_step:
             self._bar.update(state.global_step - self._last_step)
             self._last_step = state.global_step
+
         postfix = {}
+
         for key in (
             "train/loss",
             "train/lr",
@@ -41,19 +43,23 @@ class TrainingProgress:
         ):
             if key in metrics:
                 postfix[key.rsplit("/", 1)[-1]] = f"{float(metrics[key]):.4g}"
+
         if postfix:
             self._bar.set_postfix(postfix)
 
     def phase(self, name: str, state) -> None:
         if not self.enabled:
             return
+
         messages = {
             "validation:standard:start": f"[validation {state.validation_index:04d}] standard eval started",
             "validation:bfcl:start": f"[validation {state.validation_index:04d}] bfcl eval started",
             "checkpoint:save:start": f"[checkpoint {state.checkpoint_index:04d}] save started",
             "validation:end": f"[validation {state.validation_index:04d}] finished",
         }
+
         message = messages.get(name)
+        
         if message:
             if self._bar is not None:
                 self._bar.write(message)

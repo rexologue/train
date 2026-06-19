@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 
 SFT_LOSS_KINDS = {"sft_target", "sft_tool"}
 DPO_LOSS_KIND = "dpo_target"
@@ -25,6 +27,8 @@ class RoutedCollator:
     """
 
     def __init__(self, pad_token_id: int, ignore_index: int):
+        """Create a collator with tokenizer padding and label ignore ids."""
+
         self.pad_token_id = pad_token_id
         self.ignore_index = ignore_index
 
@@ -49,9 +53,7 @@ class RoutedCollator:
         raise ValueError(f"unknown loss_kind {loss_kind!r}")
 
     def _tensorize(self, rows: list[list[int]]) -> Any:
-        """Create long tensors lazily so importing data modules does not import torch."""
-
-        import torch
+        """Create long tensors."""
 
         return torch.tensor(rows, dtype=torch.long)
 
@@ -70,12 +72,13 @@ class RoutedCollator:
             ),
             "loss_kind": examples[0]["loss_kind"],
             "sample_id": [example["sample_id"] for example in examples],
+            "row_index": [example["row_index"] for example in examples],
         }
 
     def _collate_dpo(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
         """Pad chosen and rejected branches independently for DPO loss."""
 
-        return {
+        batch = {
             "chosen_input_ids": self._tensorize(
                 pad_sequences([example["chosen_input_ids"] for example in examples], self.pad_token_id)
             ),
@@ -96,4 +99,21 @@ class RoutedCollator:
             ),
             "loss_kind": DPO_LOSS_KIND,
             "sample_id": [example["sample_id"] for example in examples],
+            "row_index": [example["row_index"] for example in examples],
+            "chosen_render_hash": [example.get("chosen_render_hash") for example in examples],
+            "rejected_render_hash": [example.get("rejected_render_hash") for example in examples],
         }
+        if any("_ref_logprob_cache_owner" in example for example in examples):
+            batch["ref_logprob_cache_owner"] = [
+                bool(example.get("_ref_logprob_cache_owner", True)) for example in examples
+            ]
+        if all("chosen_ref_logp" in example and "rejected_ref_logp" in example for example in examples):
+            batch["chosen_ref_logp"] = torch.tensor(
+                [float(example["chosen_ref_logp"]) for example in examples],
+                dtype=torch.float32,
+            )
+            batch["rejected_ref_logp"] = torch.tensor(
+                [float(example["rejected_ref_logp"]) for example in examples],
+                dtype=torch.float32,
+            )
+        return batch

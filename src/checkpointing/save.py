@@ -4,10 +4,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from accelerate.checkpointing import save_accelerator_state
+from accelerate.utils import DistributedType
+from accelerate.utils.fsdp_utils import save_fsdp_optimizer
+
+from checkpointing.atomic import atomic_checkpoint_dir, commit_atomic_checkpoint_dir, reset_tmp_checkpoint_dir
 from checkpointing.checksums import directory_checksums
 from trainer.state import TrainerState
-
-from .atomic import atomic_checkpoint_dir, commit_atomic_checkpoint_dir, reset_tmp_checkpoint_dir
 
 
 def checkpoint_dir_name(global_step: int) -> str:
@@ -89,15 +92,10 @@ def save_training_state_without_model(*, accelerator: Any, model: Any, optimizer
         accelerator.save_state(str(output_dir))
         return
 
-    from accelerate.checkpointing import save_accelerator_state
-    from accelerate.utils import DistributedType
-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     optimizers = [optimizer]
     if accelerator.distributed_type == DistributedType.FSDP:
-        from accelerate.utils.fsdp_utils import save_fsdp_optimizer
-
         save_fsdp_optimizer(accelerator.state.fsdp_plugin, accelerator, optimizer, model, str(output_path), 0)
         optimizers = []
 

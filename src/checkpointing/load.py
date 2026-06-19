@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 import shutil
-from pathlib import Path
 
-from config.hashing import file_sha256, sha256_text, stable_hash
+from accelerate.checkpointing import load_accelerator_state
+from accelerate.utils import DistributedType
+from accelerate.utils.fsdp_utils import load_fsdp_optimizer
+
 from preprocessing.io import cache_root, manifest_path
 from trainer.state import TrainerState
+from utils.hashing import file_sha256, sha256_text, stable_hash
 
 
 def assert_resume_hashes_match(expected: dict[str, str], actual: dict[str, str]) -> None:
@@ -59,36 +63,40 @@ def prune_old_checkpoints(
 
 
 def resolve_resume_checkpoint(config) -> Path | None:
-    resume = config.section("checkpointing").get("resume")
-    if not isinstance(resume, dict) or not resume.get("enabled", False):
+    resume = config.checkpointing.resume
+    if not resume.enabled:
         return None
-    raw_path = resume.get("path")
-    if raw_path not in (None, "", "auto"):
-        raise ValueError("checkpointing.resume.path is no longer configurable")
     return find_latest_checkpoint(config.checkpoint_dir)
 
 
-def build_resume_hashes(config, *, tokenizer=None) -> dict[str, str]:
+def build_resume_hashes(config, *, tokenizer=None, model_source=None) -> dict[str, str]:
     hashes = {
-        "config": stable_hash(config.raw),
+        "config": stable_hash(config.to_dict()),
         "dataset": file_sha256(manifest_path(cache_root(config))),
+        "data_contract": build_data_contract_hash(config),
+        "training_contract": build_training_contract_hash(config, model_source=model_source),
     }
     if tokenizer is not None:
         hashes["template"] = sha256_text(getattr(tokenizer, "chat_template", "") or "")
+    model_source_hash = model_source_payload_hash(model_source)
+    if model_source_hash is not None:
+        hashes["model_source"] = model_source_hash
     return hashes
 
 
 def validate_resume_checkpoint(config, checkpoint_dir: str | Path, current_hashes: dict[str, str]) -> None:
-    resume = config.section("checkpointing").get("resume")
-    if not isinstance(resume, dict):
-        return
+    resume = config.checkpointing.resume
     expected: dict[str, str] = {}
-    if bool(resume.get("strict_config", False)):
+    if resume.strict_config:
         expected["config"] = _require_current_hash(current_hashes, "config")
-    if bool(resume.get("strict_dataset_hash", False)):
+        expected["training_contract"] = _require_current_hash(current_hashes, "training_contract")
+    if resume.strict_dataset_hash:
         expected["dataset"] = _require_current_hash(current_hashes, "dataset")
-    if bool(resume.get("strict_template_hash", False)):
+        expected["data_contract"] = _require_current_hash(current_hashes, "data_contract")
+    if resume.strict_template_hash:
         expected["template"] = _require_current_hash(current_hashes, "template")
+    if getattr(resume, "strict_model_source_hash", False):
+        expected["model_source"] = _require_current_hash(current_hashes, "model_source")
     if not expected:
         return
     manifest = load_checkpoint_manifest(checkpoint_dir)
@@ -96,6 +104,59 @@ def validate_resume_checkpoint(config, checkpoint_dir: str | Path, current_hashe
     if not isinstance(actual, dict):
         actual = {}
     assert_resume_hashes_match(expected, actual)
+
+
+def build_data_contract_hash(config) -> str:
+    """Hash data and sampler settings that define batch order and membership."""
+
+    return stable_hash(
+        {
+            "pretokenized_manifest": file_sha256(manifest_path(cache_root(config))),
+            "sampler": {
+                "batch_size": config.training.per_device_train_batch_size,
+                "drop_last": config.training.drop_last,
+                "seed": config.project.seed,
+            },
+        }
+    )
+
+
+def build_training_contract_hash(config, *, model_source=None) -> str:
+    """Hash training-critical settings separately from run metadata."""
+
+    return stable_hash(
+        {
+            "model": {
+                "name": config.model.name,
+                "alias": config.model.alias,
+                "cache_dir": str(config.model.cache_dir),
+                "precision": config.model.precision,
+                "expected_payload_hash": model_source_payload_hash(model_source),
+            },
+            "tokenizer": config.to_dict()["tokenizer"],
+            "lora": config.to_dict()["lora"],
+            "loss_routing": config.to_dict()["loss_routing"],
+            "training": config.to_dict()["training"],
+            "distributed": config.to_dict()["distributed"],
+        }
+    )
+
+
+def model_source_payload_hash(model_source) -> str | None:
+    """Return the verified model payload hash used for resume checks."""
+
+    if model_source is None:
+        return None
+    expected = getattr(model_source, "expected_payload_hash", None)
+    if expected:
+        return str(expected)
+    source = getattr(model_source, "source_dir_hash", None)
+    if source:
+        return str(source)
+    local = getattr(model_source, "local_payload_hash", None)
+    if local:
+        return str(local)
+    return None
 
 
 def load_trainer_state(checkpoint_dir: str | Path) -> TrainerState:
@@ -112,13 +173,8 @@ def load_training_state_without_model(*, accelerator, model, optimizer, input_di
         accelerator.load_state(str(input_dir))
         return
 
-    from accelerate.checkpointing import load_accelerator_state
-    from accelerate.utils import DistributedType
-
     optimizers = [optimizer]
     if accelerator.distributed_type == DistributedType.FSDP:
-        from accelerate.utils.fsdp_utils import load_fsdp_optimizer
-
         load_fsdp_optimizer(accelerator.state.fsdp_plugin, accelerator, optimizer, model, str(input_dir), 0)
         optimizers = []
 

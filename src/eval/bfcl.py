@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
 from typing import Any
 
 from eval.predictors import BFCLModelPredictor
@@ -14,13 +14,12 @@ def run_bfcl_eval(
     config: Any,
     accelerator: Any | None = None,
 ) -> dict[str, float]:
-    eval_config = config.section("eval")
-    bfcl_config = eval_config["bfcl"]
+    bfcl_config = config.eval.bfcl
     validator = BFCLValidator.from_jsonl(
         None,
-        categories=set(bfcl_config["categories"]) if bfcl_config.get("categories") else None,
-        include_multi_turn=bool(bfcl_config.get("include_multi_turn", True)),
-        limit=bfcl_config.get("limit"),
+        categories=set(bfcl_config.categories) if bfcl_config.categories else None,
+        include_multi_turn=bfcl_config.include_multi_turn,
+        limit=bfcl_config.limit,
     )
     predictor = BFCLModelPredictor(model=model, tokenizer=tokenizer, config=config, accelerator=accelerator)
 
@@ -30,7 +29,7 @@ def run_bfcl_eval(
         _write_rows(config, summary)
         return _summary_metrics(summary)
 
-    # FSDP forward/generate calls are collective. Every rank must execute the
+    # FSDP forwards are collective. Every rank must execute the
     # same requests in the same order; splitting variable-length/multi-turn
     # samples between ranks can deadlock when ranks perform different numbers
     # of generate calls.
@@ -48,17 +47,7 @@ def _predict_samples(samples: list[Any], predictor: BFCLModelPredictor) -> dict[
     predictions: dict[str, Any] = {}
     for sample in samples:
         if sample.is_multi_turn:
-            predictions[sample.id] = [
-                predictor(
-                    BFCLRequest(
-                        sample=sample,
-                        turn_index=turn_index,
-                        messages=turn["messages"],
-                        tools=sample.tools,
-                    )
-                )
-                for turn_index, turn in enumerate(sample.turns)
-            ]
+            predictions[sample.id] = predict_multi_turn_sample(sample, predictor)
         else:
             predictions[sample.id] = predictor(
                 BFCLRequest(
@@ -69,6 +58,59 @@ def _predict_samples(samples: list[Any], predictor: BFCLModelPredictor) -> dict[
                 )
             )
     return predictions
+
+
+def predict_multi_turn_sample(sample: Any, predictor: BFCLModelPredictor) -> list[Any]:
+    """Predict a multi-turn BFCL sample with prior turn context."""
+
+    context: list[dict[str, Any]] = []
+    predictions: list[Any] = []
+    for turn_index, turn in enumerate(sample.turns):
+        turn_messages = list(turn["messages"])
+        predicted_calls = predictor(
+            BFCLRequest(
+                sample=sample,
+                turn_index=turn_index,
+                messages=[*context, *turn_messages],
+                tools=sample.tools,
+            )
+        )
+        predictions.append(predicted_calls)
+        context.extend(turn_messages)
+        if predicted_calls:
+            context.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": tool_calls_to_messages(predicted_calls),
+                }
+            )
+    return predictions
+
+
+def tool_calls_to_messages(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert normalized predictions into assistant tool_call messages."""
+
+    messages: list[dict[str, Any]] = []
+    for index, call in enumerate(calls):
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = call.get("name") or function.get("name")
+        arguments = call.get("arguments") if "arguments" in call else function.get("arguments")
+        messages.append(
+            {
+                "id": f"bfcl_call_{index}",
+                "type": "function",
+                "function": {
+                    "name": str(name or ""),
+                    "arguments": (
+                        arguments
+                        if isinstance(arguments, str)
+                        else json.dumps(arguments or {}, ensure_ascii=False, sort_keys=True)
+                    ),
+                },
+            }
+        )
+    return messages
 
 
 def _summary_metrics(summary: dict[str, Any]) -> dict[str, float]:

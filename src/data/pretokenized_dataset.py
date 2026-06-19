@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import math
 from collections import Counter
+import math
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 
 SFT_LOSS_KINDS = {"sft_target", "sft_tool"}
@@ -47,12 +49,19 @@ def _optional(value: Any) -> Any:
     return None if _is_missing(value) else value
 
 
+def _optional_float(value: Any) -> float | None:
+    """Convert an optional parquet scalar into a float."""
+
+    value = _optional(value)
+    return None if value is None else float(value)
+
+
 class PretokenizedDataset:
     """Map-style dataset over cached pretokenized parquet rows.
 
     This dataset is deliberately route-agnostic at the container level: one
-    parquet split may contain `sft_target`, `sft_tool`, and future
-    `dpo_target` rows. The authoritative route remains the preprocessed
+    parquet split may contain `sft_target`, `sft_tool`, and `dpo_target`
+    rows. The authoritative route remains the preprocessed
     `loss_kind` column; batching and loss dispatch happen downstream.
     """
 
@@ -63,21 +72,23 @@ class PretokenizedDataset:
         self.loss_kinds = [row["loss_kind"] for row in self.rows]
         self.loss_kind_counts = Counter(self.loss_kinds)
 
+
     @classmethod
     def from_parquet(cls, path: str | Path, *, split: str | None = None) -> "PretokenizedDataset":
         """Read a pretokenized parquet split and validate its training schema."""
-
-        import pandas as pd
 
         parquet_path = Path(path)
         frame = pd.read_parquet(parquet_path)
         return cls(frame.to_dict(orient="records"), split=split, path=parquet_path)
 
+
     def __len__(self) -> int:
         return len(self.rows)
 
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         return self.rows[index]
+
 
     def _normalize_row(self, row: dict[str, Any], *, fallback_index: int) -> dict[str, Any]:
         """Normalize one physical parquet row into the in-memory Dataset schema."""
@@ -85,12 +96,14 @@ class PretokenizedDataset:
         loss_kind = row.get("loss_kind")
         if loss_kind not in LOSS_KINDS:
             raise ValueError(f"row {fallback_index}: unknown loss_kind {loss_kind!r}")
+
         row_index = row.get("row_index")
         normalized: dict[str, Any] = {
             "sample_id": str(row.get("sample_id") or fallback_index),
             "row_index": fallback_index if _is_missing(row_index) else int(row_index),
             "loss_kind": loss_kind,
         }
+
         if self.split is not None:
             normalized["split"] = self.split
 
@@ -100,11 +113,14 @@ class PretokenizedDataset:
             normalized.update(self._normalize_sft(row, fallback_index))
         else:
             normalized.update(self._normalize_dpo(row, fallback_index))
+
         for field in ("source_hash", "render_hash", "chosen_render_hash", "rejected_render_hash"):
             value = _optional(row.get(field))
             if value is not None:
                 normalized[field] = value
+
         return normalized
+
 
     def _normalize_sft(self, row: dict[str, Any], row_index: int) -> dict[str, Any]:
         """Validate fields used by the SFT cross-entropy route."""
@@ -112,8 +128,10 @@ class PretokenizedDataset:
         input_ids = _int_list(row.get("input_ids"), field="input_ids", row_index=row_index)
         attention_mask = _int_list(row.get("attention_mask"), field="attention_mask", row_index=row_index)
         labels = _int_list(row.get("labels"), field="labels", row_index=row_index)
+
         if not (len(input_ids) == len(attention_mask) == len(labels)):
             raise ValueError(f"row {row_index}: input_ids, attention_mask and labels must have equal length")
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -122,19 +140,26 @@ class PretokenizedDataset:
             "num_supervised_tokens": int(_optional(row.get("num_supervised_tokens")) or 0),
         }
 
+
     def _normalize_dpo(self, row: dict[str, Any], row_index: int) -> dict[str, Any]:
-        """Validate chosen/rejected branches used by the future DPO route."""
+        """Validate chosen/rejected branches used by the DPO route."""
 
         normalized: dict[str, Any] = {}
         for side in ("chosen", "rejected"):
             input_ids = _int_list(row.get(f"{side}_input_ids"), field=f"{side}_input_ids", row_index=row_index)
             attention_mask = _int_list(row.get(f"{side}_attention_mask"), field=f"{side}_attention_mask", row_index=row_index)
             labels = _int_list(row.get(f"{side}_labels"), field=f"{side}_labels", row_index=row_index)
+            
             if not (len(input_ids) == len(attention_mask) == len(labels)):
                 raise ValueError(f"row {row_index}: {side} input_ids, attention_mask and labels must have equal length")
+
             normalized[f"{side}_input_ids"] = input_ids
             normalized[f"{side}_attention_mask"] = attention_mask
             normalized[f"{side}_labels"] = labels
             normalized[f"{side}_length"] = int(_optional(row.get(f"{side}_length")) or len(input_ids))
             normalized[f"{side}_completion_token_count"] = int(_optional(row.get(f"{side}_completion_token_count")) or 0)
+            ref_logp = _optional_float(row.get(f"{side}_ref_logp"))
+            if ref_logp is not None:
+                normalized[f"{side}_ref_logp"] = ref_logp
+
         return normalized

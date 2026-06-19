@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .schema import ConfigError, TrainingConfig, validate_config
+import yaml
+
+from .schema import Config, ConfigError
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -20,13 +22,8 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def load_yaml(path: str | Path) -> dict[str, Any]:
+def _load_yaml(path: str | Path) -> dict[str, Any]:
     """Load a YAML file and resolve a local `extends` chain."""
-
-    try:
-        import yaml
-    except ImportError as exc:  # pragma: no cover - exercised only in minimal envs.
-        raise ConfigError("PyYAML is required to load project YAML configs") from exc
 
     with Path(path).open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
@@ -35,12 +32,12 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
     extends = data.get("extends")
     if extends:
         base_path = Path(path).parent / str(extends)
-        base = load_yaml(base_path)
+        base = _load_yaml(base_path)
         data = _deep_merge(base, data)
     return data
 
 
-def load_config(path: str | Path) -> TrainingConfig:
-    """Load and validate a training/preprocessing YAML config."""
+def load_config(path: str | Path) -> Config:
+    """Load a YAML config file and return the validated Config object."""
 
-    return validate_config(load_yaml(path))
+    return Config.from_dict(_load_yaml(path))

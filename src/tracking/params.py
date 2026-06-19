@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from config import stable_hash
+from utils.hashing import stable_hash
 
 
 SENSITIVE_KEY_PARTS = ("password", "passwd", "secret", "token", "username", "credential", "auth")

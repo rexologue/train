@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
-from config import sha256_text, stable_hash, stable_json_dumps
 from preprocessing.masking import AssistantSpan, CanonicalRow, RenderedSample
+from utils.hashing import sha256_text, stable_hash, stable_json_dumps
 
 
 FORBIDDEN_RAW_MARKERS = (
@@ -49,6 +48,14 @@ def tools_hash(tools: list[dict[str, Any]] | None) -> str | None:
     return None if tools is None else stable_hash(tools)
 
 
+def apply_system_message_policy(messages: list[dict[str, Any]], *, use_system: bool = True) -> list[dict[str, Any]]:
+    """Drop system messages when configured by rendering policy."""
+
+    if use_system:
+        return messages
+    return [message for message in messages if message.get("role") != "system"]
+
+
 def _message_completion_text(message: dict[str, Any]) -> str:
     """Fallback renderer body for tests that do not instantiate a real tokenizer."""
 
@@ -74,13 +81,14 @@ class QwenTemplateRenderer:
     def render_sft(self, row: CanonicalRow) -> RenderedSample:
         """Render an SFT/tool row and return assistant spans when available."""
 
-        reject_forbidden_raw_markers(row.messages, self.config.get("reject_raw_special_markers", True))
+        messages = apply_system_message_policy(row.messages, use_system=self.config.get("use_system", True))
+        reject_forbidden_raw_markers(messages, self.config.get("reject_raw_special_markers", True))
 
         if self.tokenizer is not None and hasattr(self.tokenizer, "apply_chat_template"):
-            rendered, metadata = self._render_with_tokenizer(row.messages, row.tools)
+            rendered, metadata = self._render_with_tokenizer(messages, row.tools)
             spans: list[AssistantSpan] = []
         else:
-            rendered, spans = self._fallback_render(row.messages)
+            rendered, spans = self._fallback_render(messages)
             metadata = {"renderer": "fallback", "unsupported_apply_chat_template_kwargs": []}
 
         metadata.update(
@@ -99,7 +107,10 @@ class QwenTemplateRenderer:
     ) -> tuple[RenderedSample, tuple[int, int]]:
         """Render prompt + one completion and return the completion char range."""
 
-        messages = [*prompt, completion]
+        messages = apply_system_message_policy(
+            [*prompt, completion],
+            use_system=self.config.get("use_system", True),
+        )
         reject_forbidden_raw_markers(messages, self.config.get("reject_raw_special_markers", True))
 
         if self.tokenizer is not None and hasattr(self.tokenizer, "apply_chat_template"):
@@ -126,18 +137,21 @@ class QwenTemplateRenderer:
 
         kwargs = dict(self.config.get("apply_chat_template_kwargs") or {})
         base_kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": False}
+
         if tools is not None:
             base_kwargs["tools"] = tools
 
         try:
             rendered = self.tokenizer.apply_chat_template(messages, **base_kwargs, **kwargs)
             unsupported: list[str] = []
+
         except TypeError:
             rendered = self.tokenizer.apply_chat_template(messages, **base_kwargs)
             unsupported = sorted(kwargs)
 
         if not isinstance(rendered, str):
             raise ChatTemplateRenderError("tokenizer.apply_chat_template(..., tokenize=False) must return str")
+
         return rendered, {"renderer": "tokenizer", "unsupported_apply_chat_template_kwargs": unsupported}
 
     @staticmethod
@@ -161,4 +175,5 @@ class QwenTemplateRenderer:
             suffix = "\n<|end|>\n"
             parts.append(suffix)
             cursor += len(suffix)
+
         return "".join(parts), spans

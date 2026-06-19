@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import torch
+
+from losses.dpo import dpo_loss
+from losses.sft import sft_cross_entropy_loss
+from trainer.trainer import RoutedTrainer
+from conftest import example_config
+
+
+class DummySftModel:
+    def __init__(self) -> None:
+        self.seen_kwargs = None
+
+    def __call__(self, **kwargs):
+        self.seen_kwargs = kwargs
+        return SimpleNamespace(loss=torch.tensor(1.25))
+
+
+class TinyLogitModel:
+    def __call__(self, *, input_ids, attention_mask=None, **kwargs):
+        del attention_mask, kwargs
+        logits = torch.zeros((*input_ids.shape, 16), dtype=torch.float32, device=input_ids.device)
+        logits[..., 5] = 3.0
+        logits[..., 6] = 1.0
+        return SimpleNamespace(logits=logits)
+
+
+class DummyAccelerator:
+    device = torch.device("cpu")
+
+    def unwrap_model(self, model):
+        return model
+
+
+def test_sft_loss_passes_only_model_inputs() -> None:
+    model = DummySftModel()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+        "labels": torch.tensor([[-100, 2, 3]]),
+        "loss_kind": "sft_target",
+        "sample_id": ["sample_0"],
+    }
+
+    loss = sft_cross_entropy_loss(model, batch)
+
+    assert loss.item() == 1.25
+    assert model.seen_kwargs == {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "labels": batch["labels"],
+    }
+
+
+def test_dpo_loss_uses_cached_reference_logprobs() -> None:
+    model = TinyLogitModel()
+    batch = {
+        "loss_kind": "dpo_target",
+        "chosen_input_ids": torch.tensor([[1, 5]]),
+        "chosen_attention_mask": torch.tensor([[1, 1]]),
+        "chosen_labels": torch.tensor([[-100, 5]]),
+        "rejected_input_ids": torch.tensor([[1, 6]]),
+        "rejected_attention_mask": torch.tensor([[1, 1]]),
+        "rejected_labels": torch.tensor([[-100, 6]]),
+        "chosen_ref_logp": torch.tensor([-1.0]),
+        "rejected_ref_logp": torch.tensor([-1.0]),
+    }
+
+    result = dpo_loss(
+        model,
+        batch,
+        beta=0.1,
+        ignore_index=-100,
+        accelerator=DummyAccelerator(),
+        cache_required=True,
+    )
+
+    assert torch.isfinite(result.loss)
+    assert result.metrics["dpo/policy_chosen_logp"] > result.metrics["dpo/policy_rejected_logp"]
+    assert result.metrics["dpo/accuracy"] == 1.0
+
+
+def test_routed_trainer_dispatches_dpo_and_records_route_metrics() -> None:
+    trainer = RoutedTrainer(config=example_config(), accelerator=DummyAccelerator(), cadence=None)
+    batch = {
+        "loss_kind": "dpo_target",
+        "chosen_input_ids": torch.tensor([[1, 5]]),
+        "chosen_attention_mask": torch.tensor([[1, 1]]),
+        "chosen_labels": torch.tensor([[-100, 5]]),
+        "rejected_input_ids": torch.tensor([[1, 6]]),
+        "rejected_attention_mask": torch.tensor([[1, 1]]),
+        "rejected_labels": torch.tensor([[-100, 6]]),
+        "chosen_ref_logp": torch.tensor([-1.0]),
+        "rejected_ref_logp": torch.tensor([-1.0]),
+    }
+
+    loss = trainer.compute_loss(TinyLogitModel(), batch)
+
+    assert torch.isfinite(loss)
+    assert "dpo/reward_margin" in trainer.last_loss_metrics

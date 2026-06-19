@@ -25,6 +25,7 @@ class RoutedBatchSampler:
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+
         self.loss_kinds = list(loss_kinds)
         self.batch_size = batch_size
         self.seed = seed
@@ -34,8 +35,10 @@ class RoutedBatchSampler:
         groups: dict[str, list[int]] = defaultdict(list)
         for index, loss_kind in enumerate(self.loss_kinds):
             groups[loss_kind].append(index)
+
         self.groups = dict(groups)
         self.batches = self._build_batches()
+
 
     def _build_batches(self) -> list[list[int]]:
         """Create route-local batches before deterministic cross-route shuffle."""
@@ -52,12 +55,15 @@ class RoutedBatchSampler:
             rng.shuffle(batches)
         return batches
 
+
     def __iter__(self) -> Iterator[list[int]]:
         for batch in self.batches:
             yield list(batch)
 
+
     def __len__(self) -> int:
         return len(self.batches)
+
 
     def summary(self) -> dict[str, object]:
         """Return lightweight routing stats for logging and audits."""
@@ -65,13 +71,17 @@ class RoutedBatchSampler:
         rows_by_loss_kind = {loss_kind: len(indices) for loss_kind, indices in sorted(self.groups.items())}
         batches_by_loss_kind: dict[str, int] = {loss_kind: 0 for loss_kind in rows_by_loss_kind}
         short_batches = 0
+
         for batch in self.batches:
             if not batch:
                 continue
+
             loss_kind = self.loss_kinds[batch[0]]
             batches_by_loss_kind[loss_kind] = batches_by_loss_kind.get(loss_kind, 0) + 1
+
             if len(batch) < self.batch_size:
                 short_batches += 1
+
         return {
             "rows_by_loss_kind": rows_by_loss_kind,
             "batches_by_loss_kind": batches_by_loss_kind,

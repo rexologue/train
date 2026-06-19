@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from collections import Counter
 import copy
 import json
-import re
-from collections import Counter
 from pathlib import Path
+import re
 from typing import Any
 
-from config import TrainingConfig, effective_model_id, file_sha256, sha256_text, stable_hash
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer
+
+from config import Config
 from preprocessing.io import (
     PretokSplitResult,
     cache_root,
@@ -31,6 +34,7 @@ from preprocessing.masking import (
     tokenize_with_offsets,
 )
 from preprocessing.rendering import QwenTemplateRenderer, reject_forbidden_raw_markers
+from utils.hashing import file_sha256, sha256_text, stable_hash
 from utils.logging import get_logger
 
 
@@ -38,28 +42,24 @@ ASSISTANT_HEADER = "<|im_start|>assistant\n"
 IM_END = "<|im_end|>"
 THINK_BLOCK_RE = re.compile(r"<think>\s*(.*?)\s*</think>\s*", re.IGNORECASE | re.DOTALL)
 UNKNOWN_MODEL_CONTEXT_THRESHOLD = 1_000_000_000
-PREPROCESSING_SCHEMA_VERSION = 2
+PREPROCESSING_SCHEMA_VERSION = 3
 AUDIT_EXAMPLES_PER_LOSS_KIND = 5
 
 
-def load_tokenizer(config: TrainingConfig) -> Any:
+def load_tokenizer(config: Config) -> Any:
     """Instantiate the tokenizer configured for preprocessing."""
 
-    from transformers import AutoTokenizer
-
-    tokenizer_config = config.section("tokenizer")
-    model_config = config.section("model")
     return AutoTokenizer.from_pretrained(
-        effective_model_id(config),
-        use_fast=bool(tokenizer_config.get("use_fast", True)),
-        trust_remote_code=bool(model_config.get("trust_remote_code", True)),
+        config.model.cache_dir,
+        use_fast=config.tokenizer.use_fast,
+        trust_remote_code=config.model.trust_remote_code,
     )
 
 
-def configured_max_seq_len(config: TrainingConfig) -> int:
+def configured_max_seq_len(config: Config) -> int:
     """Return `preprocessing.sequence.max_seq_len` as a positive integer."""
 
-    value = int(config.sequence.get("max_seq_len", 0))
+    value = config.preprocessing.sequence.max_seq_len
     if value <= 0:
         raise ValueError("preprocessing.sequence.max_seq_len must be a positive integer")
     return value
@@ -74,18 +74,21 @@ def tokenizer_model_context(tokenizer: Any) -> int | None:
     """
 
     raw_value = getattr(tokenizer, "model_max_length", None)
+
     if raw_value is None:
         raw_value = getattr(tokenizer, "init_kwargs", {}).get("model_max_length")
+
     try:
         value = int(raw_value)
     except (TypeError, ValueError):
         return None
     if value <= 0 or value >= UNKNOWN_MODEL_CONTEXT_THRESHOLD:
         return None
+
     return value
 
 
-def validate_configured_max_seq_len(config: TrainingConfig, tokenizer: Any) -> int:
+def validate_configured_max_seq_len(config: Config, tokenizer: Any) -> int:
     """Ensure configured sequence length does not exceed tokenizer/model context."""
 
     max_seq_len = configured_max_seq_len(config)
@@ -95,21 +98,21 @@ def validate_configured_max_seq_len(config: TrainingConfig, tokenizer: Any) -> i
     return max_seq_len
 
 
-def build_preprocessing_signature(config: TrainingConfig, tokenizer: Any) -> str:
+def build_preprocessing_signature(config: Config, tokenizer: Any) -> str:
     """Hash the per-split tokenization/masking contract used for cache reuse."""
 
-    tokenizer_config = config.section("tokenizer")
+    preprocessing = config.to_dict()["preprocessing"]
     return stable_hash(
         {
             "schema_version": PREPROCESSING_SCHEMA_VERSION,
-            "sequence": config.sequence,
-            "rendering": config.rendering,
-            "reasoning": config.reasoning,
-            "masking": config.preprocessing["masking"],
+            "sequence": preprocessing["sequence"],
+            "rendering": preprocessing["rendering"],
+            "reasoning": preprocessing["reasoning"],
+            "masking": preprocessing["masking"],
             "tokenizer": {
-                "effective_id": effective_model_id(config),
-                "use_fast": bool(tokenizer_config.get("use_fast", True)),
-                "add_special_tokens": bool(tokenizer_config.get("add_special_tokens", False)),
+                "effective_id": str(config.model.cache_dir),
+                "use_fast": config.tokenizer.use_fast,
+                "add_special_tokens": config.tokenizer.add_special_tokens,
                 "class": tokenizer.__class__.__name__,
                 "chat_template_hash": sha256_text(getattr(tokenizer, "chat_template", "") or ""),
             },
@@ -204,11 +207,22 @@ def normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> tuple[list[
     return normalized, converted
 
 
+def apply_system_message_policy(messages: list[dict[str, Any]], config: Config) -> tuple[list[dict[str, Any]], list[int], int]:
+    """Drop system messages when configured while preserving original indexes."""
+
+    if config.preprocessing.rendering.use_system:
+        return messages, list(range(len(messages))), 0
+    indexed_messages = [(index, message) for index, message in enumerate(messages) if message.get("role") != "system"]
+    filtered = [message for _index, message in indexed_messages]
+    original_indices = [index for index, _message in indexed_messages]
+    return filtered, original_indices, len(messages) - len(filtered)
+
+
 def apply_chat_template(
     tokenizer: Any,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
-    config: TrainingConfig,
+    config: Config,
 ) -> tuple[str, list[str]]:
     """Render messages through tokenizer chat template with configured thinking mode.
 
@@ -220,7 +234,7 @@ def apply_chat_template(
     base_kwargs = {"tokenize": False, "add_generation_prompt": False}
     if tools is not None:
         base_kwargs["tools"] = tools
-    reasoning_kwargs = {"enable_thinking": bool(config.reasoning["enable_thinking"])}
+    reasoning_kwargs = {"enable_thinking": config.preprocessing.reasoning.enable_thinking}
     try:
         rendered = tokenizer.apply_chat_template(messages, **base_kwargs, **reasoning_kwargs)
         unsupported: list[str] = []
@@ -249,8 +263,8 @@ def assistant_blocks(rendered: str) -> list[tuple[int, int, str]]:
         search_from = body_end + len(IM_END)
 
 
-def assistant_loss_segments(body_start: int, body: str, *, include_thinking: bool) -> tuple[list[tuple[int, int]], str, int]:
-    """Return assistant body ranges, optionally excluding `<think>...</think>` blocks."""
+def assistant_supervision_segments(body_start: int, body: str, *, include_thinking: bool) -> tuple[list[tuple[int, int]], str, int]:
+    """Return supervised assistant body ranges, optionally excluding `<think>...</think>` blocks."""
 
     if include_thinking:
         return [(body_start, body_start + len(body))], body, 0
@@ -313,44 +327,50 @@ def message_reply_chars(message: dict[str, Any], rendered_body: str) -> int:
     return len(rendered_body)
 
 
-def select_sft_loss_blocks(
+def select_sft_supervision_ranges(
     row: dict[str, Any],
     messages: list[dict[str, Any]],
     rendered: str,
-    config: TrainingConfig,
+    config: Config,
+    *,
+    original_message_indices: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[int, int]], Counter[str]]:
     """Select rendered assistant text that will become supervised SFT labels.
 
-    `sft_tool` supervises every assistant block. `sft_target` supervises all
-    long assistant blocks and samples short blocks deterministically. The
-    function returns both human-readable selected text for debug and character
-    ranges for token label construction.
+    `sft_tool` supervises every assistant block. `sft_target` supervises long
+    assistant replies and samples short replies deterministically. The return
+    value contains debug selection records plus rendered-text character ranges
+    for token label construction.
     """
 
-    policy = config.masking_policies["sft_tool" if row["loss_kind"] == "sft_tool" else "sft_target"]
+    policy = config.preprocessing.masking.policies.sft_target
     blocks = assistant_blocks(rendered)
-    assistant_indices = [index for index, message in enumerate(messages) if message.get("role") == "assistant"]
+    message_indices = original_message_indices or list(range(len(messages)))
+    assistant_indices = [message_indices[index] for index, message in enumerate(messages) if message.get("role") == "assistant"]
+    assistant_positions = [index for index, message in enumerate(messages) if message.get("role") == "assistant"]
     if len(blocks) != len(assistant_indices):
         raise ValueError(f"assistant block count mismatch: rendered={len(blocks)} messages={len(assistant_indices)}")
 
     sample_id = str(row["payload"].get("sample_id") or row["payload"].get("id") or stable_hash(row["payload"]))
-    seed = int(policy.get("short_response_sampling_seed", 42))
-    min_chars = int(policy["min_guaranteed_assistant_chars"]) if row["loss_kind"] == "sft_target" else 0
-    short_prob = float(policy.get("loss_on_short_assistant_reply_prob", 0.3))
+    seed = policy.short_response_sampling_seed
+    min_chars = policy.min_guaranteed_assistant_chars if row["loss_kind"] == "sft_target" else 0
+    short_prob = policy.loss_on_short_assistant_reply_prob
     selected: list[dict[str, Any]] = []
     supervised_ranges: list[tuple[int, int]] = []
     stats: Counter[str] = Counter()
-    include_thinking = bool(config.reasoning["enable_thinking"])
+    include_thinking = config.preprocessing.reasoning.enable_thinking
 
-    for assistant_order, (message_index, (start, end, body)) in enumerate(zip(assistant_indices, blocks)):
-        ranges, text, removed = assistant_loss_segments(start, body, include_thinking=include_thinking)
+    for assistant_order, (message_position, message_index, (start, end, body)) in enumerate(
+        zip(assistant_positions, assistant_indices, blocks)
+    ):
+        ranges, text, removed = assistant_supervision_segments(start, body, include_thinking=include_thinking)
         stats["removed_think_blocks_from_loss"] += removed
         if row["loss_kind"] == "sft_tool":
             keep = True
             reason = "all_assistant"
-            chars = message_reply_chars(messages[message_index], body)
+            chars = message_reply_chars(messages[message_position], body)
         else:
-            chars = message_reply_chars(messages[message_index], body)
+            chars = message_reply_chars(messages[message_position], body)
             stats["sft_target_candidates"] += 1
             if chars > min_chars:
                 keep = True
@@ -378,8 +398,8 @@ def select_sft_loss_blocks(
     return selected, supervised_ranges, stats
 
 
-def _preprocess_sft_dataset_row(row: dict[str, Any], tokenizer: Any, config: TrainingConfig) -> tuple[dict[str, Any], dict[str, Any], Counter[str]]:
-    """Render, tokenize, and label one raw SFT/tool dataset row.
+def _preprocess_raw_sft_row(row: dict[str, Any], tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any], Counter[str]]:
+    """Render, tokenize, and label one decoded parquet SFT/tool row.
 
     This is the main per-row route for `sft_target` and `sft_tool` in the real
     training-data pipeline. It keeps the raw parquet payload immutable,
@@ -393,27 +413,35 @@ def _preprocess_sft_dataset_row(row: dict[str, Any], tokenizer: Any, config: Tra
     if not isinstance(messages, list):
         raise ValueError("SFT row must contain messages list")
     messages, converted_arguments = normalize_tool_call_arguments(messages)
+    messages, original_message_indices, removed_system_messages = apply_system_message_policy(messages, config)
     tools = row["payload"].get("tools")
     if tools is not None and not isinstance(tools, list):
         raise ValueError("tools must be a list when present")
-    reject_forbidden_raw_markers(messages, bool(config.rendering.get("reject_raw_special_markers", True)))
+    reject_forbidden_raw_markers(messages, config.preprocessing.rendering.reject_raw_special_markers)
     rendered, unsupported_kwargs = apply_chat_template(tokenizer, messages, tools, config)
-    selected, supervised_ranges, stats = select_sft_loss_blocks(row, messages, rendered, config)
+    selected, supervised_ranges, stats = select_sft_supervision_ranges(
+        row,
+        messages,
+        rendered,
+        config,
+        original_message_indices=original_message_indices,
+    )
     stats["converted_tool_argument_strings"] += converted_arguments
+    stats["removed_system_messages"] += removed_system_messages
     for key in unsupported_kwargs:
         stats[f"unsupported_apply_chat_template_kwargs/{key}"] += 1
 
     encoded = tokenize_with_offsets(
         tokenizer,
         rendered,
-        add_special_tokens=bool(config.section("tokenizer").get("add_special_tokens", False)),
+        add_special_tokens=config.tokenizer.add_special_tokens,
     )
     labels, supervised_tokens = build_labels(
         encoded["input_ids"],
         encoded["offset_mapping"],
         supervised_ranges,
         config.ignore_index,
-        require_positive=bool(config.preprocessing["masking"].get("require_positive_supervised_tokens", True)),
+        require_positive=config.preprocessing.masking.require_positive_supervised_tokens,
     )
     loss_only_text, loss_only_token_spans = decode_labeled_token_spans(tokenizer, encoded["input_ids"], labels, config.ignore_index)
     sample_id = str(row["payload"].get("sample_id") or row["payload"].get("id") or stable_hash(row["payload"]))
@@ -438,25 +466,26 @@ def _preprocess_sft_dataset_row(row: dict[str, Any], tokenizer: Any, config: Tra
         "loss_only_token_spans": loss_only_token_spans,
         "target_selection": [{key: value for key, value in item.items() if key != "text"} for item in selected],
         "supervised_char_ranges": supervised_ranges,
-        "enable_thinking": bool(config.reasoning["enable_thinking"]),
+        "removed_system_messages": removed_system_messages,
+        "enable_thinking": config.preprocessing.reasoning.enable_thinking,
         "unsupported_apply_chat_template_kwargs": unsupported_kwargs,
     }
     return processed, debug, stats
 
 
-def last_assistant_loss_ranges(rendered: str, *, include_thinking: bool) -> tuple[list[tuple[int, int]], str, int]:
-    """Return supervised ranges/text for the last assistant block in a DPO render."""
+def last_assistant_supervision_ranges(rendered: str, *, include_thinking: bool) -> tuple[list[tuple[int, int]], int]:
+    """Return supervised ranges for the last assistant block in a DPO render."""
 
     blocks = assistant_blocks(rendered)
     if not blocks:
         raise ValueError("rendered DPO completion has no assistant block")
     start, end, body = blocks[-1]
-    ranges, text, removed = assistant_loss_segments(start, body, include_thinking=include_thinking)
-    return [*ranges, (end, end + len(IM_END))], text + IM_END, removed
+    ranges, _text, removed = assistant_supervision_segments(start, body, include_thinking=include_thinking)
+    return [*ranges, (end, end + len(IM_END))], removed
 
 
-def _preprocess_dpo_dataset_row(row: dict[str, Any], tokenizer: Any, config: TrainingConfig) -> tuple[dict[str, Any], dict[str, Any], Counter[str]]:
-    """Render and tokenize one DPO row as two prompt+completion branches.
+def _preprocess_raw_dpo_row(row: dict[str, Any], tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any], Counter[str]]:
+    """Render and tokenize one decoded parquet DPO row as two branches.
 
     DPO samples are intentionally not converted into an SFT-like single row.
     The prompt is rendered with `chosen` and with `rejected` separately so both
@@ -485,21 +514,23 @@ def _preprocess_dpo_dataset_row(row: dict[str, Any], tokenizer: Any, config: Tra
         "target_selection": [],
     }
     stats: Counter[str] = Counter()
-    include_thinking = bool(config.reasoning["enable_thinking"])
+    include_thinking = config.preprocessing.reasoning.enable_thinking
     for side, completion in [("chosen", chosen), ("rejected", rejected)]:
         messages = [*copy.deepcopy(prompt), copy.deepcopy(completion)]
         messages, converted = normalize_tool_call_arguments(messages)
-        reject_forbidden_raw_markers(messages, bool(config.rendering.get("reject_raw_special_markers", True)))
+        messages, _original_message_indices, removed_system_messages = apply_system_message_policy(messages, config)
+        reject_forbidden_raw_markers(messages, config.preprocessing.rendering.reject_raw_special_markers)
         rendered, unsupported_kwargs = apply_chat_template(tokenizer, messages, None, config)
-        ranges, loss_text, removed = last_assistant_loss_ranges(rendered, include_thinking=include_thinking)
+        ranges, removed = last_assistant_supervision_ranges(rendered, include_thinking=include_thinking)
         stats["converted_tool_argument_strings"] += converted
+        stats["removed_system_messages"] += removed_system_messages
         stats["removed_think_blocks_from_loss"] += removed
         for key in unsupported_kwargs:
             stats[f"unsupported_apply_chat_template_kwargs/{key}"] += 1
         encoded = tokenize_with_offsets(
             tokenizer,
             rendered,
-            add_special_tokens=bool(config.section("tokenizer").get("add_special_tokens", False)),
+            add_special_tokens=config.tokenizer.add_special_tokens,
         )
         labels, supervised_tokens = build_labels(encoded["input_ids"], encoded["offset_mapping"], ranges, config.ignore_index)
         loss_only_text_from_labels, loss_only_token_spans = decode_labeled_token_spans(
@@ -517,6 +548,7 @@ def _preprocess_dpo_dataset_row(row: dict[str, Any], tokenizer: Any, config: Tra
         debug[f"{side}_rendered_text"] = rendered
         debug[f"{side}_loss_only_text"] = loss_only_text_from_labels
         debug[f"{side}_loss_only_token_spans"] = loss_only_token_spans
+        debug.setdefault("removed_system_messages", {})[side] = removed_system_messages
         debug["enable_thinking"] = include_thinking
         debug.setdefault("unsupported_apply_chat_template_kwargs", {})[side] = unsupported_kwargs
         debug["target_selection"].append({"side": side, "reason": f"dpo_{side}"})
@@ -527,19 +559,16 @@ def preprocess_split(
     split: str,
     raw_path: Path,
     tokenizer: Any,
-    config: TrainingConfig,
+    config: Config,
     *,
     preprocessing_signature: str | None = None,
 ) -> PretokSplitResult:
     """Prepare or reuse one pretokenized split cache.
 
     The split path is resolved by the caller. This function owns cache
-    validation, dataframe read, row
-    processing with a progress bar, flat parquet/debug/manifest writes, and
-    rejected-row accounting.
+    validation, dataframe read, row processing with a progress bar,
+    flat parquet/debug/manifest writes, and rejected-row accounting.
     """
-
-    from tqdm.auto import tqdm
 
     logger = get_logger(__name__)
     output_dir = cache_root(config)
@@ -549,17 +578,18 @@ def preprocess_split(
 
     raw_hash = file_sha256(raw_path)
     max_seq_len = configured_max_seq_len(config)
-    valid, manifest = split_cache_is_valid(output_dir, split, raw_hash, preprocessing_signature)
-    if valid and manifest is not None:
+    cache_valid, cache_manifest = split_cache_is_valid(output_dir, split, raw_hash, preprocessing_signature)
+
+    if cache_valid and cache_manifest is not None:
         logger.info("reusing pretokenized %s split from %s", split, pretok_path)
-        row_counts = (manifest.get("rows") or {}).get(split) or {}
-        legacy_split = (manifest.get("splits") or {}).get(split)
+        row_counts = (cache_manifest.get("rows") or {}).get(split) or {}
+        legacy_split = (cache_manifest.get("splits") or {}).get(split)
         legacy_split = legacy_split if isinstance(legacy_split, dict) else {}
         split_manifest = {
             "split": split,
             "raw_path": str(raw_path),
             "input_sha256": raw_hash,
-            "pretok_sha256": (manifest.get("pretokenized") or {}).get(split) or legacy_split.get("pretok_sha256"),
+            "pretok_sha256": (cache_manifest.get("pretokenized") or {}).get(split) or legacy_split.get("pretok_sha256"),
             "num_raw_rows": row_counts.get("raw", legacy_split.get("num_raw_rows")),
             "num_rows": row_counts.get("processed", legacy_split.get("num_rows")),
             "num_rejected_rows": row_counts.get("rejected", legacy_split.get("num_rejected_rows")),
@@ -581,9 +611,9 @@ def preprocess_split(
         stats[f"raw_loss_kind/{row['loss_kind']}"] += 1
         try:
             if row["loss_kind"] == "dpo_target":
-                processed, debug, row_stats = _preprocess_dpo_dataset_row(row, tokenizer, config)
+                processed, debug, row_stats = _preprocess_raw_dpo_row(row, tokenizer, config)
             else:
-                processed, debug, row_stats = _preprocess_sft_dataset_row(row, tokenizer, config)
+                processed, debug, row_stats = _preprocess_raw_sft_row(row, tokenizer, config)
             enforce_max_seq_len(processed, max_seq_len)
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
@@ -631,7 +661,7 @@ def preprocess_split(
 
 
 def prepare_pretokenized_splits(
-    config: TrainingConfig,
+    config: Config,
     splits: list[str],
 ) -> list[PretokSplitResult]:
     """Build or reuse the tokenized training-data cache.
@@ -643,7 +673,7 @@ def prepare_pretokenized_splits(
     """
 
     logger = get_logger(__name__)
-    logger.info("loading tokenizer from model directory: %s", effective_model_id(config))
+    logger.info("loading tokenizer from model directory: %s", config.model.cache_dir)
     tokenizer = load_tokenizer(config)
     max_seq_len = validate_configured_max_seq_len(config, tokenizer)
     model_context = tokenizer_model_context(tokenizer)
@@ -671,32 +701,40 @@ def prepare_pretokenized_splits(
     return results
 
 
-def preprocess_sft_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokenizer: Any, config: TrainingConfig) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Compatibility helper for tests using `QwenTemplateRenderer` directly."""
+def preprocess_sft_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Test helper for direct `QwenTemplateRenderer` preprocessing."""
 
     rendered = renderer.render_sft(row)
-    policies = config.masking_policies
     if row.loss_kind == "sft_tool":
-        target_spans, selection_summary = select_sft_tool_spans(row, rendered.assistant_spans, policies["sft_tool"])
+        target_spans, selection_summary = select_sft_tool_spans(row, rendered.assistant_spans, {})
     else:
-        target_spans, selection_summary = select_sft_target_spans(row, rendered.assistant_spans, policies["sft_target"])
+        sft_target_policy = config.preprocessing.masking.policies.sft_target
+        target_spans, selection_summary = select_sft_target_spans(
+            row,
+            rendered.assistant_spans,
+            {
+                "min_guaranteed_assistant_chars": sft_target_policy.min_guaranteed_assistant_chars,
+                "loss_on_short_assistant_reply_prob": sft_target_policy.loss_on_short_assistant_reply_prob,
+                "short_response_sampling_seed": sft_target_policy.short_response_sampling_seed,
+            },
+        )
 
     supervised_ranges = apply_thinking_policy_to_ranges(
         rendered.rendered_text,
         [(span.start, span.end) for span in target_spans],
-        include_thinking=bool(config.reasoning["enable_thinking"]),
+        include_thinking=config.preprocessing.reasoning.enable_thinking,
     )
     encoded = tokenize_with_offsets(
         tokenizer,
         rendered.rendered_text,
-        add_special_tokens=bool(config.section("tokenizer").get("add_special_tokens", False)),
+        add_special_tokens=config.tokenizer.add_special_tokens,
     )
     labels, supervised_tokens = build_labels(
         encoded["input_ids"],
         encoded["offset_mapping"],
         supervised_ranges,
         ignore_index=config.ignore_index,
-        require_positive=bool(config.preprocessing["masking"].get("require_positive_supervised_tokens", True)),
+        require_positive=config.preprocessing.masking.require_positive_supervised_tokens,
     )
     loss_only_text, loss_only_token_spans = decode_labeled_token_spans(tokenizer, encoded["input_ids"], labels, config.ignore_index)
 
@@ -727,13 +765,13 @@ def preprocess_sft_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokeni
         "loss_only_token_spans": loss_only_token_spans,
         "supervised_char_ranges": supervised_ranges,
         "target_selection": selection_summary.__dict__,
-        "enable_thinking": bool(config.reasoning["enable_thinking"]),
+        "enable_thinking": config.preprocessing.reasoning.enable_thinking,
     }
     return processed, audit
 
 
-def preprocess_dpo_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokenizer: Any, config: TrainingConfig) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Compatibility helper for DPO mask tests with direct renderer usage."""
+def preprocess_dpo_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Test helper for DPO mask preprocessing with direct renderer usage."""
 
     if row.prompt is None or row.chosen is None or row.rejected is None:
         raise ValueError("dpo_target row requires prompt, chosen, rejected")
@@ -741,19 +779,19 @@ def preprocess_dpo_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokeni
     chosen_rendered, chosen_range = renderer.render_dpo_completion(row.prompt, row.chosen)
     rejected_rendered, rejected_range = renderer.render_dpo_completion(row.prompt, row.rejected)
 
-    add_special = bool(config.section("tokenizer").get("add_special_tokens", False))
+    add_special = config.tokenizer.add_special_tokens
     chosen_encoded = tokenize_with_offsets(tokenizer, chosen_rendered.rendered_text, add_special_tokens=add_special)
     rejected_encoded = tokenize_with_offsets(tokenizer, rejected_rendered.rendered_text, add_special_tokens=add_special)
 
     chosen_ranges = apply_thinking_policy_to_ranges(
         chosen_rendered.rendered_text,
         [chosen_range],
-        include_thinking=bool(config.reasoning["enable_thinking"]),
+        include_thinking=config.preprocessing.reasoning.enable_thinking,
     )
     rejected_ranges = apply_thinking_policy_to_ranges(
         rejected_rendered.rendered_text,
         [rejected_range],
-        include_thinking=bool(config.reasoning["enable_thinking"]),
+        include_thinking=config.preprocessing.reasoning.enable_thinking,
     )
 
     chosen_labels, chosen_tokens = build_labels(chosen_encoded["input_ids"], chosen_encoded["offset_mapping"], chosen_ranges, config.ignore_index)
@@ -812,14 +850,14 @@ def preprocess_raw_rows(
     split: str,
     renderer: QwenTemplateRenderer,
     tokenizer: Any,
-    config: TrainingConfig,
+    config: Config,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Compatibility batch helper used by older preprocessing tests.
+    """Batch helper used by preprocessing tests.
 
     The production path reads parquet via `preprocess_split`. This helper keeps
-    old unit tests focused on canonical rows and fallback renderers while still
-    exercising the same target selection and token masking
-    invariants. Rejected rows are reported in audit/manifest data and never
+    tests focused on canonical rows and fallback renderers while still
+    exercising the same target selection and token masking invariants.
+    Rejected rows are reported in audit/manifest data and never
     included in the processed training rows.
     """
 
