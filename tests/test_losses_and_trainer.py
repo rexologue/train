@@ -17,7 +17,11 @@ class DummySftModel:
 
     def __call__(self, **kwargs):
         self.seen_kwargs = kwargs
-        return SimpleNamespace(loss=torch.tensor(1.25))
+        input_ids = kwargs["input_ids"]
+        logits = torch.zeros((*input_ids.shape, 8), dtype=torch.float32)
+        logits[:, 0, 2] = 4.0
+        logits[:, 1, 3] = 4.0
+        return SimpleNamespace(logits=logits)
 
 
 class TinyLogitModel:
@@ -36,7 +40,7 @@ class DummyAccelerator:
         return model
 
 
-def test_sft_loss_passes_only_model_inputs() -> None:
+def test_sft_loss_computes_masked_ce_without_model_labels() -> None:
     model = DummySftModel()
     batch = {
         "input_ids": torch.tensor([[1, 2, 3]]),
@@ -48,11 +52,10 @@ def test_sft_loss_passes_only_model_inputs() -> None:
 
     loss = sft_cross_entropy_loss(model, batch)
 
-    assert loss.item() == 1.25
+    assert loss.item() < 0.2
     assert model.seen_kwargs == {
         "input_ids": batch["input_ids"],
         "attention_mask": batch["attention_mask"],
-        "labels": batch["labels"],
     }
 
 

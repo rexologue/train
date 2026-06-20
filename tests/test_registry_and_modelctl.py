@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from registry.modelctl_client import ModelctlClient, ModelctlCommandFailure, ModelctlRegisterRequest
+from registry.modelctl_client import (
+    ModelctlClient,
+    ModelctlCommandFailure,
+    ModelctlRegisterRequest,
+    parse_modelctl_json_stdout,
+)
 from registry.package import build_candidate_registration_request
 from registry.selection import CandidateWindowSelector, CheckpointCandidate, RegistrationDecision
 from registry.tags import validate_training_aliases
@@ -129,3 +134,17 @@ def test_modelctl_client_parses_json_and_surfaces_failures(monkeypatch) -> None:
 
     with pytest.raises(ModelctlCommandFailure, match="boom"):
         ModelctlClient().info("models:/source@missing")
+
+
+def test_modelctl_client_parses_trailing_json_after_progress_logs() -> None:
+    stdout = "\n".join(
+        [
+            "[modelctl] hashing payload directory: checkpoint/adapter",
+            "[modelctl] registered model version: name=dialog-model, version=7",
+            '{"name": "dialog-model", "version": "7", "aliases": ["candidate-latest"]}',
+        ]
+    )
+
+    payload = parse_modelctl_json_stdout(stdout, ["modelctl", "register"])
+
+    assert payload == {"name": "dialog-model", "version": "7", "aliases": ["candidate-latest"]}

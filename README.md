@@ -81,6 +81,11 @@ accelerate launch --use_fsdp --num_processes <GPU_COUNT> \
 routed dataloaders, DPO ref-logprob cache, training, validation,
 checkpointing и candidate registration.
 
+FSDP runtime использует YAML policy из `distributed.fsdp`. Если input
+embeddings и `lm_head` tied и frozen, training автоматически исключает эти
+модули из FSDP flatten и переносит их на accelerator device. Это runtime guard
+для tied shared parameters, не отдельное YAML-поле.
+
 ## Model Registry
 
 Source model задается alias-ссылкой:
@@ -255,6 +260,10 @@ Checkpoints сохраняются атомарно:
 ├── manifest.json
 └── checksums.json
 ```
+
+`adapter/` сохраняет только trainable PEFT adapter parameters. Full base model
+state dict не материализуется в checkpoint package; base lineage и source hash
+восстанавливаются через registry source metadata.
 
 Auto-resume ищет последний валидный `step-NNNNNN` в derived checkpoint
 directory. Strict resume сравнивает effective config, dataset manifest,

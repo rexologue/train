@@ -578,7 +578,7 @@ class FsdpConfig:
 
         return cls(
             sharding_strategy=_require_non_empty_str(data.get("sharding_strategy"), "distributed.fsdp.sharding_strategy"),
-            mixed_precision=_require_non_empty_str(data.get("mixed_precision"), "distributed.fsdp.mixed_precision"),
+            mixed_precision=_fsdp_mixed_precision(data.get("mixed_precision")),
             cpu_offload=_require_bool(data.get("cpu_offload"), "distributed.fsdp.cpu_offload"),
             activation_checkpointing=_require_bool(
                 data.get("activation_checkpointing"),
@@ -1070,6 +1070,17 @@ def _require_non_empty_str(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ConfigError(f"{name} must be a non-empty string")
     return value
+
+
+def _fsdp_mixed_precision(value: Any) -> str:
+    parsed = _require_non_empty_str(value, "distributed.fsdp.mixed_precision")
+    allowed = {"bf16", "fp16", "fp32", "fp8"}
+    if parsed not in allowed:
+        raise ConfigError(
+            "distributed.fsdp.mixed_precision must be one of "
+            f"{sorted(allowed)}; use fp32 to disable lower-precision FSDP params"
+        )
+    return parsed
 
 
 def _optional_str(value: Any, name: str) -> str | None:

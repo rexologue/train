@@ -7,6 +7,7 @@ from typing import Any
 from accelerate.checkpointing import save_accelerator_state
 from accelerate.utils import DistributedType
 from accelerate.utils.fsdp_utils import save_fsdp_optimizer
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from checkpointing.atomic import atomic_checkpoint_dir, commit_atomic_checkpoint_dir, reset_tmp_checkpoint_dir
 from checkpointing.checksums import directory_checksums
@@ -40,11 +41,12 @@ def save_adapter_checkpoint(
     adapter_dir = tmp_dir / "adapter"
     if not hasattr(unwrapped_model, "save_pretrained"):
         raise TypeError("adapter checkpointing requires model.save_pretrained")
+    adapter_state_dict = adapter_state_dict_for_save(model, unwrapped_model, accelerator)
     unwrapped_model.save_pretrained(
         adapter_dir,
         is_main_process=is_main_process,
         save_function=accelerator.save,
-        state_dict=accelerator.get_state_dict(model),
+        state_dict=adapter_state_dict,
     )
 
     accelerator.wait_for_everyone()
@@ -83,6 +85,35 @@ def save_adapter_checkpoint(
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def adapter_state_dict_for_save(model: Any, unwrapped_model: Any, accelerator: Any) -> dict[str, Any]:
+    """Collect only adapter parameters without asking FSDP for a full base state dict."""
+
+    if getattr(accelerator, "distributed_type", None) == DistributedType.FSDP:
+        offload_to_cpu = int(getattr(accelerator, "num_processes", 1)) > 1
+        with FSDP.summon_full_params(
+            model,
+            recurse=True,
+            writeback=False,
+            rank0_only=True,
+            offload_to_cpu=offload_to_cpu,
+        ):
+            if not bool(accelerator.is_main_process):
+                return {}
+            return trainable_state_dict(unwrapped_model)
+    return trainable_state_dict(unwrapped_model)
+
+
+def trainable_state_dict(model: Any) -> dict[str, Any]:
+    """Return a CPU clone of parameters that PEFT should persist for the adapter."""
+
+    state: dict[str, Any] = {}
+    for name, parameter in model.named_parameters():
+        if not bool(getattr(parameter, "requires_grad", False)):
+            continue
+        state[name] = parameter.detach().cpu().clone()
+    return state
 
 
 def save_training_state_without_model(*, accelerator: Any, model: Any, optimizer: Any, output_dir: str | Path) -> None:

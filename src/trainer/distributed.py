@@ -69,9 +69,57 @@ def validate_training_runtime(accelerator: Any) -> None:
 def prepare_with_accelerator(runtime: DistributedRuntime, *objects: Any) -> tuple[Any, ...]:
     """Prepare model/optimizer/dataloaders/scheduler through Accelerator."""
 
+    ignored_modules = configure_ignored_tied_embeddings(runtime.fsdp_plugin, objects)
+    for module in ignored_modules:
+        if hasattr(module, "to"):
+            module.to(runtime.accelerator.device)
     prepared = runtime.accelerator.prepare(*objects)
     
     if not isinstance(prepared, tuple):
         return (prepared,)
 
     return prepared
+
+
+def configure_ignored_tied_embeddings(fsdp_plugin: Any, objects: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Keep frozen tied embeddings out of FSDP FlatParameter shared-param handling."""
+
+    if not hasattr(fsdp_plugin, "ignored_modules") or getattr(fsdp_plugin, "ignored_modules", None):
+        return ()
+
+    for obj in objects:
+        ignored = tied_frozen_embedding_modules(obj)
+        if ignored:
+            fsdp_plugin.ignored_modules = ignored
+            return ignored
+    return ()
+
+
+def tied_frozen_embedding_modules(model: Any) -> tuple[Any, ...]:
+    """Return tied input/output embedding modules that are frozen and safe to replicate."""
+
+    get_input = getattr(model, "get_input_embeddings", None)
+    get_output = getattr(model, "get_output_embeddings", None)
+    if not callable(get_input) or not callable(get_output):
+        return ()
+
+    input_module = get_input()
+    output_module = get_output()
+    if input_module is None or output_module is None:
+        return ()
+
+    input_weight = getattr(input_module, "weight", None)
+    output_weight = getattr(output_module, "weight", None)
+    if input_weight is None or input_weight is not output_weight:
+        return ()
+    if bool(getattr(input_weight, "requires_grad", True)):
+        return ()
+
+    modules = []
+    seen: set[int] = set()
+    for module in (input_module, output_module):
+        marker = id(module)
+        if marker not in seen:
+            seen.add(marker)
+            modules.append(module)
+    return tuple(modules)

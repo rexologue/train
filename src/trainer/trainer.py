@@ -93,7 +93,8 @@ class RoutedTrainer:
         self.last_loss_metrics = {}
         loss_kind = batch.get("loss_kind")
         if loss_kind in {"sft_target", "sft_tool"}:
-            return sft_cross_entropy_loss(model, batch)
+            ignore_index = int(getattr(self.config, "ignore_index", -100)) if self.config is not None else -100
+            return sft_cross_entropy_loss(model, batch, ignore_index=ignore_index)
         if loss_kind == "dpo_target":
             if self.config is None:
                 raise ValueError("DPO loss requires trainer config")

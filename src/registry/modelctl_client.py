@@ -219,10 +219,7 @@ class ModelctlClient:
         stdout = completed.stdout.strip()
         if not stdout:
             return {}
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"modelctl returned non-JSON stdout for {' '.join(command)}") from exc
+        payload = parse_modelctl_json_stdout(stdout, command)
         if not isinstance(payload, dict):
             raise ValueError(f"modelctl returned non-object JSON for {' '.join(command)}")
         return payload
@@ -255,3 +252,29 @@ def string_or_none(value: Any) -> str | None:
     if value in (None, ""):
         return None
     return str(value)
+
+
+def parse_modelctl_json_stdout(stdout: str, command: list[str]) -> Any:
+    """Parse modelctl JSON even when the CLI emits progress logs before it."""
+
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    parsed: Any = None
+    for index, char in enumerate(stdout):
+        if char != "{":
+            continue
+        try:
+            candidate, end = decoder.raw_decode(stdout[index:])
+        except json.JSONDecodeError:
+            continue
+        if stdout[index + end :].strip():
+            continue
+        parsed = candidate
+        break
+    if parsed is None:
+        raise ValueError(f"modelctl returned non-JSON stdout for {' '.join(command)}")
+    return parsed
