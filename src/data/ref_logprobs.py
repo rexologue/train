@@ -11,7 +11,7 @@ from data.dataloaders import DataLoaderBundle, SplitDataLoader
 from utils.hashing import file_sha256, stable_hash
 
 
-REF_LOGPROB_CACHE_SCHEMA_VERSION = 1
+REF_LOGPROB_CACHE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,7 @@ def build_ref_logprob_cache_signature(config: Any, model_source: Any | None) -> 
                 "cache_dir": str(config.model.cache_dir),
             },
             "reference": {
-                "mode": config.loss_routing.dpo.reference.mode,
+                "policy": "base_model_precompute",
                 "ignore_index": config.ignore_index,
             },
         }

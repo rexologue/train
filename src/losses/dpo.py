@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,10 +46,11 @@ def dpo_loss(
     beta: float,
     ignore_index: int,
     accelerator: Any | None = None,
-    reference_mode: str = "disable_adapter",
     cache_required: bool = False,
 ) -> DpoLossResult:
-    """Compute one DPO batch loss with cached or online reference logprobs."""
+    """Compute one DPO batch loss with precomputed reference logprobs."""
+
+    del accelerator, cache_required
 
     policy_chosen_logp = sequence_logps(
         model,
@@ -70,9 +70,6 @@ def dpo_loss(
         model,
         batch,
         ignore_index=ignore_index,
-        accelerator=accelerator,
-        reference_mode=reference_mode,
-        cache_required=cache_required,
     )
 
     policy_logratio = policy_chosen_logp - policy_rejected_logp
@@ -100,44 +97,17 @@ def reference_logps(
     batch: dict[str, Any],
     *,
     ignore_index: int,
-    accelerator: Any | None,
-    reference_mode: str,
-    cache_required: bool,
 ) -> tuple[Any, Any]:
-    """Return reference logprobs from batch cache or by disabling the active adapter."""
+    """Return precomputed reference logprobs attached to the DPO batch."""
 
+    del model, ignore_index
     cached = cached_reference_logps(batch)
-    if cached is not None:
-        return cached
-    if cache_required:
-        raise ValueError("DPO reference logprob cache is required but missing from batch")
-    if reference_mode != "disable_adapter":
-        raise ValueError(f"unsupported DPO reference mode: {reference_mode!r}")
-
-    disable_context = disable_adapter_context(model, accelerator)
-    was_training = bool(getattr(model, "training", False))
-    if hasattr(model, "eval"):
-        model.eval()
-    try:
-        with torch.no_grad(), disable_context:
-            chosen = sequence_logps(
-                model,
-                input_ids=batch["chosen_input_ids"],
-                attention_mask=batch.get("chosen_attention_mask"),
-                labels=batch["chosen_labels"],
-                ignore_index=ignore_index,
-            )
-            rejected = sequence_logps(
-                model,
-                input_ids=batch["rejected_input_ids"],
-                attention_mask=batch.get("rejected_attention_mask"),
-                labels=batch["rejected_labels"],
-                ignore_index=ignore_index,
-            )
-    finally:
-        if was_training and hasattr(model, "train"):
-            model.train()
-    return chosen, rejected
+    if cached is None:
+        raise ValueError(
+            "DPO reference logprobs are missing from batch; run reference precompute with "
+            "loss_routing.dpo.reference.cache_enabled=true before training"
+        )
+    return cached
 
 
 def cached_reference_logps(batch: dict[str, Any]) -> tuple[Any, Any] | None:
@@ -148,16 +118,6 @@ def cached_reference_logps(batch: dict[str, Any]) -> tuple[Any, Any] | None:
     if chosen is None or rejected is None:
         return None
     return chosen, rejected
-
-
-def disable_adapter_context(model: Any, accelerator: Any | None) -> Any:
-    """Return a PEFT disable-adapter context without bypassing wrapped forward calls."""
-
-    unwrapped = accelerator.unwrap_model(model) if accelerator is not None and hasattr(accelerator, "unwrap_model") else model
-    if not hasattr(unwrapped, "disable_adapter"):
-        raise TypeError("DPO reference_mode=disable_adapter requires a PEFT model with disable_adapter()")
-    context = unwrapped.disable_adapter()
-    return context if context is not None else nullcontext()
 
 
 def tensor_mean(value: Any) -> float:

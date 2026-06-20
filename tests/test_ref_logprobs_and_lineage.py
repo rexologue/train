@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 
 import pandas as pd
+import pytest
 
 from data.dataloaders import build_dataloaders
 from data.ref_logprobs import (
@@ -11,6 +12,7 @@ from data.ref_logprobs import (
     ref_logprob_cache_dir,
     write_ref_logprob_split_cache,
 )
+import trainer.ref_logprobs as ref_logprob_pipeline
 from tracking.lineage import collect_tracking_lineage
 from tracking.params import flatten_config_params
 from conftest import example_config, pretok_result
@@ -81,6 +83,79 @@ def test_ref_logprob_cache_is_loaded_and_applied_to_dpo_rows(tmp_path) -> None:
         row = split_loader.dataset.rows[0]
         assert row["chosen_ref_logp"] == -1.25
         assert row["rejected_ref_logp"] == -2.5
+
+
+def test_ref_logprob_pipeline_reuses_complete_cache(tmp_path, monkeypatch) -> None:
+    train_path = tmp_path / "train.parquet"
+    valid_path = tmp_path / "valid.parquet"
+    write_dpo_pretok(train_path)
+    write_dpo_pretok(valid_path)
+    config = example_config(
+        project={"output_dir": str(tmp_path / "run")},
+        training={"per_device_train_batch_size": 1},
+    )
+    bundle = build_dataloaders(
+        config,
+        [pretok_result("train", train_path), pretok_result("valid", valid_path)],
+        pad_token_id=0,
+    )
+    signature = build_ref_logprob_cache_signature(config, model_source=None)
+    cache_dir = ref_logprob_cache_dir(config, signature)
+    for split_loader in bundle.splits.values():
+        write_ref_logprob_split_cache(
+            cache_dir,
+            split_loader,
+            [
+                {
+                    "sample_id": "dpo-0",
+                    "row_index": 7,
+                    "chosen_render_hash": "chosen-hash",
+                    "rejected_render_hash": "rejected-hash",
+                    "chosen_ref_logp": -1.25,
+                    "rejected_ref_logp": -2.5,
+                }
+            ],
+        )
+
+    def fail_compute(**kwargs):
+        del kwargs
+        raise AssertionError("complete reference cache should be reused")
+
+    monkeypatch.setattr(ref_logprob_pipeline, "compute_ref_logprob_cache", fail_compute)
+    state = ref_logprob_pipeline.ensure_ref_logprob_cache(
+        config=config,
+        dataloaders=bundle,
+        accelerator=object(),
+        model_source=None,
+    )
+
+    assert state.complete is True
+    assert state.applied_rows == 2
+
+
+def test_ref_logprob_pipeline_rejects_disabled_cache_with_dpo_rows(tmp_path) -> None:
+    train_path = tmp_path / "train.parquet"
+    valid_path = tmp_path / "valid.parquet"
+    write_dpo_pretok(train_path)
+    write_dpo_pretok(valid_path)
+    config = example_config(
+        project={"output_dir": str(tmp_path / "run")},
+        training={"per_device_train_batch_size": 1},
+        loss_routing={"dpo": {"reference": {"cache_enabled": False}}},
+    )
+    bundle = build_dataloaders(
+        config,
+        [pretok_result("train", train_path), pretok_result("valid", valid_path)],
+        pad_token_id=0,
+    )
+
+    with pytest.raises(ValueError, match="cache_enabled=true"):
+        ref_logprob_pipeline.ensure_ref_logprob_cache(
+            config=config,
+            dataloaders=bundle,
+            accelerator=object(),
+            model_source=None,
+        )
 
 
 def test_collect_tracking_lineage_reads_data_dvc_without_dvc_package(tmp_path) -> None:

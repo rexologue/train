@@ -31,7 +31,7 @@ model:
   trust_remote_code: true
   attn_implementation: flash_attention_2
   experts_implementation: eager
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   freeze_router: true
   freeze_embeddings: true
   freeze_lm_head: true
@@ -98,9 +98,8 @@ loss_routing:
   dpo:
     beta: 0.1
     reference:
-      # The reference policy is the prepared FSDP model with the active
-      # trainable LoRA adapter disabled through PEFT.
-      mode: disable_adapter
+      # The reference policy is the source base model before LoRA is attached.
+      # It is computed as a separate pre-training cache stage after dataloaders.
       # Store reference logprobs in output_dir/ref_logprobs/<signature>.
       cache_enabled: true
       # Force recomputation even when a matching cache exists.

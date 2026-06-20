@@ -168,8 +168,10 @@ Loss считается только на выбранных assistant completio
 - preprocessing рендерит `prompt + chosen` и `prompt + rejected` отдельно;
 - collator паддит chosen/rejected branches независимо;
 - trainer считает DPO loss через `losses.dpo.dpo_loss`;
-- reference policy берется из того же PEFT/FSDP model с отключенным active LoRA adapter;
-- reference logprobs могут кэшироваться в `{project.output_dir}/ref_logprobs/<signature>`.
+- reference policy берется из source base model до подключения LoRA;
+- reference logprobs считаются отдельным pre-training stage после dataloaders и
+  кэшируются в `{project.output_dir}/ref_logprobs/<signature>`;
+- DPO loss использует только precomputed reference logprobs из batch cache.
 
 Relevant YAML:
 
@@ -181,7 +183,6 @@ loss_routing:
   dpo:
     beta: 0.1
     reference:
-      mode: disable_adapter
       cache_enabled: true
       cache_refresh: false
       cache_required: false

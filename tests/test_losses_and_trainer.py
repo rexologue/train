@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from losses.dpo import dpo_loss
@@ -81,6 +82,28 @@ def test_dpo_loss_uses_cached_reference_logprobs() -> None:
     assert torch.isfinite(result.loss)
     assert result.metrics["dpo/policy_chosen_logp"] > result.metrics["dpo/policy_rejected_logp"]
     assert result.metrics["dpo/accuracy"] == 1.0
+
+
+def test_dpo_loss_requires_precomputed_reference_logprobs() -> None:
+    batch = {
+        "loss_kind": "dpo_target",
+        "chosen_input_ids": torch.tensor([[1, 5]]),
+        "chosen_attention_mask": torch.tensor([[1, 1]]),
+        "chosen_labels": torch.tensor([[-100, 5]]),
+        "rejected_input_ids": torch.tensor([[1, 6]]),
+        "rejected_attention_mask": torch.tensor([[1, 1]]),
+        "rejected_labels": torch.tensor([[-100, 6]]),
+    }
+
+    with pytest.raises(ValueError, match="reference logprobs are missing"):
+        dpo_loss(
+            TinyLogitModel(),
+            batch,
+            beta=0.1,
+            ignore_index=-100,
+            accelerator=DummyAccelerator(),
+            cache_required=False,
+        )
 
 
 def test_routed_trainer_dispatches_dpo_and_records_route_metrics() -> None:

@@ -128,6 +128,23 @@ def main() -> None:
             tracker.log_dataloaders(dataloaders)
 
         validate_training_inputs(config, dataloaders)
+        logger.info("ensuring DPO reference-logprob cache")
+        ref_cache_state = ensure_ref_logprob_cache(
+            config=config,
+            dataloaders=dataloaders,
+            accelerator=accelerator,
+            model_source=tracker.model_source_resolution,
+        )
+        if is_main_process:
+            logger.info(
+                "DPO ref-logprob cache: complete=%s applied=%s missing=%s path=%s",
+                ref_cache_state.complete,
+                ref_cache_state.applied_rows,
+                ref_cache_state.missing_rows,
+                ref_cache_state.cache_dir,
+            )
+            tracker.log_ref_logprob_cache(ref_cache_state)
+
         run_training(config, dataloaders, tracker, runtime=runtime)
 
     logger.info("training pipeline complete")
@@ -191,22 +208,6 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
         raise RuntimeError(
             "resolved optimizer-step count changed after Accelerate DataLoader sharding: "
             f"before_prepare={total_steps} after_prepare={prepared_total_steps}"
-        )
-
-    ref_cache_state = ensure_ref_logprob_cache(
-        config=config,
-        dataloaders=dataloaders,
-        model=model,
-        accelerator=accelerator,
-        model_source=tracker.model_source_resolution,
-    )
-    if bool(getattr(accelerator, "is_main_process", True)):
-        logger.info(
-            "DPO ref-logprob cache: complete=%s applied=%s missing=%s path=%s",
-            ref_cache_state.complete,
-            ref_cache_state.applied_rows,
-            ref_cache_state.missing_rows,
-            ref_cache_state.cache_dir,
         )
 
     total_micro_batches = len(train_loader) * config.training.num_epochs

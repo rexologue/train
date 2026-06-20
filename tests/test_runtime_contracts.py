@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
-from config import load_config
+from config import ConfigError, load_config
+from conftest import example_config
 from trainer.modeling import configure_gradient_checkpointing, freeze_configured_modules
 
 
@@ -12,8 +13,23 @@ def test_example_config_loads_with_dpo_route() -> None:
     config = load_config("configs/config.example.yaml")
 
     assert config.loss_routing.routes["dpo_target"].type == "dpo"
-    assert config.loss_routing.dpo.reference.mode == "disable_adapter"
+    assert config.loss_routing.dpo.reference.cache_enabled is True
+    assert config.model.gradient_checkpointing is False
+    assert config.distributed.fsdp.activation_checkpointing is True
     assert config.output_dir.as_posix().endswith("qwen35-a3b-lora-sft-dpo-v1")
+
+
+def test_config_rejects_double_activation_checkpointing() -> None:
+    try:
+        example_config(
+            model={"gradient_checkpointing": True},
+            distributed={"fsdp": {"activation_checkpointing": True}},
+        )
+    except ConfigError as exc:
+        assert "gradient_checkpointing" in str(exc)
+        assert "activation_checkpointing" in str(exc)
+    else:
+        raise AssertionError("expected double activation checkpointing config to fail")
 
 
 class TinyModel(torch.nn.Module):

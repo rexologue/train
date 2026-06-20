@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from data.dataloaders import DataLoaderBundle, SplitDataLoader
 from data.ref_logprobs import (
@@ -17,7 +18,7 @@ from data.ref_logprobs import (
     ref_logprob_cache_dir,
     write_ref_logprob_split_cache,
 )
-from losses.dpo import disable_adapter_context, sequence_logps
+from losses.dpo import sequence_logps
 from utils.logging import get_logger
 
 
@@ -25,40 +26,51 @@ def ensure_ref_logprob_cache(
     *,
     config: Any,
     dataloaders: DataLoaderBundle,
-    model: Any,
     accelerator: Any,
     model_source: Any | None,
 ) -> RefLogprobCacheState:
     """Ensure configured DPO reference-logprob cache exists and is attached."""
 
+    logger = get_logger(__name__)
+    is_main_process = bool(getattr(accelerator, "is_main_process", True))
     reference = config.loss_routing.dpo.reference
-    if not reference.cache_enabled:
-        if reference.cache_required:
-            raise ValueError("DPO reference-logprob cache cannot be required when cache_enabled=false")
+    dpo_rows = dpo_row_count(dataloaders)
+    if dpo_rows == 0:
         signature = build_ref_logprob_cache_signature(config, model_source)
         return RefLogprobCacheState(
             cache_dir=ref_logprob_cache_dir(config, signature),
             signature=signature,
             applied_rows=0,
-            missing_rows=dpo_row_count(dataloaders),
-            complete=dpo_row_count(dataloaders) == 0,
+            missing_rows=0,
+            complete=True,
         )
+
+    if not reference.cache_enabled:
+        raise ValueError("DPO rows require loss_routing.dpo.reference.cache_enabled=true")
 
     state = load_and_apply_ref_logprob_cache(config, dataloaders, model_source=model_source)
     if state.complete and not reference.cache_refresh:
-        return state
-    if dpo_row_count(dataloaders) == 0:
+        if is_main_process:
+            logger.info("DPO ref-logprob cache reused: rows=%s path=%s", state.applied_rows, state.cache_dir)
         return state
 
+    if is_main_process:
+        logger.info(
+            "DPO ref-logprob cache precompute required: complete=%s missing=%s refresh=%s path=%s",
+            state.complete,
+            state.missing_rows,
+            reference.cache_refresh,
+            state.cache_dir,
+        )
     compute_ref_logprob_cache(
         config=config,
         dataloaders=dataloaders,
-        model=model,
         accelerator=accelerator,
         cache_dir=state.cache_dir,
+        total_rows=dpo_rows,
     )
     state = load_and_apply_ref_logprob_cache(config, dataloaders, model_source=model_source)
-    if reference.cache_required and state.missing_rows:
+    if state.missing_rows:
         raise ValueError(f"DPO reference-logprob cache remains incomplete: missing rows={state.missing_rows}")
     return state
 
@@ -67,11 +79,11 @@ def compute_ref_logprob_cache(
     *,
     config: Any,
     dataloaders: DataLoaderBundle,
-    model: Any,
     accelerator: Any,
     cache_dir: Path,
+    total_rows: int,
 ) -> None:
-    """Compute DPO reference logprobs for every DPO row through the FSDP model."""
+    """Compute DPO reference logprobs through a temporary base-model FSDP instance."""
 
     logger = get_logger(__name__)
     is_main_process = bool(getattr(accelerator, "is_main_process", True))
@@ -79,26 +91,48 @@ def compute_ref_logprob_cache(
         reset_cache_dir(cache_dir)
     accelerator.wait_for_everyone()
 
-    for split_loader in dataloaders.splits.values():
-        if not split_has_dpo(split_loader):
-            continue
-        local_path = compute_split_ref_logprobs(
-            config=config,
-            split_loader=split_loader,
-            model=model,
-            accelerator=accelerator,
-            cache_dir=cache_dir,
-        )
-        accelerator.wait_for_everyone()
-        if is_main_process:
-            rows = merge_rank_jsonl(cache_dir, split_loader.split)
-            validate_split_rows(split_loader, rows)
-            write_ref_logprob_split_cache(cache_dir, split_loader, rows)
-            logger.info("DPO ref-logprob cache ready: split=%s rows=%s path=%s", split_loader.split, len(rows), cache_dir)
-        accelerator.wait_for_everyone()
-        if is_main_process:
-            cleanup_rank_file(local_path)
-        accelerator.wait_for_everyone()
+    progress_config = getattr(config, "progress", None)
+    progress = reference_progress(
+        total_rows,
+        enabled=bool(getattr(progress_config, "enabled", True)),
+        main_process=is_main_process,
+    )
+    model = None
+    try:
+        model = build_base_reference_policy(config)
+        model = accelerator.prepare(model)
+        for split_loader in dataloaders.splits.values():
+            if not split_has_dpo(split_loader):
+                continue
+            if is_main_process:
+                logger.info("DPO ref-logprob precompute started: split=%s path=%s", split_loader.split, cache_dir)
+            local_path = compute_split_ref_logprobs(
+                config=config,
+                split_loader=split_loader,
+                model=model,
+                accelerator=accelerator,
+                cache_dir=cache_dir,
+            )
+            accelerator.wait_for_everyone()
+            if is_main_process:
+                rows = merge_rank_jsonl(cache_dir, split_loader.split)
+                validate_split_rows(split_loader, rows)
+                write_ref_logprob_split_cache(cache_dir, split_loader, rows)
+                progress.update(len(rows))
+                logger.info(
+                    "DPO ref-logprob cache ready: split=%s rows=%s path=%s",
+                    split_loader.split,
+                    len(rows),
+                    cache_dir,
+                )
+            accelerator.wait_for_everyone()
+            if is_main_process:
+                cleanup_rank_file(local_path)
+            accelerator.wait_for_everyone()
+    finally:
+        progress.close()
+        if model is not None:
+            release_base_reference_policy(model, accelerator)
 
 
 def compute_split_ref_logprobs(
@@ -125,7 +159,7 @@ def compute_split_ref_logprobs(
         model.eval()
     try:
         with output_path.open("w", encoding="utf-8") as handle:
-            with torch.no_grad(), disable_adapter_context(model, accelerator):
+            with torch.no_grad():
                 for batch in dpo_loader:
                     batch = move_batch_to_device(batch, getattr(accelerator, "device", None))
                     chosen_logps = sequence_logps(
@@ -147,6 +181,50 @@ def compute_split_ref_logprobs(
         if was_training and hasattr(model, "train"):
             model.train()
     return output_path
+
+
+def build_base_reference_policy(config: Any) -> Any:
+    """Load the frozen base model used as the DPO reference policy."""
+
+    from trainer.modeling import (
+        cast_floating_parameters,
+        load_base_model,
+        precision_to_dtype,
+        validate_model_runtime_requirements,
+    )
+
+    validate_model_runtime_requirements(config)
+    model = load_base_model(config)
+    cast_floating_parameters(model, precision_to_dtype(config.model.precision))
+    if hasattr(model, "eval"):
+        model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    return model
+
+
+def release_base_reference_policy(model: Any, accelerator: Any) -> None:
+    """Release the temporary reference model before the train model is built."""
+
+    if hasattr(accelerator, "free_memory"):
+        try:
+            accelerator.free_memory(model)
+        except TypeError:
+            accelerator.free_memory()
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def reference_progress(total_rows: int, *, enabled: bool, main_process: bool) -> Any:
+    """Return a progress bar for the reference precompute stage."""
+
+    return tqdm(
+        total=total_rows,
+        desc="reference",
+        dynamic_ncols=True,
+        disable=not (enabled and main_process),
+    )
 
 
 def build_dpo_dataloader(split_loader: SplitDataLoader, *, process_index: int, num_processes: int) -> DataLoader:

@@ -398,7 +398,6 @@ class LossRouteConfig:
 
 @dataclass(frozen=True)
 class DpoReferenceConfig:
-    mode: Literal["disable_adapter"]
     cache_enabled: bool
     cache_refresh: bool
     cache_required: bool
@@ -408,16 +407,11 @@ class DpoReferenceConfig:
         data = {} if raw is None else _mapping(raw, "loss_routing.dpo.reference")
         _reject_unknown(
             data,
-            {"mode", "cache_enabled", "cache_refresh", "cache_required"},
+            {"cache_enabled", "cache_refresh", "cache_required"},
             "loss_routing.dpo.reference",
         )
 
-        mode = data.get("mode", "disable_adapter")
-        if mode != "disable_adapter":
-            raise ConfigError("loss_routing.dpo.reference.mode must be disable_adapter")
-
         return cls(
-            mode=mode,  # type: ignore[arg-type]
             cache_enabled=_optional_bool(data.get("cache_enabled"), "loss_routing.dpo.reference.cache_enabled", True),
             cache_refresh=_optional_bool(data.get("cache_refresh"), "loss_routing.dpo.reference.cache_refresh", False),
             cache_required=_optional_bool(data.get("cache_required"), "loss_routing.dpo.reference.cache_required", False),
@@ -957,6 +951,11 @@ class Config:
     def _validate_cross_fields(self) -> None:
         if self.model.freeze_lm_head and "lm_head" in self.lora.modules_to_save:
             raise ConfigError("lora.modules_to_save cannot include lm_head when model.freeze_lm_head=true")
+
+        if self.model.gradient_checkpointing and self.distributed.fsdp.activation_checkpointing:
+            raise ConfigError(
+                "model.gradient_checkpointing and distributed.fsdp.activation_checkpointing cannot both be true"
+            )
 
         metric = self.registry.selection.metric
 

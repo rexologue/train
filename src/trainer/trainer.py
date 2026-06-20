@@ -103,7 +103,6 @@ class RoutedTrainer:
                 beta=float(self.config.loss_routing.dpo.beta),
                 ignore_index=int(self.config.ignore_index),
                 accelerator=self.accelerator,
-                reference_mode=self.config.loss_routing.dpo.reference.mode,
                 cache_required=bool(self.config.loss_routing.dpo.reference.cache_required),
             )
             self.last_loss_metrics = result.metrics
