@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -88,6 +89,7 @@ def ensure_ref_logprob_cache(
         accelerator=accelerator,
         cache_dir=state.cache_dir,
         total_rows=dpo_rows,
+        refresh=bool(reference.cache_refresh),
     )
     if is_main_process:
         elapsed = max(time.monotonic() - started_at, 1e-9)
@@ -148,21 +150,21 @@ def compute_ref_logprob_cache(
     accelerator: Any,
     cache_dir: Path,
     total_rows: int,
+    refresh: bool,
 ) -> None:
     """Compute DPO reference logprobs through a temporary base-model FSDP instance."""
 
     logger = get_logger(__name__)
     is_main_process = bool(getattr(accelerator, "is_main_process", True))
     if is_main_process:
-        reset_cache_dir(cache_dir)
+        if refresh:
+            reset_cache_dir(cache_dir)
+        else:
+            cache_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
 
     progress_config = getattr(config, "progress", None)
-    progress = reference_progress(
-        total_rows,
-        enabled=bool(getattr(progress_config, "enabled", True)),
-        main_process=is_main_process,
-    )
+    progress_enabled = bool(getattr(progress_config, "enabled", True))
     model = None
     try:
         model = build_base_reference_policy(config)
@@ -178,13 +180,13 @@ def compute_ref_logprob_cache(
                 model=model,
                 accelerator=accelerator,
                 cache_dir=cache_dir,
+                progress_enabled=progress_enabled,
             )
             accelerator.wait_for_everyone()
             if is_main_process:
                 rows = merge_rank_jsonl(cache_dir, split_loader.split)
                 validate_split_rows(split_loader, rows)
                 write_ref_logprob_split_cache(cache_dir, split_loader, rows)
-                progress.update(len(rows))
                 logger.info(
                     "DPO ref-logprob cache ready: split=%s rows=%s path=%s",
                     split_loader.split,
@@ -196,7 +198,6 @@ def compute_ref_logprob_cache(
                 cleanup_rank_file(local_path)
             accelerator.wait_for_everyone()
     finally:
-        progress.close()
         if model is not None:
             release_base_reference_policy(model, accelerator)
 
@@ -208,6 +209,7 @@ def compute_split_ref_logprobs(
     model: Any,
     accelerator: Any,
     cache_dir: Path,
+    progress_enabled: bool,
 ) -> Path:
     """Compute local-rank reference logprobs for one split and write JSONL rows."""
 
@@ -215,16 +217,56 @@ def compute_split_ref_logprobs(
     rank_dir = cache_dir / f"{split_loader.split}.rank_rows"
     rank_dir.mkdir(parents=True, exist_ok=True)
     output_path = rank_dir / f"rank-{rank:05d}.jsonl"
-    dpo_loader = build_dpo_dataloader(
-        split_loader,
-        process_index=int(getattr(accelerator, "process_index", 0)),
-        num_processes=int(getattr(accelerator, "num_processes", 1)),
+    process_index = int(getattr(accelerator, "process_index", 0))
+    num_processes = int(getattr(accelerator, "num_processes", 1))
+    batch_size = int(split_loader.summary["batch_size"])
+    local_rows = balanced_rank_rows(
+        [row for row in split_loader.dataset.rows if row.get("loss_kind") == "dpo_target"],
+        process_index=process_index,
+        num_processes=max(num_processes, 1),
     )
+    local_prefix_rows, local_prefix_row_count = valid_rank_prefix_rows(output_path, local_rows)
+    local_completed_batches = local_prefix_row_count // max(batch_size, 1)
+    completed_batches = synchronized_min_int(local_completed_batches, accelerator)
+    skip_row_count = min(completed_batches * max(batch_size, 1), len(local_rows))
+    prefix_rows = valid_rank_rows_for_prefix(output_path, local_rows[:skip_row_count])
+    remaining_rows = local_rows[skip_row_count:]
+    dpo_loader = DataLoader(
+        remaining_rows,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=split_loader.dataloader.collate_fn,
+    )
+    logger = get_logger(__name__)
+    is_main_process = bool(getattr(accelerator, "is_main_process", True))
+    local_owner_total = sum(1 for row in local_rows if bool(row.get("_ref_logprob_cache_owner", True)))
+    resumed_owner_rows = len(prefix_rows)
+    if is_main_process:
+        logger.info(
+            "DPO ref-logprob rank progress: split=%s rank=%s resumed_rows=%s local_rows=%s "
+            "local_owner_rows=%s skipped_batches=%s output=%s",
+            split_loader.split,
+            rank,
+            resumed_owner_rows,
+            len(local_rows),
+            local_owner_total,
+            completed_batches,
+            output_path,
+        )
     was_training = bool(getattr(model, "training", False))
     if hasattr(model, "eval"):
         model.eval()
+    progress = reference_progress(
+        local_owner_total,
+        initial=resumed_owner_rows,
+        enabled=progress_enabled,
+        main_process=is_main_process,
+    )
     try:
         with output_path.open("w", encoding="utf-8") as handle:
+            for row in prefix_rows:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
             with torch.no_grad():
                 for batch in dpo_loader:
                     batch = move_batch_to_device(batch, getattr(accelerator, "device", None))
@@ -242,8 +284,11 @@ def compute_split_ref_logprobs(
                         labels=batch["rejected_labels"],
                         ignore_index=config.ignore_index,
                     )
-                    write_batch_rows(handle, batch, chosen_logps, rejected_logps)
+                    written = write_batch_rows(handle, batch, chosen_logps, rejected_logps)
+                    handle.flush()
+                    progress.update(written)
     finally:
+        progress.close()
         if was_training and hasattr(model, "train"):
             model.train()
     return output_path
@@ -284,11 +329,12 @@ def release_base_reference_policy(model: Any, accelerator: Any) -> None:
         torch.cuda.empty_cache()
 
 
-def reference_progress(total_rows: int, *, enabled: bool, main_process: bool) -> Any:
+def reference_progress(total_rows: int, *, initial: int = 0, enabled: bool, main_process: bool) -> Any:
     """Return a progress bar for the reference precompute stage."""
 
     return tqdm(
         total=total_rows,
+        initial=initial,
         desc="reference",
         dynamic_ncols=True,
         disable=not (enabled and main_process),
@@ -306,6 +352,80 @@ def build_dpo_dataloader(split_loader: SplitDataLoader, *, process_index: int, n
         shuffle=False,
         collate_fn=split_loader.dataloader.collate_fn,
     )
+
+
+def synchronized_min_int(value: int, accelerator: Any) -> int:
+    """Return the minimum integer across ranks when distributed is initialized."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        return int(value)
+    device = getattr(accelerator, "device", None)
+    tensor = torch.tensor([int(value)], dtype=torch.long, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+    return int(tensor.item())
+
+
+def load_rank_rows(path: Path) -> dict[int, dict[str, Any]]:
+    """Load rank-local JSONL rows by row_index, ignoring incomplete trailing lines."""
+
+    if not path.exists():
+        return {}
+    rows: dict[int, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            try:
+                rows[int(row["row_index"])] = row
+            except (KeyError, TypeError, ValueError):
+                continue
+    return rows
+
+
+def rank_row_matches(cached: dict[str, Any], row: dict[str, Any]) -> bool:
+    """Return whether one rank-local row matches the current rendered DPO row."""
+
+    return (
+        str(cached.get("chosen_render_hash")) == str(row.get("chosen_render_hash"))
+        and str(cached.get("rejected_render_hash")) == str(row.get("rejected_render_hash"))
+    )
+
+
+def valid_rank_prefix_rows(path: Path, local_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Return valid cached owner rows and local-row prefix length safe to skip."""
+
+    cached_rows = load_rank_rows(path)
+    prefix_rows: list[dict[str, Any]] = []
+    prefix_row_count = 0
+    for row in local_rows:
+        if not bool(row.get("_ref_logprob_cache_owner", True)):
+            prefix_row_count += 1
+            continue
+        cached = cached_rows.get(int(row["row_index"]))
+        if cached is None or not rank_row_matches(cached, row):
+            break
+        prefix_rows.append(cached)
+        prefix_row_count += 1
+    return prefix_rows, prefix_row_count
+
+
+def valid_rank_rows_for_prefix(path: Path, prefix_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return cached owner rows for an already synchronized local-row prefix."""
+
+    cached_rows = load_rank_rows(path)
+    output: list[dict[str, Any]] = []
+    for row in prefix_rows:
+        if not bool(row.get("_ref_logprob_cache_owner", True)):
+            continue
+        cached = cached_rows.get(int(row["row_index"]))
+        if cached is None or not rank_row_matches(cached, row):
+            break
+        output.append(cached)
+    return output
 
 
 def balanced_rank_rows(rows: list[dict[str, Any]], *, process_index: int, num_processes: int) -> list[dict[str, Any]]:
@@ -336,12 +456,13 @@ def move_batch_to_device(batch: dict[str, Any], device: Any) -> dict[str, Any]:
     return moved
 
 
-def write_batch_rows(handle: Any, batch: dict[str, Any], chosen_logps: Any, rejected_logps: Any) -> None:
+def write_batch_rows(handle: Any, batch: dict[str, Any], chosen_logps: Any, rejected_logps: Any) -> int:
     """Write one computed cache batch as JSONL rows."""
 
     chosen_values = chosen_logps.detach().float().cpu().tolist()
     rejected_values = rejected_logps.detach().float().cpu().tolist()
     owners = batch.get("ref_logprob_cache_owner")
+    written = 0
     for index, row_index in enumerate(batch["row_index"]):
         if owners is not None and not bool(owners[index]):
             continue
@@ -354,6 +475,8 @@ def write_batch_rows(handle: Any, batch: dict[str, Any], chosen_logps: Any, reje
             "rejected_ref_logp": float(rejected_values[index]),
         }
         handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        written += 1
+    return written
 
 
 def merge_rank_jsonl(cache_dir: Path, split: str) -> list[dict[str, Any]]:

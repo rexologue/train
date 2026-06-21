@@ -14,6 +14,7 @@ from data.ref_logprobs import (
 )
 import trainer.ref_logprobs as ref_logprob_pipeline
 from trainer.ref_logprobs import estimate_ref_logprob_work
+from trainer.ref_logprobs import valid_rank_prefix_rows, valid_rank_rows_for_prefix
 from tracking.lineage import collect_tracking_lineage
 from tracking.params import flatten_config_params
 from conftest import example_config, pretok_result
@@ -156,6 +157,28 @@ def test_ref_logprob_work_estimate_reports_forward_batches(tmp_path) -> None:
     assert estimate["rejected_tokens"] == 4
     assert estimate["forward_batches_per_rank"] == 4
     assert estimate["total_forward_calls"] == 8
+
+
+def test_ref_logprob_rank_prefix_resume_keeps_only_matching_rows(tmp_path) -> None:
+    path = tmp_path / "rank-00000.jsonl"
+    path.write_text(
+        '{"row_index": 1, "chosen_render_hash": "c1", "rejected_render_hash": "r1", '
+        '"chosen_ref_logp": -1.0, "rejected_ref_logp": -2.0}\n'
+        '{"row_index": 2, "chosen_render_hash": "stale", "rejected_render_hash": "r2", '
+        '"chosen_ref_logp": -1.0, "rejected_ref_logp": -2.0}\n',
+        encoding="utf-8",
+    )
+    local_rows = [
+        {"row_index": 1, "chosen_render_hash": "c1", "rejected_render_hash": "r1"},
+        {"row_index": 2, "chosen_render_hash": "c2", "rejected_render_hash": "r2"},
+        {"row_index": 3, "chosen_render_hash": "c3", "rejected_render_hash": "r3"},
+    ]
+
+    rows, prefix_count = valid_rank_prefix_rows(path, local_rows)
+
+    assert prefix_count == 1
+    assert [row["row_index"] for row in rows] == [1]
+    assert [row["row_index"] for row in valid_rank_rows_for_prefix(path, local_rows[:prefix_count])] == [1]
 
 
 def test_ref_logprob_pipeline_rejects_disabled_cache_with_dpo_rows(tmp_path) -> None:
