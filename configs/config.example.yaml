@@ -1,100 +1,216 @@
-# Production SFT/DPO training contour example.
-# The run always executes the full pipeline: model source resolution,
-# preprocessing cache, routed dataloaders, optional DPO reference-logprob cache,
-# training, eval, checkpointing, MLflow tracking, and candidate registration.
+# Production SFT/DPO training contour template.
+#
+# This file is the self-documenting production contract. Keep training-critical
+# choices here rather than in CLI flags or environment-specific scripts.
+#
+# The run always executes the same high-level pipeline:
+# modelctl/MLflow source resolution -> preprocessing cache -> routed dataloaders
+# -> optional DPO reference-logprob cache -> FSDP LoRA training -> ordinary eval
+# -> optional BFCL eval -> checkpointing -> MLflow logging -> candidate registry.
 
 project:
-  # MLflow experiment name and default destination registry model name.
+  # MLflow experiment name. Candidate adapters are also registered into the
+  # registry model with this exact name, so use a stable model-family name, not
+  # a one-off run label.
   name: estadel-dialog-tuning
-  # Optional MLflow run name.
+
+  # MLflow run name. This is safe to change for each attempt, seed, dataset
+  # version, or hyperparameter sweep.
   run_name: qwen35-a3b-lora-sft-dpo-v1
+
+  # Seed for Python, torch, preprocessing short-reply sampling, and routed
+  # sampler shuffling. Change it only when intentionally running a new trial.
   seed: 42
-  # Single output root for pretokenized cache, ref-logprob cache, checkpoints,
-  # eval rows, and run-local artifacts.
+
+  # Single local root for all generated run artifacts. The trainer derives
+  # these paths under it:
+  #   pretokenized/
+  #   ref_logprobs/<signature>/
+  #   checkpoints/
+  #   eval/bfcl_rows.jsonl
+  # Use a fresh directory for clean experiments. Reuse it only when you want
+  # cache/resume behavior.
   output_dir: runs/estadel-dialog-tuning/qwen35-a3b-lora-sft-dpo-v1
 
 model:
-  # Source model is resolved from modelctl/MLflow registry by alias.
+  # Source model registry name and alias. The trainer resolves models:/<name>@<alias>
+  # through modelctl. Do not point the tokenizer elsewhere: tokenizer is loaded
+  # from the resolved model payload directory.
   name: estadel-llm
   alias: champion
-  # Local model payload cache. Main process verifies or pulls it through modelctl.
+
+  # Local payload cache for the source model. Main process verifies this
+  # directory against registry metadata and pulls into it when missing/stale.
+  # For shared machines, prefer a stable cache outside output_dir so repeated
+  # runs do not download the same base model.
   cache_dir: artifacts/model_cache/estadel-llm/champion
 
   checks:
-    # Kept for config compatibility. Current resolution uses modelctl verify
-    # before pull and records the verified payload hash in the local sidecar.
+    # Verify the local payload hash before using cache_dir. Keep true for
+    # production; false is useful only for local experiments without complete
+    # registry metadata.
     verify_local_hash: true
+
+    # Verify the remote registry ref before local verification/pull. Usually
+    # false is enough because modelctl info/pull/verify already protects the
+    # payload path. Set true only when debugging registry integrity.
     verify_remote_ref: false
+
+    # Require modelctl metadata such as payload hash. Keep true for reproducible
+    # training. Set false only for legacy registry entries while migrating them.
     require_registry_metadata: true
 
+  # Base model load dtype. bf16 is the normal production choice for Ampere+
+  # GPUs and Qwen-style training. fp16 can be less stable. fp32 is for debugging
+  # only and is usually too memory-heavy.
   precision: bf16
+
+  # Required for custom model/tokenizer implementations shipped with the model
+  # payload. Disable only when using a vanilla Transformers architecture.
   trust_remote_code: true
+
+  # Attention backend passed to Transformers. flash_attention_2 is fastest when
+  # the environment has flash_attn installed; otherwise choose an implementation
+  # supported by the model/environment.
   attn_implementation: flash_attention_2
+
+  # MoE expert backend when the model supports it. eager is conservative and
+  # easier to debug. grouped_mm/batched_mm can be faster but need compatible
+  # kernels and should be validated separately.
   experts_implementation: eager
+
+  # Model-level gradient checkpointing. Keep false when using
+  # distributed.fsdp.activation_checkpointing=true; the schema rejects enabling
+  # both because double checkpointing is expensive and ambiguous.
   gradient_checkpointing: false
+
+  # Freeze non-LoRA base components. For LoRA-only tuning these should usually
+  # stay true: fewer trainable params, lower optimizer memory, cleaner adapter
+  # checkpoints. Set false only when intentionally training those base weights.
   freeze_router: true
   freeze_embeddings: true
   freeze_lm_head: true
 
 tokenizer:
-  # Tokenizer and official chat template are loaded from model.cache_dir.
+  # Loaded from model.cache_dir. Fast tokenizer is expected for offset-aware
+  # masking and throughput; set false only for tokenizer compatibility issues.
   use_fast: true
+
+  # Chat templates already include the model-specific special/control tokens.
+  # Keep false to avoid duplicated BOS/EOS/control tokens.
   add_special_tokens: false
+
+  # Right padding is the training/eval default for the current collators.
   padding_side: right
 
 lora:
+  # LoRA rank. Higher r increases adapter capacity and trainable/optimizer
+  # memory. Common sweep values: 8, 16, 32, 64. For large 35B runs, start with
+  # the smallest rank that meets quality requirements.
   r: 32
+
+  # LoRA alpha. Effective scale is alpha / r. A common stable default is 2*r.
   alpha: 64
+
+  # Adapter dropout. Use 0.0 for very small data or deterministic ablations;
+  # 0.05-0.1 can help regularization on noisier domain data.
   dropout: 0.05
+
+  # Bias training mode. none is the normal PEFT adapter-only setting. all or
+  # lora_only increases trainable state and changes checkpoint semantics.
   bias: none
+
+  # Module names matched by PEFT. q/k/v/o attention projections are the
+  # conservative production target. Adding MLP projections increases capacity
+  # and memory; validate before using at 35B scale.
   target_modules:
     - q_proj
     - k_proj
     - v_proj
     - o_proj
+
+  # Extra non-LoRA modules to save/train with the adapter. Keep empty for pure
+  # LoRA. Do not include lm_head when model.freeze_lm_head=true; schema rejects it.
   modules_to_save: []
 
 preprocessing:
   raw:
+    # Raw parquet splits. Each row must contain:
+    #   type: sft_target | sft_tool | dpo_target
+    #   data: JSON payload for that route
+    # `type` is the only authoritative route column at raw boundary.
     train_path: data/train.parquet
     valid_path: data/valid.parquet
+
+    # Optional test split. It is pretokenized when present but not required by
+    # the training loop.
     test_path: data/test.parquet
     test_required: false
 
   sequence:
+    # Hard sequence length after rendering. Larger values improve long-context
+    # coverage but increase activation memory roughly linearly. For memory
+    # debugging, reduce this before touching optimizer settings.
     max_seq_len: 8192
+
+    # false means overlength samples are rejected, which is safer for
+    # reproducibility and masking audits. true keeps more data but may cut
+    # completions/tool calls in ways that change the supervised signal.
     truncation: false
+
+    # Packing is not implemented for this routed/masked contract. Keep false.
     packing: false
 
   rendering:
+    # Include system messages when rendering. Match this to the data contract
+    # and target serving template. Changing it invalidates masks and caches.
     use_system: true
+
+    # Reject raw payload text that already contains model special markers.
+    # Keep true to prevent template injection and double-control-token bugs.
     reject_raw_special_markers: true
 
   reasoning:
+    # When false, <think>...</think> spans are masked out of supervised loss.
+    # Set true only when you explicitly want to train hidden reasoning text.
     enable_thinking: false
 
   masking:
+    # Label value ignored by CE/DPO sequence logprob supervision.
     ignore_index: -100
+
+    # Reject rendered samples with no supervised completion tokens. Keep true
+    # for production; false only for debugging preprocessing coverage.
     require_positive_supervised_tokens: true
 
     policies:
       sft_target:
+        # Short assistant replies can be noisy acknowledgements. This policy
+        # guarantees sufficiently long target replies and probabilistically
+        # keeps some short replies to avoid fully deleting that behavior.
         min_guaranteed_assistant_chars: 80
         loss_on_short_assistant_reply_prob: 0.3
         short_response_sampling_seed: 42
 
   quality:
+    # Fail preprocessing when rejected/raw rows exceed this fraction. Tighten
+    # for clean production data; loosen during dataset migration.
     max_rejected_fraction: 0.05
+
+    # Minimum processed rows per route. Set a route to 0 only when that route is
+    # optional for the run, for example DPO-disabled data.
     min_processed_rows_per_loss_kind:
       sft_target: 1
       sft_tool: 1
       dpo_target: 1
+
+    # Minimum supervised tokens per processed split. This catches template or
+    # masking bugs that would make training a no-op.
     min_supervised_tokens: 1
 
 loss_routing:
-  # Route frequency is determined by dataset composition. No sampler weights.
-  # `dpo_target` is a supported active route; remove it only when the dataset
-  # and run are intentionally SFT-only.
+  # Route frequency is determined by dataset composition. There are no sampler
+  # weights: if you need a different SFT/DPO/tool mix, change the dataset.
   routes:
     sft_target:
       type: sft_ce
@@ -104,94 +220,236 @@ loss_routing:
       type: dpo
 
   dpo:
+    # DPO beta controls preference strength. Higher beta pushes harder on
+    # chosen-vs-rejected margins and can destabilize noisy preference data.
+    # 0.05-0.2 is a typical sweep range.
     beta: 0.1
+
     reference:
       # The reference policy is the source base model before LoRA is attached.
-      # It is computed as a separate pre-training cache stage after dataloaders.
-      # Store reference logprobs in output_dir/ref_logprobs/<signature>.
+      # Reference logprobs are computed once into output_dir/ref_logprobs/<signature>
+      # and then loaded into DPO batches.
       cache_enabled: true
-      # Force recomputation even when a matching cache exists.
+
+      # true forces recomputation even when signature-matching cache exists.
+      # Use after changing reference computation code or when auditing cache.
       cache_refresh: false
-      # Fail if DPO rows cannot get cached reference logprobs.
+
+      # true makes missing/incomplete cache fatal. For production DPO runs this
+      # is safer. false allows migration/debug runs to continue only when the
+      # code path can fill or reuse cache successfully.
       cache_required: false
 
 training:
+  # Number of full passes over the routed train dataloader. Optimizer steps are
+  # computed automatically from dataloader length, world size, and grad accum.
   num_epochs: 3
+
+  # Per-rank microbatch size. This is the first knob to reduce on OOM. With
+  # routed SFT/DPO and long context, 1 is the safest production default.
   per_device_train_batch_size: 1
+
+  # false keeps all route samples. In multi-GPU FSDP, the sampler pads incomplete
+  # route replica groups by duplicating the last batch within that route so all
+  # ranks execute the same route. true discards incomplete route batches instead.
   drop_last: false
+
+  # Number of microbatches per optimizer step. Increase to recover effective
+  # batch size when per_device_train_batch_size must stay small.
   gradient_accumulation_steps: 16
+
+  # LoRA learning rate. 5e-5 is conservative. Larger ranks, noisier data, or DPO
+  # usually prefer lower LR than small clean SFT-only adapters.
   learning_rate: 0.00005
+
+  # AdamW beta1/beta2. Defaults are stable for LoRA. Change only for explicit
+  # optimizer sweeps.
   adamw_betas:
     - 0.9
     - 0.999
+
+  # Usually 0.0 for LoRA adapters; nonzero decay can be swept but is not a
+  # default production assumption.
   weight_decay: 0.0
+
+  # Fraction of optimizer steps used for warmup.
   warmup_ratio: 0.03
+
+  # Scheduler name passed to Transformers get_scheduler.
   lr_scheduler_type: cosine
+
+  # Gradient clipping. 1.0 is a conservative guardrail for DPO/SFT mixed runs.
+  # Set 0.0 only to disable clipping intentionally.
   max_grad_norm: 1.0
 
 progress:
+  # Console progress bars. Disable in very noisy cluster log environments.
   enabled: true
 
 distributed:
   fsdp:
+    # Full shard is the memory-saving FSDP mode: parameters, gradients, and
+    # optimizer state are sharded across ranks. Single-GPU smoke runs fall back
+    # to NO_SHARD automatically because there is nothing to shard.
     sharding_strategy: full_shard
+
+    # FSDP mixed precision policy. Keep bf16 for memory and stability on modern
+    # GPUs. This is intentionally separate from Accelerator(mixed_precision),
+    # which the code keeps at "no" to avoid Accelerate fp32 FlatParameter upcast.
     mixed_precision: bf16
+
+    # Parameter CPU offload can reduce VRAM but is usually much slower and can
+    # bottleneck on PCIe/CPU RAM. Keep false unless GPU memory is impossible even
+    # with sharding/checkpointing/smaller sequence length.
     cpu_offload: false
+
+    # FSDP activation checkpointing trades compute for lower activation memory.
+    # Keep true for long-context/large-model runs. Do not also enable
+    # model.gradient_checkpointing.
     activation_checkpointing: true
+
+    # Sharded state dict avoids materializing a full model/optimizer state on
+    # one rank during save/resume. Required by the schema.
     state_dict_type: sharded_state_dict
+
+    # Required for PEFT LoRA with frozen base params. false makes FSDP flatten
+    # modules that mix requires_grad=true LoRA weights and frozen base weights,
+    # which fails before the first batch.
     use_orig_params: true
+
+    # Throttles all-gather scheduling to reduce peak memory spikes. Keep true
+    # for memory-bound runs; false can improve throughput when memory is ample.
     limit_all_gathers: true
+
+    # Wrap each transformer block as an FSDP unit. This is the normal balance
+    # between memory and communication. no_wrap is not viable for large models.
     auto_wrap_policy: transformer_based_wrap
+
+    # Exact decoder layer class names to wrap. Must match the source model
+    # implementation. Examples:
+    #   Qwen3_5MoeDecoderLayer for MoE model variants
+    #   Qwen3_5DecoderLayer for dense model variants
     transformer_cls_names_to_wrap:
       - Qwen3_5MoeDecoderLayer
+
+    # Load pretrained weights on rank 0 and initialize other ranks efficiently,
+    # then sync module states. Keep both true for multi-GPU memory-safe loading.
     cpu_ram_efficient_loading: true
     sync_module_states: true
 
 eval:
+  # Run ordinary validation every N optimizer steps. Smaller values give earlier
+  # feedback but add overhead and more checkpoints/registry windows.
   every_train_steps: 25
+
   standard:
+    # Limit ordinary validation batches for smoke/debug runs. null evaluates
+    # the full validation split.
     max_batches: 50
+
   bfcl:
+    # BFCL is a tool-calling eval using the bundled RU BFCL dataset. It is much
+    # more expensive than ordinary validation because it generates tokens. Keep
+    # false for fast training iterations; enable for candidate-quality gates.
     enabled: false
+
+    # Run BFCL every N validation events. If registry.selection.metric is BFCL,
+    # every checkpoint boundary must include BFCL; schema validates cadence.
     run_every_n_validations: 4
+
+    # Include multi-turn tool-call cases in addition to simpler cases.
     include_multi_turn: true
+
+    # Optional category filter. null means all bundled categories.
     categories: null
+
+    # BFCL sample cap. Use 10-100 for smoke runs. null means full BFCL and can
+    # be slow, especially with high max_new_tokens.
     limit: 100
+
     generation:
+      # Upper bound for BFCL generated tokens. Reduce for smoke runs; increase
+      # when tool-call JSON is being truncated.
       max_new_tokens: 256
+
+      # Deterministic eval defaults. Use sampling only for explicit robustness
+      # experiments, not registry selection.
       temperature: 0.0
       top_p: 1.0
       do_sample: false
 
 checkpointing:
+  # Save one adapter checkpoint every N validation events.
   save_every_n_validations: 1
+
+  # Keep only the newest N checkpoints, except checkpoints still needed by an
+  # active registry-selection window or pending async registration. null disables
+  # pruning.
   save_total_limit: 3
+
   resume:
+    # Resume from latest valid checkpoint under output_dir/checkpoints.
     enabled: true
+
+    # Strict resume guards. Keep true for production reproducibility. Disable
+    # individual checks only to intentionally continue after changing that
+    # contract.
     strict_config: true
     strict_dataset_hash: true
     strict_template_hash: true
     strict_model_source_hash: true
 
 mlflow:
+  # MLflow tracking server URI. Use localhost only for local dev; production
+  # should point to the shared tracking server.
   tracking_uri: http://localhost:5000
+
+  # Existing MLflow run id to append to. null creates a new run.
   resume_run_id: null
+
   async_logging:
+    # Background MLflow/modelctl side effects keep training steps from blocking
+    # on network I/O. Keep true unless debugging tracking failures.
     enabled: true
+
+    # Queue capacity for pending async jobs. Increase only if tracking emits
+    # bursts faster than the worker can flush.
     queue_max_items: 1024
+
+    # Max seconds to wait for async queue flush and modelctl registration.
     flush_timeout_seconds: 300
+
+    # true fails training when async MLflow/modelctl work fails. Keep true for
+    # production so registry/logging failures are visible.
     fail_on_worker_error: true
+
+  # Log rendered preprocessing samples as MLflow artifacts for mask/template
+  # audit. Disable if artifacts become too noisy.
   log_rendered_samples: true
 
 registry:
-  # Training registers candidate aliases only. Production promotion is separate.
+  # Training registers candidate aliases only. Production promotion to baseline
+  # or champion is intentionally separate.
+  #
+  # The selector observes checkpoints in windows of this size and registers the
+  # best checkpoint from each completed window.
   register_every_n_checkpoints: 5
+
   selection:
-    # Ordinary metrics: eval/sft/loss, eval/sft/ppl, eval/dpo/loss,
-    # eval/dpo/accuracy, eval/dpo/reward_margin, plus legacy aggregate
-    # eval/loss for dashboards only.
-    # BFCL metrics: eval/bfcl/accuracy, eval/bfcl/total, eval/bfcl/passed,
-    # eval/bfcl/failed, eval/bfcl/<category>/accuracy,
-    # eval/bfcl/<category>/total.
+    # Metric used to pick the best checkpoint inside each registry window.
+    #
+    # Prefer route-specific metrics for mixed SFT/DPO runs:
+    #   eval/sft/loss, eval/sft/ppl
+    #   eval/dpo/loss, eval/dpo/accuracy, eval/dpo/reward_margin
+    #
+    # eval/loss is a legacy aggregate for dashboards and is rejected for mixed
+    # SFT/DPO registry selection because it blends different objectives.
+    #
+    # BFCL metrics are valid only when eval.bfcl.enabled=true:
+    #   eval/bfcl/accuracy, eval/bfcl/total, eval/bfcl/passed,
+    #   eval/bfcl/failed, eval/bfcl/<category>/accuracy,
+    #   eval/bfcl/<category>/total.
     metric: eval/sft/loss
+
+    # min for losses/perplexity, max for accuracy/reward_margin/pass metrics.
     mode: min
