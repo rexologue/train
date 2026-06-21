@@ -10,6 +10,7 @@ import pandas as pd
 
 from config import Config
 from utils.hashing import file_sha256, stable_json_dumps
+from utils.logging import get_logger
 
 
 LOSS_KINDS = {"sft_target", "sft_tool", "dpo_target"}
@@ -333,13 +334,18 @@ def write_split_cache(
     raw input hash for that exact split.
     """
 
+    logger = get_logger(__name__)
     root.mkdir(parents=True, exist_ok=True)
     pretok_path = split_parquet_path(root, split)
     pretok_tmp = pretok_path.with_name(f"{pretok_path.stem}.tmp{pretok_path.suffix}")
+    logger.info("serializing %s pretokenized parquet: rows=%s tmp=%s", split, len(processed_rows), pretok_tmp)
     pd.DataFrame(processed_rows).to_parquet(pretok_tmp, index=False)
+    logger.info("replacing %s pretokenized parquet: path=%s", split, pretok_path)
     pretok_tmp.replace(pretok_path)
 
+    logger.info("hashing %s pretokenized parquet: path=%s", split, pretok_path)
     pretok_hash = file_sha256(pretok_path)
+    logger.info("hashed %s pretokenized parquet: sha256=%s", split, pretok_hash)
 
     splits = dict((base_manifest.get("splits") or {}))
     splits[split] = split_manifest["input_sha256"]
@@ -381,6 +387,7 @@ def write_split_cache(
     previous_debug_rows = [row for row in read_jsonl(debug_path(root)) if row.get("split") != split]
     current_debug_rows = sample_debug_rows(debug_rows, examples_per_loss_kind=examples_per_loss_kind)
     all_debug_rows = previous_debug_rows + current_debug_rows
+    logger.info("writing preprocessing debug samples: split=%s rows=%s path=%s", split, len(all_debug_rows), debug_path(root))
     write_jsonl(debug_path(root), all_debug_rows)
     manifest["debug"] = {
         "path": str(debug_path(root)),
@@ -388,6 +395,7 @@ def write_split_cache(
         "num_rows": len(all_debug_rows),
     }
     manifest_tmp = manifest_path(root).with_suffix(".json.tmp")
+    logger.info("writing preprocessing manifest: path=%s", manifest_path(root))
     manifest_tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     manifest_tmp.replace(manifest_path(root))
     return manifest

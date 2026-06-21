@@ -662,6 +662,7 @@ def _preprocess_decoded_rows(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Counter[str], Counter[str]]:
     processed_rows: list[dict[str, Any]] = []
     debug_rows: list[dict[str, Any]] = []
+    debug_sample_counts: Counter[tuple[str, str]] = Counter()
     rejected_rows: list[dict[str, Any]] = []
     rejected_counts: Counter[str] = Counter()
     stats: Counter[str] = Counter()
@@ -684,7 +685,10 @@ def _preprocess_decoded_rows(
 
         processed_rows.append(processed)
         debug["split"] = split
-        debug_rows.append(debug)
+        debug_sample_key = (split, str(debug.get("loss_kind") or processed.get("loss_kind")))
+        if debug_sample_counts[debug_sample_key] < AUDIT_EXAMPLES_PER_LOSS_KIND:
+            debug_rows.append(debug)
+            debug_sample_counts[debug_sample_key] += 1
         stats.update(row_stats)
         stats[f"processed_loss_kind/{row['loss_kind']}"] += 1
         token_count, supervised_token_count = processed_token_stats(processed)
@@ -757,6 +761,7 @@ def _preprocess_rows_parallel(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Counter[str], Counter[str]]:
     chunks = _chunk_rows(rows, chunk_size)
     chunk_results: list[PreprocessChunkResult] = []
+    logger = get_logger(__name__)
 
     with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_preprocess_worker, initargs=(config,)) as executor:
         futures = {
@@ -769,7 +774,10 @@ def _preprocess_rows_parallel(
                 chunk_results.append(result)
                 progress.update(result.num_input_rows)
 
-    return _merge_chunk_results(chunk_results)
+    logger.info("merging preprocessed %s chunks for %s split", len(chunk_results), split)
+    merged = _merge_chunk_results(chunk_results)
+    logger.info("merged preprocessed chunks for %s split", split)
+    return merged
 
 
 def preprocess_split(
@@ -848,6 +856,14 @@ def preprocess_split(
             show_progress=True,
         )
 
+    logger.info(
+        "%s preprocessing rows ready: processed=%s rejected=%s debug_samples=%s",
+        split,
+        len(processed_rows),
+        len(rejected_rows),
+        len(debug_rows),
+    )
+    logger.info("running %s preprocessing quality gates", split)
     enforce_preprocessing_quality(
         split=split,
         config=config,
@@ -855,6 +871,7 @@ def preprocess_split(
         rejected_rows=rejected_rows,
         stats=stats,
     )
+    logger.info("%s preprocessing quality gates passed", split)
 
     base_manifest = load_manifest(output_dir) or {}
     split_manifest = {
@@ -869,6 +886,7 @@ def preprocess_split(
         "stats": dict(stats),
         "preprocessing_signature": preprocessing_signature,
     }
+    logger.info("writing %s pretokenized cache: rows=%s path=%s", split, len(processed_rows), pretok_path)
     write_split_cache(
         output_dir,
         split,
@@ -878,6 +896,7 @@ def preprocess_split(
         base_manifest=base_manifest,
         examples_per_loss_kind=AUDIT_EXAMPLES_PER_LOSS_KIND,
     )
+    logger.info("wrote %s pretokenized cache: path=%s", split, pretok_path)
     logger.info("%s preprocessing complete: rows=%s rejected=%s pretok=%s", split, len(processed_rows), len(rejected_rows), pretok_path)
     if rejected_counts:
         logger.warning("%s rejected counts: %s", split, dict(rejected_counts))

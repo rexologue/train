@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from losses.dpo import dpo_loss
+import losses.dpo as dpo_module
+from losses.dpo import dpo_loss, sequence_logps
 from losses.sft import sft_cross_entropy_loss
 from trainer.trainer import RoutedTrainer
 from conftest import example_config
@@ -86,6 +87,24 @@ def test_dpo_loss_uses_cached_reference_logprobs() -> None:
     assert torch.isfinite(result.loss)
     assert result.metrics["dpo/policy_chosen_logp"] > result.metrics["dpo/policy_rejected_logp"]
     assert result.metrics["dpo/accuracy"] == 1.0
+
+
+def test_sequence_logps_does_not_materialize_full_log_softmax(monkeypatch) -> None:
+    def fail_log_softmax(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("sequence_logps must avoid full [batch, seq, vocab] log_softmax")
+
+    monkeypatch.setattr(dpo_module.F, "log_softmax", fail_log_softmax)
+    logps = sequence_logps(
+        TinyLogitModel(),
+        input_ids=torch.tensor([[1, 5, 6]]),
+        attention_mask=torch.tensor([[1, 1, 1]]),
+        labels=torch.tensor([[-100, 5, 6]]),
+        ignore_index=-100,
+    )
+
+    assert torch.isfinite(logps).all()
+    assert logps.shape == (1,)
 
 
 def test_dpo_loss_requires_precomputed_reference_logprobs() -> None:

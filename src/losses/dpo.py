@@ -35,8 +35,9 @@ def sequence_logps(
     shift_input_ids = input_ids[:, 1:]
     shift_labels = labels[:, 1:]
     loss_mask = shift_labels != int(ignore_index)
-    token_logps = F.log_softmax(shift_logits, dim=-1)
-    gathered = token_logps.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
+    target_logits = shift_logits.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
+    log_normalizers = torch.logsumexp(shift_logits, dim=-1)
+    gathered = target_logits - log_normalizers
     return (gathered.float() * loss_mask).sum(dim=-1)
 
 
