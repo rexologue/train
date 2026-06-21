@@ -24,7 +24,6 @@ from data.dataloaders import build_dataloaders, validate_training_inputs
 from eval.bfcl import run_bfcl_eval
 from eval.ordinary import run_standard_eval
 from preprocessing.io import load_pretokenized_split_results
-from preprocessing.pipeline import prepare_pretokenized_splits
 from registry.modelctl_client import ModelctlClient
 from registry.package import build_candidate_registration_request
 from registry.selection import CandidateWindowSelector, RegistrationDecision
@@ -69,16 +68,17 @@ def main() -> None:
 
     with tracker:
         if is_main_process:
-            model_source = tracker.resolve_model_source()
+            tracker.model_source_resolution = load_model_source_resolution_from_cache(config)
 
             logger.info(
                 "registry model resolved: effective_model_id=%s ref=%s pulled=%s used_local=%s",
-                model_source.effective_model_id,
-                model_source.ref,
-                model_source.pulled,
-                model_source.used_local,
+                tracker.model_source_resolution.effective_model_id,
+                tracker.model_source_resolution.ref,
+                tracker.model_source_resolution.pulled,
+                tracker.model_source_resolution.used_local,
             )
 
+            tracker.log_model_source_resolution(tracker.model_source_resolution)
             tracker.log_run_start(config_path=args.config)
             tracker.log_lineage()
 
@@ -87,31 +87,21 @@ def main() -> None:
         if not is_main_process:
             tracker.model_source_resolution = load_model_source_resolution_from_cache(config)
 
-        if is_main_process:
-            logger.info("building training data cache")
-            results = prepare_pretokenized_splits(
-                config,
-                ["train", "valid", "test"],
-                model_source=tracker.model_source_resolution,
+        results = load_pretokenized_split_results(config, ["train", "valid", "test"])
+
+        for result in results:
+            logger.info(
+                "split ready: split=%s reused=%s rows=%s rejected=%s pretok=%s manifest=%s",
+                result.split,
+                result.reused,
+                result.manifest.get("num_rows"),
+                result.manifest.get("num_rejected_rows"),
+                result.pretok_path,
+                result.manifest_path,
             )
 
-            for result in results:
-                logger.info(
-                    "split ready: split=%s reused=%s rows=%s rejected=%s pretok=%s manifest=%s",
-                    result.split,
-                    result.reused,
-                    result.manifest.get("num_rows"),
-                    result.manifest.get("num_rejected_rows"),
-                    result.pretok_path,
-                    result.manifest_path,
-                )
-
+        if is_main_process:
             tracker.log_preprocessing_results(results)
-
-        accelerator.wait_for_everyone()
-
-        if not is_main_process:
-            results = load_pretokenized_split_results(config, ["train", "valid", "test"])
 
         logger.info("building routed dataloaders")
         dataloaders = build_dataloaders(

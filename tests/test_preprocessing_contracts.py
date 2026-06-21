@@ -7,9 +7,27 @@ import pytest
 
 from preprocessing.io import ParquetSchemaError, read_rows
 from preprocessing.masking import canonicalize_row
-from preprocessing.pipeline import preprocess_dpo_row, preprocess_sft_row
+from preprocessing.pipeline import preprocess_dpo_row, preprocess_sft_row, preprocess_split
 from preprocessing.rendering import QwenTemplateRenderer
 from conftest import CharTokenizer, example_config, renderer_config
+
+
+class ChatTemplateTokenizer(CharTokenizer):
+    is_fast = True
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **kwargs,
+    ) -> str:
+        del tokenize, add_generation_prompt, kwargs
+        rendered = []
+        for message in messages:
+            rendered.append(f"<|im_start|>{message['role']}\n{message.get('content', '')}<|im_end|>")
+        return "".join(rendered)
 
 
 def supervised_text(input_ids: list[int], labels: list[int], *, ignore_index: int = -100) -> str:
@@ -47,6 +65,49 @@ def test_read_rows_rejects_legacy_target_column(tmp_path) -> None:
 
     with pytest.raises(ParquetSchemaError, match="must not contain target"):
         read_rows(path)
+
+
+def test_preprocess_split_force_refresh_rebuilds_valid_cache(tmp_path) -> None:
+    raw_path = tmp_path / "train.parquet"
+    pd.DataFrame(
+        [
+            {
+                "data": json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "question"},
+                            {"role": "assistant", "content": "long supervised answer " * 8},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                "type": "sft_target",
+            }
+        ]
+    ).to_parquet(raw_path, index=False)
+    config = example_config(
+        project={"output_dir": str(tmp_path / "run")},
+        preprocessing={
+            "raw": {"train_path": str(raw_path), "valid_path": str(raw_path)},
+            "quality": {"min_processed_rows_per_loss_kind": {"sft_tool": 0, "dpo_target": 0}},
+        },
+    )
+    tokenizer = ChatTemplateTokenizer()
+
+    first = preprocess_split("train", raw_path, tokenizer, config, preprocessing_signature="sig")
+    reused = preprocess_split("train", raw_path, tokenizer, config, preprocessing_signature="sig")
+    refreshed = preprocess_split(
+        "train",
+        raw_path,
+        tokenizer,
+        config,
+        preprocessing_signature="sig",
+        force_refresh=True,
+    )
+
+    assert first.reused is False
+    assert reused.reused is True
+    assert refreshed.reused is False
 
 
 def test_sft_target_masks_selected_assistant_tokens_only() -> None:

@@ -1,16 +1,31 @@
 # estadel-trainer
 
-Production-контур для LoRA-дообучения Qwen3.5-35B-A3B в диалоговом домене:
+Production-контур для LoRA-дообучения Qwen3.5 в диалоговом домене с SFT,
+tool-calling loss и DPO.
 
-- source model и tokenizer берутся из MLflow/modelctl registry;
-- tokenizer всегда загружается из resolved model directory;
-- SFT и DPO идут через единый routed training loop;
-- batches однородны по `loss_kind`;
-- training запускается только через Accelerate/FSDP;
-- ordinary validation и опциональный bundled RU BFCL;
-- MLflow tracking, async side effects, adapter-only checkpoints и candidate registration;
-- strict resume с проверкой config, dataset manifest, tokenizer chat template и source model hash;
-- DVC lineage ищется автоматически рядом с train parquet.
+Поддержанный runtime:
+
+```text
+MLflow/modelctl registry model
+  -> bundled tokenizer
+  -> PEFT LoRA
+  -> Transformers
+  -> Accelerate/FSDP
+  -> RoutedTrainer
+  -> MLflow/modelctl candidate registry
+```
+
+Ключевое правило запуска: подготовка данных и модели выполняется отдельной
+CPU-стадией до distributed training.
+
+```text
+estadel-prepare --config configs/config.yaml
+accelerate launch --use_fsdp --num_processes <N> estadel-train --config configs/config.yaml
+```
+
+Так дорогой preprocessing не держит NCCL/FSDP process group открытым и не
+может упасть по distributed timeout, пока rank0 один долго токенизирует
+датасет.
 
 ## Установка
 
@@ -20,43 +35,53 @@ source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
-`modelctl` приходит зависимостью `modelctl-mlflow` из PyPI и вызывается из
-`PATH`. Путь к executable в YAML не конфигурируется.
+`modelctl` приходит из PyPI-пакета `modelctl-mlflow` и вызывается из `PATH`.
+Путь к executable в YAML не задается.
 
-Для окружений, где нужны CUDA kernels:
+Опциональные extras:
 
 ```bash
+# CUDA kernels вроде flash-attn. Обычно ставится после torch.
 python -m pip install --no-build-isolation -e ".[cuda-kernels]"
-```
 
-Для окружений, которым нужен Transformers main:
-
-```bash
+# Только если окружению нужен Transformers main.
 python -m pip install -e ".[transformers-main]"
 ```
 
-## Конфигурация
+## Конфиг
 
-Единственный production template: `configs/config.example.yaml`.
+Production template:
 
 ```bash
 cp configs/config.example.yaml configs/config.yaml
 ```
 
-Минимально перед запуском задаются:
+`configs/config.example.yaml` является самодокументированным шаблоном. README
+ниже объясняет рабочую схему, а конкретные поля и дефолты смотрите в YAML.
 
-- `project.name`: MLflow experiment и destination registry model;
-- `project.run_name`: MLflow run name;
-- `project.output_dir`: единый корень локальных результатов;
-- `model.name`, `model.alias`, `model.cache_dir`: source model из registry;
-- `preprocessing.raw.train_path` и `preprocessing.raw.valid_path`;
-- `training.num_epochs`;
-- `mlflow.tracking_uri`.
+Минимум, который нужно задать под новый запуск:
 
-Training-critical значения живут в YAML и валидируются в `src/config/schema.py`.
-Отдельный tokenizer source, revision и template hash в конфиге не поддерживаются.
+```yaml
+project:
+  name: dialog-tuning
+  run_name: qwen35-lora-sft-dpo-v1
+  output_dir: artifacts/runs/qwen35-lora-sft-dpo-v1
 
-Derived paths:
+model:
+  name: Qwen_3.5_35B_A3B
+  alias: champion
+  cache_dir: artifacts/model_cache/qwen35/champion
+
+preprocessing:
+  raw:
+    train_path: artifacts/data/train.parquet
+    valid_path: artifacts/data/valid.parquet
+
+mlflow:
+  tracking_uri: http://...
+```
+
+Derived paths всегда выводятся из `project.output_dir`:
 
 ```text
 {project.output_dir}/pretokenized
@@ -65,53 +90,109 @@ Derived paths:
 {project.output_dir}/eval/bfcl_rows.jsonl
 ```
 
-## Запуск
+`project.name` используется как MLflow experiment и destination model для
+candidate registration. `project.run_name` используется как MLflow run name.
 
-Основной entrypoint из package:
+## Двухфазный Запуск
+
+### 1. Prepare
+
+```bash
+estadel-prepare --config configs/config.yaml
+```
+
+Prepare делает только локальную подготовку:
+
+- читает YAML и валидирует config schema;
+- резолвит source model как `models:/<model.name>@<model.alias>`;
+- вызывает `modelctl info`;
+- если `model.cache_dir` уже содержит payload, вызывает `modelctl verify`;
+- если payload отсутствует или hash не совпал, вызывает `modelctl pull` и
+  повторный `modelctl verify`;
+- пишет sidecar рядом с `model.cache_dir`;
+- грузит tokenizer из resolved model directory;
+- считает preprocessing signature: tokenizer files, chat template hash,
+  preprocessing contract, model source hash;
+- для каждого split считает raw parquet hash;
+- переиспользует split cache, если raw hash, pretokenized parquet hash и
+  preprocessing signature совпали;
+- перестраивает только отсутствующий или несогласованный split.
+
+Принудительный rebuild всех pretokenized split caches:
+
+```bash
+estadel-prepare --config configs/config.yaml --force
+```
+
+`--force` не нужен для обычного обновления данных или конфига: если raw parquet,
+tokenizer, source model или preprocessing settings изменились, prepare сам
+увидит mismatch и перестроит нужные splits. `--force` нужен, когда вы хотите
+пересоздать кеш несмотря на совпадающие hashes.
+
+Prepare не стартует MLflow training run, не создает Accelerator и не
+инициализирует CUDA/NCCL.
+
+### 2. Train
 
 ```bash
 accelerate launch --use_fsdp --num_processes <GPU_COUNT> \
   estadel-train --config configs/config.yaml
 ```
 
-`train` также остается Python module в `src`, но production-документация
-ориентируется на console script из `pyproject.toml`.
+`estadel-train` запускается уже внутри Accelerate/FSDP и не строит
+pretokenized cache. Он ожидает, что prepare был выполнен заранее.
 
-Запуск выполняет полный контур: model source resolution, preprocessing cache,
-routed dataloaders, DPO ref-logprob cache, training, validation,
-checkpointing и candidate registration.
+Train делает:
 
-FSDP runtime использует YAML policy из `distributed.fsdp`. Если input
-embeddings и `lm_head` tied и frozen, training автоматически исключает эти
-модули из FSDP flatten и переносит их на accelerator device. Это runtime guard
-для tied shared parameters, не отдельное YAML-поле.
+- создает Accelerator/FSDP runtime;
+- читает model source sidecar из `model.cache_dir`;
+- читает `{project.output_dir}/pretokenized/manifest.json`;
+- падает быстро, если sidecar, manifest или split parquet отсутствуют;
+- логирует model source, lineage и preprocessing manifest в MLflow;
+- строит routed dataloaders с route-homogeneous batches;
+- при DPO строит или переиспользует ref-logprob cache;
+- запускает training, ordinary eval, optional BFCL eval;
+- сохраняет adapter-only checkpoints;
+- регистрирует candidate aliases в registry.
 
-## Model Registry
+Train не выполняет `modelctl pull` и не пересобирает preprocessing. Если
+изменились source model, tokenizer, raw parquet или preprocessing settings,
+сначала снова запускайте `estadel-prepare`.
 
-Source model задается alias-ссылкой:
+Strict resume остается в training контуре: checkpoint resume сверяет effective
+config, dataset manifest, data/training contracts, actual tokenizer chat
+template hash и verified source model payload hash. Поэтому training не
+доверяет голым путям без manifest/sidecar.
 
-```yaml
-model:
-  name: estadel-llm
-  alias: champion
-  cache_dir: artifacts/model_cache/estadel-llm/champion
-```
+## Что Проверять Перед Дорогим Запуском
 
-Main process вызывает `modelctl info`, проверяет локальный cache через
-`modelctl verify`, при mismatch или отсутствии payload выполняет `modelctl pull`
-и повторную verification. Результат пишется в sidecar рядом с cache directory.
-
-Candidate checkpoints регистрируются в registry model с именем `project.name`.
-Training регистрирует только candidate aliases:
+1. Prepare завершился строкой `prepare complete`.
+2. Есть sidecar рядом с `model.cache_dir`:
 
 ```text
-candidate-000001
-candidate-latest
+<model.cache_dir>.estadel_registry.json
 ```
 
-Promotion до `baseline` или `champion` training loop не выполняет.
+3. Есть preprocessing manifest:
 
-## Dataset
+```text
+{project.output_dir}/pretokenized/manifest.json
+```
+
+4. В manifest есть нужные splits и `preprocessing_signatures`.
+5. `estadel-train` стартует, строит dataloaders и доходит до
+   `loading tokenizer, model, LoRA adapter, optimizer, scheduler`.
+
+Если падает `pretokenized manifest not found`, это не NCCL проблема: запустите
+`estadel-prepare --config ...`.
+
+Если падает `model source sidecar not found`, prepare не был выполнен для
+текущего `model.cache_dir`.
+
+Если raw parquet был заменен, запускайте prepare еще раз. Валидные splits будут
+переиспользованы, измененные будут перестроены.
+
+## Dataset Contract
 
 Raw parquet split содержит одну строку на sample:
 
@@ -122,9 +203,9 @@ Raw parquet split содержит одну строку на sample:
 }
 ```
 
-`type` является единственным authoritative route column на raw boundary.
-`loss_kind` не выводится из содержимого `data`. Колонка `target` в raw parquet
-сейчас не поддерживается и считается schema error.
+`type` является единственной authoritative route column. Колонка `target` не
+поддерживается и считается schema error. `loss_kind` не выводится из JSON
+payload.
 
 SFT/tool payload:
 
@@ -164,21 +245,25 @@ Loss считается только на выбранных assistant completio
 - все assistant messages в `sft_tool`;
 - final assistant answer after tool response;
 - stop/end-of-message token выбранной completion;
-- selected chosen/rejected completion tokens для DPO sequence logprobs.
+- selected DPO chosen/rejected completion tokens при расчете sequence logprobs.
 
 ## DPO
 
-`dpo_target` является поддержанным route:
+`dpo_target` является активным route.
 
-- preprocessing рендерит `prompt + chosen` и `prompt + rejected` отдельно;
-- collator паддит chosen/rejected branches независимо;
-- trainer считает DPO loss через `losses.dpo.dpo_loss`;
-- reference policy берется из source base model до подключения LoRA;
-- reference logprobs считаются отдельным pre-training stage после dataloaders и
-  кэшируются в `{project.output_dir}/ref_logprobs/<signature>`;
-- DPO loss использует только precomputed reference logprobs из batch cache.
+Pipeline:
 
-Relevant YAML:
+```text
+raw dpo_target
+  -> prompt+chosen / prompt+rejected render
+  -> branch-local labels
+  -> routed DPO collator
+  -> optional ref-logprob cache
+  -> DPO loss in RoutedTrainer
+```
+
+Reference logprobs считаются в training phase, потому что им нужна модель.
+Стадия distributed-safe: все ranks участвуют после создания Accelerator.
 
 ```yaml
 loss_routing:
@@ -193,17 +278,49 @@ loss_routing:
       cache_required: false
 ```
 
-## Epochs И Batches
+`cache_refresh=true` пересчитывает ref-logprob cache. `cache_required=true`
+превращает incomplete/missing cache для DPO rows в ошибку.
 
-Продолжительность задается через `training.num_epochs`. Число optimizer steps
-вычисляется из train DataLoader, числа процессов и
-`gradient_accumulation_steps`.
+## FSDP И Память
 
-Route frequency определяется составом датасета. Sampler weights не
-поддерживаются. `RoutedBatchSampler` строит route-local batches и затем
-детерминированно перемешивает список batches seed-ом `project.seed`.
+Training всегда запускается через Accelerate/FSDP:
 
-## Evaluation И Selection
+```yaml
+distributed:
+  fsdp:
+    sharding_strategy: full_shard
+    mixed_precision: bf16
+    activation_checkpointing: true
+    state_dict_type: sharded_state_dict
+    use_orig_params: true
+    cpu_ram_efficient_loading: true
+    sync_module_states: true
+```
+
+Практические правила:
+
+- `use_orig_params: true` нужен для LoRA + frozen base/frozen embeddings. При
+  `use_orig_params: false` FSDP требует uniform `requires_grad` внутри flatten
+  group и будет падать на смешанных frozen/trainable tensors.
+- `mixed_precision: bf16` относится к FSDP mixed precision policy. Это не то
+  же самое, что запуск всего обучения в fp32.
+- `model.precision: bf16` управляет dtype загрузки модели.
+- `activation_checkpointing: true` снижает memory pressure ценой compute.
+- `cpu_ram_efficient_loading: true` и `sync_module_states: true` помогают не
+  материализовать полный payload независимо на каждом rank во время загрузки.
+- `per_device_train_batch_size` и `preprocessing.sequence.max_seq_len` сильнее
+  всего влияют на VRAM во время forward/backward.
+
+Если нужно проверить, что distributed sampler не расходится по routes, смотрите
+в логи dataloader:
+
+```text
+replica_group_size=<num_processes>
+padded_replica_batches=<...>
+loss_kinds={'sft_target': ..., 'sft_tool': ..., 'dpo_target': ...}
+```
+
+## Evaluation И Registry
 
 Validation boundary:
 
@@ -211,7 +328,7 @@ Validation boundary:
 ordinary eval -> optional BFCL eval -> checkpoint -> candidate selection
 ```
 
-Ordinary validation возвращает:
+Ordinary metrics:
 
 ```text
 eval/loss
@@ -221,10 +338,10 @@ eval/tokens
 eval/supervised_tokens
 ```
 
-Bundled RU BFCL включается через `eval.bfcl.enabled`. Dataset bundled в
+BFCL включается через `eval.bfcl.enabled`. RU BFCL dataset bundled в
 `src/eval/ru_bfcl/data/bfcl_eval.jsonl`; путь не конфигурируется.
 
-Registry selection задается явно:
+Registry selection:
 
 ```yaml
 registry:
@@ -234,18 +351,14 @@ registry:
     mode: min
 ```
 
-Для запуска без BFCL:
+Training регистрирует только candidate aliases:
 
-```yaml
-eval:
-  bfcl:
-    enabled: false
-
-registry:
-  selection:
-    metric: eval/loss
-    mode: min
+```text
+candidate-000001
+candidate-latest
 ```
+
+Promotion в `baseline` или `champion` training loop не выполняет.
 
 ## Checkpoints И Resume
 
@@ -261,18 +374,70 @@ Checkpoints сохраняются атомарно:
 └── checksums.json
 ```
 
-`adapter/` сохраняет только trainable PEFT adapter parameters. Full base model
-state dict не материализуется в checkpoint package; base lineage и source hash
-восстанавливаются через registry source metadata.
+`adapter/` содержит только trainable PEFT adapter parameters. Full base model
+state dict не материализуется в checkpoint package.
 
-Auto-resume ищет последний валидный `step-NNNNNN` в derived checkpoint
-directory. Strict resume сравнивает effective config, dataset manifest,
-data/training contracts, actual tokenizer chat template hash и verified source
-model payload hash.
+Auto-resume ищет последний валидный `step-NNNNNN` в
+`{project.output_dir}/checkpoints`. Strict resume контролируется:
+
+```yaml
+checkpointing:
+  resume:
+    enabled: true
+    strict_config: true
+    strict_dataset_hash: true
+    strict_template_hash: true
+    strict_model_source_hash: true
+```
+
+Если меняете датасет, tokenizer, source model или training-critical config,
+ожидайте strict resume error и начинайте новый `project.output_dir` либо
+осознанно меняйте resume policy.
+
+## Типовые Команды
+
+Prepare:
+
+```bash
+estadel-prepare --config configs/config.yaml
+```
+
+Force prepare:
+
+```bash
+estadel-prepare --config configs/config.yaml --force
+```
+
+Train на 2 GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+accelerate launch --use_fsdp --num_processes 2 \
+  estadel-train --config configs/config.yaml
+```
+
+С явным debug для NCCL:
+
+```bash
+TORCH_DISTRIBUTED_DEBUG=DETAIL \
+TORCH_NCCL_TRACE_BUFFER_SIZE=1048576 \
+TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
+NCCL_DEBUG=INFO \
+NCCL_DEBUG_SUBSYS=INIT,COLL \
+accelerate launch --use_fsdp --num_processes 2 \
+  estadel-train --config configs/config.yaml
+```
+
+Source-tree module fallback в editable checkout:
+
+```bash
+PYTHONPATH=src python -m prepare --config configs/config.yaml
+PYTHONPATH=src accelerate launch --use_fsdp --num_processes 2 -m train --config configs/config.yaml
+```
 
 ## RU BFCL CLI
 
-Standalone validator entrypoint:
+Standalone validator:
 
 ```bash
 ru-bfcl-eval --help

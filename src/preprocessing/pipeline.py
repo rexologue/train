@@ -641,6 +641,7 @@ def preprocess_split(
     config: Config,
     *,
     preprocessing_signature: str | None = None,
+    force_refresh: bool = False,
 ) -> PretokSplitResult:
     """Prepare or reuse one pretokenized split cache.
 
@@ -659,7 +660,7 @@ def preprocess_split(
     max_seq_len = configured_max_seq_len(config)
     cache_valid, cache_manifest = split_cache_is_valid(output_dir, split, raw_hash, preprocessing_signature)
 
-    if cache_valid and cache_manifest is not None:
+    if cache_valid and cache_manifest is not None and not force_refresh:
         logger.info("reusing pretokenized %s split from %s", split, pretok_path)
         row_counts = (cache_manifest.get("rows") or {}).get(split) or {}
         legacy_split = (cache_manifest.get("splits") or {}).get(split)
@@ -753,6 +754,7 @@ def prepare_pretokenized_splits(
     splits: list[str],
     *,
     model_source: Any | None = None,
+    force_refresh: bool = False,
 ) -> list[PretokSplitResult]:
     """Build or reuse the tokenized training-data cache.
 
@@ -786,6 +788,7 @@ def prepare_pretokenized_splits(
                 tokenizer,
                 config,
                 preprocessing_signature=preprocessing_signature,
+                force_refresh=force_refresh,
             )
         )
     return results
