@@ -25,20 +25,82 @@ def sequence_logps(
 ) -> Any:
     """Return summed log probabilities over label-selected completion tokens."""
 
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-    )
-    logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
-    shift_logits = logits[:, :-1, :]
-    shift_input_ids = input_ids[:, 1:]
     shift_labels = labels[:, 1:]
     loss_mask = shift_labels != int(ignore_index)
+    keep_positions = selected_logit_positions(loss_mask)
+    if keep_positions.numel() == 0:
+        return input_ids.new_zeros((input_ids.shape[0],), dtype=torch.float32)
+
+    outputs = call_model_for_sequence_logps(
+        model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        logits_to_keep=keep_positions,
+    )
+    logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
+    shift_logits, shift_input_ids, loss_mask = align_kept_logits(
+        logits=logits,
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        keep_positions=keep_positions,
+    )
     target_logits = shift_logits.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
     log_normalizers = torch.logsumexp(shift_logits, dim=-1)
     gathered = target_logits - log_normalizers
     return (gathered.float() * loss_mask).sum(dim=-1)
+
+
+def selected_logit_positions(loss_mask: Any) -> Any:
+    """Return original-logit positions required for any selected label in the batch."""
+
+    selected_columns = torch.nonzero(loss_mask.any(dim=0), as_tuple=False).flatten()
+    return selected_columns.to(device=loss_mask.device, dtype=torch.long)
+
+
+def call_model_for_sequence_logps(
+    model: Any,
+    *,
+    input_ids: Any,
+    attention_mask: Any,
+    logits_to_keep: Any,
+) -> Any:
+    """Call model with compact logits when supported, fallback for older test doubles/models."""
+
+    kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "use_cache": False,
+        "logits_to_keep": logits_to_keep,
+    }
+    try:
+        return model(**kwargs)
+    except TypeError as exc:
+        if "logits_to_keep" not in str(exc):
+            raise
+        kwargs.pop("logits_to_keep")
+        return model(**kwargs)
+
+
+def align_kept_logits(
+    *,
+    logits: Any,
+    input_ids: Any,
+    loss_mask: Any,
+    keep_positions: Any,
+) -> tuple[Any, Any, Any]:
+    """Align compact `logits_to_keep` outputs with target ids and loss mask.
+
+    Qwen-style models support `logits_to_keep=<positions>` and return logits
+    only for those original hidden-state positions. Some test doubles or older
+    models may ignore the kwarg and return full sequence logits; keep that path
+    working without changing the DPO math.
+    """
+
+    if logits.shape[1] == keep_positions.numel():
+        target_positions = keep_positions + 1
+        return logits, input_ids[:, target_positions], loss_mask[:, keep_positions]
+
+    return logits[:, :-1, :], input_ids[:, 1:], loss_mask
 
 
 def dpo_loss(
