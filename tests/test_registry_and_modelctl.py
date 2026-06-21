@@ -15,6 +15,7 @@ from registry.package import build_candidate_registration_request
 from registry.selection import CandidateWindowSelector, CheckpointCandidate, RegistrationDecision
 from registry.tags import validate_training_aliases
 from conftest import example_config
+from train import prune_checkpoint_retention
 
 
 def test_candidate_window_selector_registers_best_checkpoint_after_window(tmp_path) -> None:
@@ -58,7 +59,7 @@ def test_build_candidate_registration_request_writes_modelctl_tags(tmp_path) -> 
         checkpoint_index=1,
         global_step=100,
         metric_value=0.91,
-        metrics={"eval/loss": 0.91},
+        metrics={"eval/sft/loss": 0.91},
     )
     decision = RegistrationDecision(
         checkpoint=checkpoint,
@@ -77,7 +78,7 @@ def test_build_candidate_registration_request_writes_modelctl_tags(tmp_path) -> 
     training_tags = json.loads(request.training_tags_json.read_text(encoding="utf-8"))
     assert general_tags["artifact.kind"] == "peft_adapter_checkpoint"
     assert training_tags["training.registry_role"] == "candidate"
-    assert training_tags["training.selection_metric"] == "eval/loss"
+    assert training_tags["training.selection_metric"] == "eval/sft/loss"
 
 
 def test_modelctl_client_builds_register_command_and_rejects_production_aliases() -> None:
@@ -148,3 +149,44 @@ def test_modelctl_client_parses_trailing_json_after_progress_logs() -> None:
     payload = parse_modelctl_json_stdout(stdout, ["modelctl", "register"])
 
     assert payload == {"name": "dialog-model", "version": "7", "aliases": ["candidate-latest"]}
+
+
+def test_async_registry_pending_paths_only_protect_until_flush(tmp_path) -> None:
+    config = example_config(
+        project={"output_dir": str(tmp_path / "run")},
+        checkpointing={"save_total_limit": 2},
+    )
+    checkpoint_root = config.checkpoint_dir
+    checkpoints = []
+    for index in range(1, 4):
+        checkpoint = checkpoint_root / f"step-{index:06d}"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "manifest.json").write_text(json.dumps({"global_step": index}), encoding="utf-8")
+        checkpoints.append(checkpoint)
+
+    pending = set(checkpoints)
+
+    protected_deleted = prune_checkpoint_retention(
+        config,
+        registry_selector=None,
+        pending_registration_paths=pending,
+        protect_pending_registry=True,
+    )
+
+    assert protected_deleted == []
+    assert [path.name for path in checkpoints if path.exists()] == [
+        "step-000001",
+        "step-000002",
+        "step-000003",
+    ]
+
+    flushed_deleted = prune_checkpoint_retention(
+        config,
+        registry_selector=None,
+        pending_registration_paths=pending,
+        protect_pending_registry=False,
+    )
+
+    assert [path.name for path in flushed_deleted] == ["step-000001"]
+    assert pending == set()
+    assert [path.name for path in checkpoints if path.exists()] == ["step-000002", "step-000003"]

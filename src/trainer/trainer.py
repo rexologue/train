@@ -156,6 +156,8 @@ class RoutedTrainer:
             else state.consumed_batches + (total_steps - state.global_step) * grad_accum
         )
         batches_per_epoch = len(train_dataloader) if exact_epoch_mode else 0  # type: ignore[arg-type]
+        if exact_epoch_mode:
+            _set_epoch(train_dataloader, state.consumed_batches // batches_per_epoch)
 
         accumulated_loss = 0.0
         step_samples = 0
@@ -201,6 +203,8 @@ class RoutedTrainer:
                 accumulated_batches += 1
 
             epoch_boundary = exact_epoch_mode and state.consumed_batches % batches_per_epoch == 0
+            if epoch_boundary:
+                _set_epoch(train_dataloader, state.consumed_batches // batches_per_epoch)
             should_step = (
                 accumulated_batches >= accumulation_target
                 or epoch_boundary
@@ -372,3 +376,9 @@ def _advance_iterator(iterator: Any, iterable: Iterable[Any], consumed_batches: 
     for _ in range(to_skip):
         _batch, iterator = _cycle_next(iterator, iterable)
     return iterator
+
+
+def _set_epoch(iterable: Iterable[Any], epoch: int) -> None:
+    batch_sampler = getattr(iterable, "batch_sampler", None)
+    if hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)

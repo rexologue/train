@@ -42,8 +42,16 @@ ASSISTANT_HEADER = "<|im_start|>assistant\n"
 IM_END = "<|im_end|>"
 THINK_BLOCK_RE = re.compile(r"<think>\s*(.*?)\s*</think>\s*", re.IGNORECASE | re.DOTALL)
 UNKNOWN_MODEL_CONTEXT_THRESHOLD = 1_000_000_000
-PREPROCESSING_SCHEMA_VERSION = 3
+PREPROCESSING_SCHEMA_VERSION = 4
 AUDIT_EXAMPLES_PER_LOSS_KIND = 5
+TOKENIZER_SIGNATURE_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer.model",
+)
 
 
 def load_tokenizer(config: Config) -> Any:
@@ -98,7 +106,7 @@ def validate_configured_max_seq_len(config: Config, tokenizer: Any) -> int:
     return max_seq_len
 
 
-def build_preprocessing_signature(config: Config, tokenizer: Any) -> str:
+def build_preprocessing_signature(config: Config, tokenizer: Any, *, model_source: Any | None = None) -> str:
     """Hash the per-split tokenization/masking contract used for cache reuse."""
 
     preprocessing = config.to_dict()["preprocessing"]
@@ -109,15 +117,34 @@ def build_preprocessing_signature(config: Config, tokenizer: Any) -> str:
             "rendering": preprocessing["rendering"],
             "reasoning": preprocessing["reasoning"],
             "masking": preprocessing["masking"],
+            "quality": preprocessing["quality"],
+            "model": {
+                "ref": getattr(model_source, "ref", None),
+                "expected_payload_hash": getattr(model_source, "expected_payload_hash", None),
+                "source_dir_hash": getattr(model_source, "source_dir_hash", None),
+                "cache_dir": str(config.model.cache_dir),
+            },
             "tokenizer": {
                 "effective_id": str(config.model.cache_dir),
                 "use_fast": config.tokenizer.use_fast,
                 "add_special_tokens": config.tokenizer.add_special_tokens,
                 "class": tokenizer.__class__.__name__,
                 "chat_template_hash": sha256_text(getattr(tokenizer, "chat_template", "") or ""),
+                "artifact_hashes": tokenizer_artifact_hashes(config.model.cache_dir),
             },
         }
     )
+
+
+def tokenizer_artifact_hashes(model_dir: Path) -> dict[str, str]:
+    """Hash tokenizer files that affect token ids or special-token behavior."""
+
+    hashes: dict[str, str] = {}
+    for name in TOKENIZER_SIGNATURE_FILES:
+        path = model_dir / name
+        if path.is_file():
+            hashes[name] = file_sha256(path)
+    return hashes
 
 
 def enforce_max_seq_len(processed: dict[str, Any], max_seq_len: int) -> None:
@@ -128,6 +155,58 @@ def enforce_max_seq_len(processed: dict[str, Any], max_seq_len: int) -> None:
         tokens = processed.get(field)
         if isinstance(tokens, list) and len(tokens) > max_seq_len:
             raise ValueError(f"{field} length={len(tokens)} exceeds preprocessing.sequence.max_seq_len={max_seq_len}; truncation=false")
+
+
+def processed_token_stats(processed: dict[str, Any]) -> tuple[int, int]:
+    """Return total and supervised token counts for SFT or DPO processed rows."""
+
+    if processed.get("loss_kind") == "dpo_target":
+        total = int(processed.get("chosen_length") or 0) + int(processed.get("rejected_length") or 0)
+        supervised = int(processed.get("chosen_completion_token_count") or 0) + int(
+            processed.get("rejected_completion_token_count") or 0
+        )
+        return total, supervised
+    return int(processed.get("length") or 0), int(processed.get("num_supervised_tokens") or 0)
+
+
+def enforce_preprocessing_quality(
+    *,
+    split: str,
+    config: Config,
+    num_raw_rows: int,
+    rejected_rows: list[dict[str, Any]],
+    stats: Counter[str],
+) -> None:
+    """Fail before training when preprocessing silently loses too much data."""
+
+    if split not in {"train", "valid"}:
+        return
+
+    quality = config.preprocessing.quality
+    rejected_fraction = (len(rejected_rows) / num_raw_rows) if num_raw_rows else 0.0
+    if rejected_fraction > quality.max_rejected_fraction:
+        raise ValueError(
+            f"{split} preprocessing rejected fraction {rejected_fraction:.4f} exceeds "
+            f"preprocessing.quality.max_rejected_fraction={quality.max_rejected_fraction:.4f}"
+        )
+
+    configured_routes = set(config.loss_routing.routes)
+    for loss_kind, minimum in quality.min_processed_rows_per_loss_kind.items():
+        if loss_kind not in configured_routes or minimum <= 0:
+            continue
+        count = int(stats.get(f"processed_loss_kind/{loss_kind}", 0))
+        if count < minimum:
+            raise ValueError(
+                f"{split} preprocessing produced {count} rows for {loss_kind}, below "
+                f"preprocessing.quality.min_processed_rows_per_loss_kind.{loss_kind}={minimum}"
+            )
+
+    supervised_tokens = int(stats.get("supervised_tokens", 0))
+    if supervised_tokens < quality.min_supervised_tokens:
+        raise ValueError(
+            f"{split} preprocessing produced {supervised_tokens} supervised tokens, below "
+            f"preprocessing.quality.min_supervised_tokens={quality.min_supervised_tokens}"
+        )
 
 
 def decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
@@ -629,8 +708,17 @@ def preprocess_split(
         debug_rows.append(debug)
         stats.update(row_stats)
         stats[f"processed_loss_kind/{row['loss_kind']}"] += 1
-        stats["tokens"] += int(processed.get("length") or 0)
-        stats["supervised_tokens"] += int(processed.get("num_supervised_tokens") or 0)
+        token_count, supervised_token_count = processed_token_stats(processed)
+        stats["tokens"] += token_count
+        stats["supervised_tokens"] += supervised_token_count
+
+    enforce_preprocessing_quality(
+        split=split,
+        config=config,
+        num_raw_rows=len(rows),
+        rejected_rows=rejected_rows,
+        stats=stats,
+    )
 
     base_manifest = load_manifest(output_dir) or {}
     split_manifest = {
@@ -663,6 +751,8 @@ def preprocess_split(
 def prepare_pretokenized_splits(
     config: Config,
     splits: list[str],
+    *,
+    model_source: Any | None = None,
 ) -> list[PretokSplitResult]:
     """Build or reuse the tokenized training-data cache.
 
@@ -677,7 +767,7 @@ def prepare_pretokenized_splits(
     tokenizer = load_tokenizer(config)
     max_seq_len = validate_configured_max_seq_len(config, tokenizer)
     model_context = tokenizer_model_context(tokenizer)
-    preprocessing_signature = build_preprocessing_signature(config, tokenizer)
+    preprocessing_signature = build_preprocessing_signature(config, tokenizer, model_source=model_source)
     logger.info(
         "tokenizer loaded: class=%s fast=%s template_hash=%s max_seq_len=%s model_context=%s",
         tokenizer.__class__.__name__,

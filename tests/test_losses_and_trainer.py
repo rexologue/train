@@ -56,6 +56,7 @@ def test_sft_loss_computes_masked_ce_without_model_labels() -> None:
     assert model.seen_kwargs == {
         "input_ids": batch["input_ids"],
         "attention_mask": batch["attention_mask"],
+        "use_cache": False,
     }
 
 

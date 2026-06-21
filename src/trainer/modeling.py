@@ -51,10 +51,25 @@ def load_base_model(config: Config) -> Any:
     if model_cfg.experts_implementation is not None:
         kwargs["experts_implementation"] = model_cfg.experts_implementation
 
-    return AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         str(model_cfg.cache_dir),
         **kwargs,
     )
+    disable_model_kv_cache(model)
+    return model
+
+
+def disable_model_kv_cache(model: Any) -> None:
+    """Disable generation KV cache for full-sequence train/eval forwards."""
+
+    model_config = getattr(model, "config", None)
+    if model_config is not None and hasattr(model_config, "use_cache"):
+        model_config.use_cache = False
+
+    base_model = getattr(model, "base_model", None)
+    base_config = getattr(base_model, "config", None)
+    if base_config is not None and hasattr(base_config, "use_cache"):
+        base_config.use_cache = False
 
 
 def validate_model_runtime_requirements(config: Config) -> None:
@@ -104,9 +119,7 @@ def configure_gradient_checkpointing(model: Any, config: Config) -> None:
     if not config.model.gradient_checkpointing:
         return
 
-    model_config = getattr(model, "config", None)
-    if model_config is not None and hasattr(model_config, "use_cache"):
-        model_config.use_cache = False
+    disable_model_kv_cache(model)
 
     if not hasattr(model, "gradient_checkpointing_enable"):
         raise TypeError("model.gradient_checkpointing=true requires gradient_checkpointing_enable()")
@@ -194,6 +207,7 @@ def build_training_objects(
         if resume_adapter_path is not None
         else apply_lora(config, base_model)
     )
+    disable_model_kv_cache(model)
     configure_gradient_checkpointing(model, config)
     freeze_configured_modules(model, config)
 

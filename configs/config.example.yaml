@@ -83,6 +83,14 @@ preprocessing:
         loss_on_short_assistant_reply_prob: 0.3
         short_response_sampling_seed: 42
 
+  quality:
+    max_rejected_fraction: 0.05
+    min_processed_rows_per_loss_kind:
+      sft_target: 1
+      sft_tool: 1
+      dpo_target: 1
+    min_supervised_tokens: 1
+
 loss_routing:
   # Route frequency is determined by dataset composition. No sampler weights.
   # `dpo_target` is a supported active route; remove it only when the dataset
@@ -144,13 +152,13 @@ eval:
   standard:
     max_batches: 50
   bfcl:
-    enabled: true
-    run_every_n_validations: 1
+    enabled: false
+    run_every_n_validations: 4
     include_multi_turn: true
     categories: null
-    limit: null
+    limit: 100
     generation:
-      max_new_tokens: 1024
+      max_new_tokens: 256
       temperature: 0.0
       top_p: 1.0
       do_sample: false
@@ -179,10 +187,11 @@ registry:
   # Training registers candidate aliases only. Production promotion is separate.
   register_every_n_checkpoints: 5
   selection:
-    # Ordinary metrics: eval/loss, eval/ppl, eval/batches, eval/tokens,
-    # eval/supervised_tokens.
+    # Ordinary metrics: eval/sft/loss, eval/sft/ppl, eval/dpo/loss,
+    # eval/dpo/accuracy, eval/dpo/reward_margin, plus legacy aggregate
+    # eval/loss for dashboards only.
     # BFCL metrics: eval/bfcl/accuracy, eval/bfcl/total, eval/bfcl/passed,
     # eval/bfcl/failed, eval/bfcl/<category>/accuracy,
     # eval/bfcl/<category>/total.
-    metric: eval/loss
+    metric: eval/sft/loss
     mode: min

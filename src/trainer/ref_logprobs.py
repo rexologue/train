@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import shutil
+import time
 from typing import Any
 
 import torch
@@ -55,6 +57,23 @@ def ensure_ref_logprob_cache(
         return state
 
     if is_main_process:
+        estimate = estimate_ref_logprob_work(
+            dataloaders,
+            num_processes=int(getattr(accelerator, "num_processes", 1)),
+        )
+        logger.info(
+            "DPO ref-logprob cache sizing: rows=%s chosen_tokens=%s rejected_tokens=%s total_tokens=%s "
+            "batch_size=%s num_processes=%s forward_batches_per_rank=%s total_forward_calls=%s cache_required=%s",
+            estimate["rows"],
+            estimate["chosen_tokens"],
+            estimate["rejected_tokens"],
+            estimate["total_tokens"],
+            estimate["batch_size"],
+            estimate["num_processes"],
+            estimate["forward_batches_per_rank"],
+            estimate["total_forward_calls"],
+            reference.cache_required,
+        )
         logger.info(
             "DPO ref-logprob cache precompute required: complete=%s missing=%s refresh=%s path=%s",
             state.complete,
@@ -62,6 +81,7 @@ def ensure_ref_logprob_cache(
             reference.cache_refresh,
             state.cache_dir,
         )
+    started_at = time.monotonic()
     compute_ref_logprob_cache(
         config=config,
         dataloaders=dataloaders,
@@ -69,10 +89,56 @@ def ensure_ref_logprob_cache(
         cache_dir=state.cache_dir,
         total_rows=dpo_rows,
     )
+    if is_main_process:
+        elapsed = max(time.monotonic() - started_at, 1e-9)
+        estimate = estimate_ref_logprob_work(
+            dataloaders,
+            num_processes=int(getattr(accelerator, "num_processes", 1)),
+        )
+        logger.info(
+            "DPO ref-logprob cache precompute finished: rows=%s elapsed_seconds=%.2f rows_per_second=%.4f "
+            "tokens_per_second=%.2f path=%s",
+            estimate["rows"],
+            elapsed,
+            estimate["rows"] / elapsed,
+            estimate["total_tokens"] / elapsed,
+            state.cache_dir,
+        )
     state = load_and_apply_ref_logprob_cache(config, dataloaders, model_source=model_source)
     if state.missing_rows:
         raise ValueError(f"DPO reference-logprob cache remains incomplete: missing rows={state.missing_rows}")
     return state
+
+
+def estimate_ref_logprob_work(dataloaders: DataLoaderBundle, *, num_processes: int) -> dict[str, int]:
+    """Estimate DPO reference precompute size before loading the reference model."""
+
+    rows = 0
+    chosen_tokens = 0
+    rejected_tokens = 0
+    forward_batches_per_rank = 0
+    batch_size = 1
+    processes = max(int(num_processes), 1)
+    for split_loader in dataloaders.splits.values():
+        split_rows = [row for row in split_loader.dataset.rows if row.get("loss_kind") == "dpo_target"]
+        if not split_rows:
+            continue
+        batch_size = max(int(split_loader.summary["batch_size"]), 1)
+        rows += len(split_rows)
+        chosen_tokens += sum(int(row.get("chosen_length") or len(row.get("chosen_input_ids") or [])) for row in split_rows)
+        rejected_tokens += sum(int(row.get("rejected_length") or len(row.get("rejected_input_ids") or [])) for row in split_rows)
+        balanced_rows_per_rank = math.ceil(len(split_rows) / processes)
+        forward_batches_per_rank += math.ceil(balanced_rows_per_rank / batch_size) * 2
+    return {
+        "rows": rows,
+        "chosen_tokens": chosen_tokens,
+        "rejected_tokens": rejected_tokens,
+        "total_tokens": chosen_tokens + rejected_tokens,
+        "batch_size": batch_size,
+        "num_processes": processes,
+        "forward_batches_per_rank": forward_batches_per_rank,
+        "total_forward_calls": forward_batches_per_rank * processes,
+    }
 
 
 def compute_ref_logprob_cache(
@@ -188,6 +254,7 @@ def build_base_reference_policy(config: Any) -> Any:
 
     from trainer.modeling import (
         cast_floating_parameters,
+        disable_model_kv_cache,
         load_base_model,
         precision_to_dtype,
         validate_model_runtime_requirements,
@@ -195,6 +262,7 @@ def build_base_reference_policy(config: Any) -> Any:
 
     validate_model_runtime_requirements(config)
     model = load_base_model(config)
+    disable_model_kv_cache(model)
     cast_floating_parameters(model, precision_to_dtype(config.model.precision))
     if hasattr(model, "eval"):
         model.eval()

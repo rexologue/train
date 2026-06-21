@@ -32,6 +32,18 @@ REGISTRY_SELECTION_METRICS = {
     "eval/batches",
     "eval/tokens",
     "eval/supervised_tokens",
+    "eval/sft/loss",
+    "eval/sft/ppl",
+    "eval/sft/batches",
+    "eval/sft/tokens",
+    "eval/sft/supervised_tokens",
+    "eval/dpo/loss",
+    "eval/dpo/accuracy",
+    "eval/dpo/reward_margin",
+    "eval/dpo/batches",
+    "eval/dpo/pairs",
+    "eval/dpo/tokens",
+    "eval/dpo/supervised_tokens",
     "eval/bfcl/accuracy",
     "eval/bfcl/total",
     "eval/bfcl/passed",
@@ -359,17 +371,59 @@ class MaskingConfig:
 
 
 @dataclass(frozen=True)
+class PreprocessingQualityConfig:
+    max_rejected_fraction: float
+    min_processed_rows_per_loss_kind: dict[str, int]
+    min_supervised_tokens: int
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> PreprocessingQualityConfig:
+        data = _mapping(raw, "preprocessing.quality")
+        _reject_unknown(
+            data,
+            {"max_rejected_fraction", "min_processed_rows_per_loss_kind", "min_supervised_tokens"},
+            "preprocessing.quality",
+        )
+
+        max_rejected_fraction = _require_probability(
+            data.get("max_rejected_fraction"),
+            "preprocessing.quality.max_rejected_fraction",
+        )
+        min_rows_raw = _mapping(
+            data.get("min_processed_rows_per_loss_kind"),
+            "preprocessing.quality.min_processed_rows_per_loss_kind",
+        )
+        min_rows = {
+            str(loss_kind): _require_non_negative_int(value, f"preprocessing.quality.min_processed_rows_per_loss_kind.{loss_kind}")
+            for loss_kind, value in min_rows_raw.items()
+        }
+        unknown_loss_kinds = sorted(set(min_rows) - {"sft_target", "sft_tool", "dpo_target"})
+        if unknown_loss_kinds:
+            raise ConfigError(f"Unknown preprocessing.quality loss kinds: {unknown_loss_kinds}")
+
+        return cls(
+            max_rejected_fraction=max_rejected_fraction,
+            min_processed_rows_per_loss_kind=min_rows,
+            min_supervised_tokens=_require_non_negative_int(
+                data.get("min_supervised_tokens"),
+                "preprocessing.quality.min_supervised_tokens",
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class PreprocessingConfig:
     raw: PreprocessingRawConfig
     sequence: SequenceConfig
     rendering: RenderingConfig
     reasoning: ReasoningConfig
     masking: MaskingConfig
+    quality: PreprocessingQualityConfig
 
     @classmethod
     def from_dict(cls, raw: Any) -> PreprocessingConfig:
         data = _mapping(raw, "preprocessing")
-        _reject_unknown(data, {"raw", "sequence", "rendering", "reasoning", "masking"}, "preprocessing")
+        _reject_unknown(data, {"raw", "sequence", "rendering", "reasoning", "masking", "quality"}, "preprocessing")
 
         return cls(
             raw=PreprocessingRawConfig.from_dict(data.get("raw")),
@@ -377,6 +431,7 @@ class PreprocessingConfig:
             rendering=RenderingConfig.from_dict(data.get("rendering")),
             reasoning=ReasoningConfig.from_dict(data.get("reasoning")),
             masking=MaskingConfig.from_dict(data.get("masking")),
+            quality=PreprocessingQualityConfig.from_dict(data.get("quality")),
         )
 
 
@@ -958,6 +1013,10 @@ class Config:
             )
 
         metric = self.registry.selection.metric
+        route_types = {route.type for route in self.loss_routing.routes.values()}
+
+        if metric == "eval/loss" and len(route_types) > 1:
+            raise ConfigError("registry.selection.metric=eval/loss cannot be used with mixed SFT/DPO routes")
 
         if metric.startswith("eval/bfcl/") and not self.eval.bfcl.enabled:
             raise ConfigError("registry.selection.metric uses BFCL while eval.bfcl.enabled=false")

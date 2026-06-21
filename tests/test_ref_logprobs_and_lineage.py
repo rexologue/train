@@ -13,6 +13,7 @@ from data.ref_logprobs import (
     write_ref_logprob_split_cache,
 )
 import trainer.ref_logprobs as ref_logprob_pipeline
+from trainer.ref_logprobs import estimate_ref_logprob_work
 from tracking.lineage import collect_tracking_lineage
 from tracking.params import flatten_config_params
 from conftest import example_config, pretok_result
@@ -131,6 +132,30 @@ def test_ref_logprob_pipeline_reuses_complete_cache(tmp_path, monkeypatch) -> No
 
     assert state.complete is True
     assert state.applied_rows == 2
+
+
+def test_ref_logprob_work_estimate_reports_forward_batches(tmp_path) -> None:
+    train_path = tmp_path / "train.parquet"
+    valid_path = tmp_path / "valid.parquet"
+    write_dpo_pretok(train_path)
+    write_dpo_pretok(valid_path)
+    config = example_config(
+        project={"output_dir": str(tmp_path / "run")},
+        training={"per_device_train_batch_size": 1},
+    )
+    bundle = build_dataloaders(
+        config,
+        [pretok_result("train", train_path), pretok_result("valid", valid_path)],
+        pad_token_id=0,
+    )
+
+    estimate = estimate_ref_logprob_work(bundle, num_processes=2)
+
+    assert estimate["rows"] == 2
+    assert estimate["chosen_tokens"] == 4
+    assert estimate["rejected_tokens"] == 4
+    assert estimate["forward_batches_per_rank"] == 4
+    assert estimate["total_forward_calls"] == 8
 
 
 def test_ref_logprob_pipeline_rejects_disabled_cache_with_dpo_rows(tmp_path) -> None:

@@ -11,6 +11,7 @@ def sft_cross_entropy_loss(model: Any, batch: dict[str, Any], *, ignore_index: i
     outputs = model(
         input_ids=batch["input_ids"],
         attention_mask=batch.get("attention_mask"),
+        use_cache=False,
     )
     logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
     shift_logits = logits[:, :-1, :].contiguous()

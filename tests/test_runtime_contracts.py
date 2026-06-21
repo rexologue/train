@@ -8,7 +8,7 @@ from config import ConfigError, load_config
 from checkpointing.save import trainable_state_dict
 from conftest import example_config
 from trainer.distributed import configure_ignored_tied_embeddings, tied_frozen_embedding_modules
-from trainer.modeling import configure_gradient_checkpointing, freeze_configured_modules
+from trainer.modeling import configure_gradient_checkpointing, disable_model_kv_cache, freeze_configured_modules
 
 
 def test_example_config_loads_with_dpo_route() -> None:
@@ -18,6 +18,9 @@ def test_example_config_loads_with_dpo_route() -> None:
     assert config.loss_routing.dpo.reference.cache_enabled is True
     assert config.model.gradient_checkpointing is False
     assert config.distributed.fsdp.activation_checkpointing is True
+    assert config.eval.bfcl.enabled is False
+    assert config.eval.bfcl.limit == 100
+    assert config.registry.selection.metric == "eval/sft/loss"
     assert config.output_dir.as_posix().endswith("qwen35-a3b-lora-sft-dpo-v1")
 
 
@@ -139,3 +142,11 @@ def test_model_runtime_flags_are_applied() -> None:
     assert model.router.weight.requires_grad is False
     assert model.gate.weight.requires_grad is False
     assert model.gate_proj.weight.requires_grad is True
+
+
+def test_model_kv_cache_is_disabled_without_gradient_checkpointing() -> None:
+    model = TinyModel()
+
+    disable_model_kv_cache(model)
+
+    assert model.config.use_cache is False

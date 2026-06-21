@@ -67,6 +67,8 @@ class BFCLModelPredictor:
             attention_mask = torch.cat([attention_mask, (~finished).to(attention_mask.dtype)[:, None]], dim=-1)
             if eos_token_ids:
                 finished = finished | token_is_in(selected, eos_token_ids)
+                if bool(finished.all().item()):
+                    break
 
         return generated
 

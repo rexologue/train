@@ -75,6 +75,18 @@ def test_routed_sampler_drop_last_discards_short_route_batches() -> None:
     assert list(sampler) == [[0, 1]]
 
 
+def test_routed_sampler_reshuffles_inside_route_per_epoch() -> None:
+    loss_kinds = ["sft_target"] * 8
+    sampler = RoutedBatchSampler(loss_kinds, batch_size=2, seed=5, shuffle=True)
+    epoch_zero = list(sampler)
+
+    sampler.set_epoch(1)
+    epoch_one = list(sampler)
+
+    assert epoch_zero != epoch_one
+    assert sorted(index for batch in epoch_one for index in batch) == list(range(8))
+
+
 def test_routed_collator_pads_sft_and_dpo() -> None:
     collator = RoutedCollator(pad_token_id=0, ignore_index=-100)
 

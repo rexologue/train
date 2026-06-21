@@ -89,7 +89,11 @@ def main() -> None:
 
         if is_main_process:
             logger.info("building training data cache")
-            results = prepare_pretokenized_splits(config, ["train", "valid", "test"])
+            results = prepare_pretokenized_splits(
+                config,
+                ["train", "valid", "test"],
+                model_source=tracker.model_source_resolution,
+            )
 
             for result in results:
                 logger.info(
@@ -307,14 +311,11 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
         if decision is not None and async_worker is not None:
             pending_registration_paths.add(decision.checkpoint.path)
 
-        protected_paths = set(pending_registration_paths)
-        if registry_selector is not None:
-            protected_paths.update(registry_selector.window_checkpoint_paths())
-
-        deleted = prune_old_checkpoints(
-            config.checkpoint_dir,
-            config.checkpointing.save_total_limit,
-            protected_paths=protected_paths,
+        deleted = prune_checkpoint_retention(
+            config,
+            registry_selector,
+            pending_registration_paths,
+            protect_pending_registry=True,
         )
 
         for deleted_path in deleted:
@@ -348,19 +349,40 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
             async_worker.flush()
 
         if is_main_process():
-            protected_paths = set(pending_registration_paths)
-            if registry_selector is not None:
-                protected_paths.update(registry_selector.window_checkpoint_paths())
-            deleted = prune_old_checkpoints(
-                config.checkpoint_dir,
-                config.checkpointing.save_total_limit,
-                protected_paths=protected_paths,
+            deleted = prune_checkpoint_retention(
+                config,
+                registry_selector,
+                pending_registration_paths,
+                protect_pending_registry=False,
             )
 
             for deleted_path in deleted:
                 logger.info("pruned old checkpoint after async flush: %s", deleted_path)
 
     return state
+
+
+def prune_checkpoint_retention(
+    config,
+    registry_selector: CandidateWindowSelector | None,
+    pending_registration_paths: set[Path],
+    *,
+    protect_pending_registry: bool,
+) -> list[Path]:
+    protected_paths: set[Path] = set()
+    if protect_pending_registry:
+        protected_paths.update(pending_registration_paths)
+    if registry_selector is not None:
+        protected_paths.update(registry_selector.window_checkpoint_paths())
+
+    deleted = prune_old_checkpoints(
+        config.checkpoint_dir,
+        config.checkpointing.save_total_limit,
+        protected_paths=protected_paths,
+    )
+    if not protect_pending_registry:
+        pending_registration_paths.clear()
+    return deleted
 
 
 def maybe_register_candidate(

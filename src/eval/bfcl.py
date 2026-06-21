@@ -102,15 +102,27 @@ def tool_calls_to_messages(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "type": "function",
                 "function": {
                     "name": str(name or ""),
-                    "arguments": (
-                        arguments
-                        if isinstance(arguments, str)
-                        else json.dumps(arguments or {}, ensure_ascii=False, sort_keys=True)
-                    ),
+                    "arguments": normalize_tool_call_arguments_for_template(arguments),
                 },
             }
         )
     return messages
+
+
+def normalize_tool_call_arguments_for_template(arguments: Any) -> dict[str, Any]:
+    """Return Qwen-template-compatible function arguments for prior tool calls."""
+
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        if not arguments.strip():
+            return {}
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _summary_metrics(summary: dict[str, Any]) -> dict[str, float]:

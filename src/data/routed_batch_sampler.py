@@ -31,6 +31,7 @@ class RoutedBatchSampler:
         self.seed = seed
         self.drop_last = drop_last
         self.shuffle = shuffle
+        self.epoch = 0
 
         groups: dict[str, list[int]] = defaultdict(list)
         for index, loss_kind in enumerate(self.loss_kinds):
@@ -44,16 +45,26 @@ class RoutedBatchSampler:
         """Create route-local batches before deterministic cross-route shuffle."""
 
         batches: list[list[int]] = []
+        rng = random.Random(self.seed + self.epoch)
         for indices in self.groups.values():
-            for start in range(0, len(indices), self.batch_size):
-                batch = indices[start : start + self.batch_size]
+            route_indices = list(indices)
+            if self.shuffle:
+                rng.shuffle(route_indices)
+            for start in range(0, len(route_indices), self.batch_size):
+                batch = route_indices[start : start + self.batch_size]
                 if self.drop_last and len(batch) < self.batch_size:
                     continue
                 batches.append(batch)
         if self.shuffle:
-            rng = random.Random(self.seed)
             rng.shuffle(batches)
         return batches
+
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reshuffle route-local and cross-route batch order for a new epoch."""
+
+        self.epoch = int(epoch)
+        self.batches = self._build_batches()
 
 
     def __iter__(self) -> Iterator[list[int]]:
@@ -91,4 +102,5 @@ class RoutedBatchSampler:
             "drop_last": self.drop_last,
             "shuffle": self.shuffle,
             "seed": self.seed,
+            "epoch": self.epoch,
         }

@@ -28,6 +28,7 @@ def sequence_logps(
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        use_cache=False,
     )
     logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
     shift_logits = logits[:, :-1, :]
