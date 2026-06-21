@@ -147,6 +147,18 @@ preprocessing:
     test_path: data/test.parquet
     test_required: false
 
+  workers:
+    # CPU process workers used only by estadel-prepare. 1 preserves the
+    # deterministic single-process path and is the safest debugging default.
+    # Increase to 4-8 for large datasets after checking host RAM: each worker
+    # loads its own tokenizer and holds one processed chunk at a time.
+    num_workers: 1
+
+    # Rows per worker task. Larger chunks reduce multiprocessing overhead but
+    # increase peak memory per returned chunk. Start with 512 or 1024 for large
+    # parquet splits; lower it when samples are very long.
+    chunk_size: 512
+
   sequence:
     # Hard sequence length after rendering. Larger values improve long-context
     # coverage but increase activation memory roughly linearly. For memory

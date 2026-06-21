@@ -412,6 +412,33 @@ class PreprocessingQualityConfig:
 
 
 @dataclass(frozen=True)
+class PreprocessingWorkersConfig:
+    num_workers: int = 1
+    chunk_size: int = 512
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> PreprocessingWorkersConfig:
+        if raw is None:
+            return cls()
+
+        data = _mapping(raw, "preprocessing.workers")
+        _reject_unknown(data, {"num_workers", "chunk_size"}, "preprocessing.workers")
+
+        return cls(
+            num_workers=_optional_positive_int(
+                data.get("num_workers"),
+                "preprocessing.workers.num_workers",
+                default=1,
+            ),
+            chunk_size=_optional_positive_int(
+                data.get("chunk_size"),
+                "preprocessing.workers.chunk_size",
+                default=512,
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class PreprocessingConfig:
     raw: PreprocessingRawConfig
     sequence: SequenceConfig
@@ -419,11 +446,16 @@ class PreprocessingConfig:
     reasoning: ReasoningConfig
     masking: MaskingConfig
     quality: PreprocessingQualityConfig
+    workers: PreprocessingWorkersConfig
 
     @classmethod
     def from_dict(cls, raw: Any) -> PreprocessingConfig:
         data = _mapping(raw, "preprocessing")
-        _reject_unknown(data, {"raw", "sequence", "rendering", "reasoning", "masking", "quality"}, "preprocessing")
+        _reject_unknown(
+            data,
+            {"raw", "sequence", "rendering", "reasoning", "masking", "quality", "workers"},
+            "preprocessing",
+        )
 
         return cls(
             raw=PreprocessingRawConfig.from_dict(data.get("raw")),
@@ -432,6 +464,7 @@ class PreprocessingConfig:
             reasoning=ReasoningConfig.from_dict(data.get("reasoning")),
             masking=MaskingConfig.from_dict(data.get("masking")),
             quality=PreprocessingQualityConfig.from_dict(data.get("quality")),
+            workers=PreprocessingWorkersConfig.from_dict(data.get("workers")),
         )
 
 
@@ -1096,9 +1129,9 @@ def _require_positive_int(value: Any, name: str) -> int:
     return parsed
 
 
-def _optional_positive_int(value: Any, name: str) -> int | None:
+def _optional_positive_int(value: Any, name: str, default: int | None = None) -> int | None:
     if value is None:
-        return None
+        return default
     return _require_positive_int(value, name)
 
 

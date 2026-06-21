@@ -77,6 +77,10 @@ preprocessing:
     train_path: artifacts/data/train.parquet
     valid_path: artifacts/data/valid.parquet
 
+  workers:
+    num_workers: 1
+    chunk_size: 512
+
 mlflow:
   tracking_uri: http://...
 ```
@@ -117,6 +121,8 @@ Prepare делает только локальную подготовку:
 - переиспользует split cache, если raw hash, pretokenized parquet hash и
   preprocessing signature совпали;
 - перестраивает только отсутствующий или несогласованный split.
+- при `preprocessing.workers.num_workers > 1` делит decoded rows на chunks и
+  обрабатывает их в CPU process pool.
 
 Принудительный rebuild всех pretokenized split caches:
 
@@ -131,6 +137,28 @@ tokenizer, source model или preprocessing settings изменились, prep
 
 Prepare не стартует MLflow training run, не создает Accelerator и не
 инициализирует CUDA/NCCL.
+
+CPU parallel prepare:
+
+```bash
+estadel-prepare --config configs/config.yaml --workers 8 --worker-chunk-size 1024
+```
+
+`--workers` и `--worker-chunk-size` переопределяют только текущий prepare run.
+Если CLI flags не заданы, используются `preprocessing.workers.num_workers` и
+`preprocessing.workers.chunk_size` из YAML. Число workers и размер chunk не
+входят в preprocessing signature: они не меняют tokenization/masking contract,
+а только способ вычисления. Поэтому смена `--workers` не инвалидирует уже
+валидный cache.
+
+Практические ориентиры:
+
+- `num_workers: 1` - лучший режим для отладки и минимальной RAM;
+- `4-8` workers обычно дают хороший прирост на больших parquet splits;
+- каждый worker грузит свой tokenizer и держит один processed chunk, поэтому
+  не ставьте `num_workers=$(nproc)` вслепую;
+- увеличивайте `chunk_size`, если overhead multiprocessing заметен;
+- уменьшайте `chunk_size`, если samples длинные и RAM растет слишком сильно.
 
 ### 2. Train
 
@@ -408,6 +436,12 @@ Force prepare:
 estadel-prepare --config configs/config.yaml --force
 ```
 
+Parallel prepare:
+
+```bash
+estadel-prepare --config configs/config.yaml --workers 8 --worker-chunk-size 1024
+```
+
 Train на 2 GPU:
 
 ```bash
@@ -432,6 +466,7 @@ Source-tree module fallback в editable checkout:
 
 ```bash
 PYTHONPATH=src python -m prepare --config configs/config.yaml
+PYTHONPATH=src python -m prepare --config configs/config.yaml --workers 8
 PYTHONPATH=src accelerate launch --use_fsdp --num_processes 2 -m train --config configs/config.yaml
 ```
 

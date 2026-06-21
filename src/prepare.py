@@ -9,6 +9,13 @@ from utils.logging import configure_logging, get_logger
 from utils.seed import set_seed
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def main() -> None:
     """Prepare local model and preprocessing artifacts before distributed training."""
 
@@ -18,6 +25,18 @@ def main() -> None:
         "--force",
         action="store_true",
         help="rebuild pretokenized split caches even when raw hashes and preprocessing signatures match",
+    )
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=None,
+        help="override preprocessing.workers.num_workers for this prepare run",
+    )
+    parser.add_argument(
+        "--worker-chunk-size",
+        type=positive_int,
+        default=None,
+        help="override preprocessing.workers.chunk_size for this prepare run",
     )
     args = parser.parse_args()
 
@@ -37,12 +56,19 @@ def main() -> None:
         model_source.used_local,
     )
 
-    logger.info("building training data cache force=%s", args.force)
+    logger.info(
+        "building training data cache force=%s workers=%s chunk_size=%s",
+        args.force,
+        args.workers if args.workers is not None else config.preprocessing.workers.num_workers,
+        args.worker_chunk_size if args.worker_chunk_size is not None else config.preprocessing.workers.chunk_size,
+    )
     results = prepare_pretokenized_splits(
         config,
         ["train", "valid", "test"],
         model_source=model_source,
         force_refresh=args.force,
+        num_workers=args.workers,
+        worker_chunk_size=args.worker_chunk_size,
     )
 
     for result in results:

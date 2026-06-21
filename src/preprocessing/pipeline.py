@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import copy
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -52,6 +54,21 @@ TOKENIZER_SIGNATURE_FILES = (
     "merges.txt",
     "tokenizer.model",
 )
+
+_WORKER_CONFIG: Config | None = None
+_WORKER_TOKENIZER: Any | None = None
+_WORKER_MAX_SEQ_LEN: int | None = None
+
+
+@dataclass
+class PreprocessChunkResult:
+    chunk_index: int
+    num_input_rows: int
+    processed_rows: list[dict[str, Any]]
+    debug_rows: list[dict[str, Any]]
+    rejected_rows: list[dict[str, Any]]
+    rejected_counts: dict[str, int]
+    stats: dict[str, int]
 
 
 def load_tokenizer(config: Config) -> Any:
@@ -634,14 +651,137 @@ def _preprocess_raw_dpo_row(row: dict[str, Any], tokenizer: Any, config: Config)
     return processed, debug, stats
 
 
+def _preprocess_decoded_rows(
+    *,
+    split: str,
+    rows: list[dict[str, Any]],
+    tokenizer: Any,
+    config: Config,
+    max_seq_len: int,
+    show_progress: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Counter[str], Counter[str]]:
+    processed_rows: list[dict[str, Any]] = []
+    debug_rows: list[dict[str, Any]] = []
+    rejected_rows: list[dict[str, Any]] = []
+    rejected_counts: Counter[str] = Counter()
+    stats: Counter[str] = Counter()
+
+    row_iterable = tqdm(rows, desc=f"preprocess {split}", unit="row") if show_progress else rows
+    for row in row_iterable:
+        stats[f"raw_loss_kind/{row['loss_kind']}"] += 1
+        try:
+            if row["loss_kind"] == "dpo_target":
+                processed, debug, row_stats = _preprocess_raw_dpo_row(row, tokenizer, config)
+            else:
+                processed, debug, row_stats = _preprocess_raw_sft_row(row, tokenizer, config)
+            enforce_max_seq_len(processed, max_seq_len)
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            rejected_rows.append({"row_index": row["row_index"], "loss_kind": row["loss_kind"], "reason": reason})
+            rejected_counts[reason] += 1
+            stats["rejected_rows"] += 1
+            continue
+
+        processed_rows.append(processed)
+        debug["split"] = split
+        debug_rows.append(debug)
+        stats.update(row_stats)
+        stats[f"processed_loss_kind/{row['loss_kind']}"] += 1
+        token_count, supervised_token_count = processed_token_stats(processed)
+        stats["tokens"] += token_count
+        stats["supervised_tokens"] += supervised_token_count
+
+    return processed_rows, debug_rows, rejected_rows, rejected_counts, stats
+
+
+def _chunk_rows(rows: list[dict[str, Any]], chunk_size: int) -> list[tuple[int, list[dict[str, Any]]]]:
+    return [(index, rows[offset : offset + chunk_size]) for index, offset in enumerate(range(0, len(rows), chunk_size))]
+
+
+def _init_preprocess_worker(config: Config) -> None:
+    global _WORKER_CONFIG, _WORKER_MAX_SEQ_LEN, _WORKER_TOKENIZER
+
+    _WORKER_CONFIG = config
+    _WORKER_TOKENIZER = load_tokenizer(config)
+    _WORKER_MAX_SEQ_LEN = configured_max_seq_len(config)
+
+
+def _preprocess_chunk_in_worker(split: str, chunk_index: int, rows: list[dict[str, Any]]) -> PreprocessChunkResult:
+    if _WORKER_CONFIG is None or _WORKER_TOKENIZER is None or _WORKER_MAX_SEQ_LEN is None:
+        raise RuntimeError("preprocessing worker was not initialized")
+
+    processed_rows, debug_rows, rejected_rows, rejected_counts, stats = _preprocess_decoded_rows(
+        split=split,
+        rows=rows,
+        tokenizer=_WORKER_TOKENIZER,
+        config=_WORKER_CONFIG,
+        max_seq_len=_WORKER_MAX_SEQ_LEN,
+    )
+    return PreprocessChunkResult(
+        chunk_index=chunk_index,
+        num_input_rows=len(rows),
+        processed_rows=processed_rows,
+        debug_rows=debug_rows,
+        rejected_rows=rejected_rows,
+        rejected_counts=dict(rejected_counts),
+        stats=dict(stats),
+    )
+
+
+def _merge_chunk_results(
+    chunks: list[PreprocessChunkResult],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Counter[str], Counter[str]]:
+    processed_rows: list[dict[str, Any]] = []
+    debug_rows: list[dict[str, Any]] = []
+    rejected_rows: list[dict[str, Any]] = []
+    rejected_counts: Counter[str] = Counter()
+    stats: Counter[str] = Counter()
+
+    for chunk in sorted(chunks, key=lambda item: item.chunk_index):
+        processed_rows.extend(chunk.processed_rows)
+        debug_rows.extend(chunk.debug_rows)
+        rejected_rows.extend(chunk.rejected_rows)
+        rejected_counts.update(chunk.rejected_counts)
+        stats.update(chunk.stats)
+
+    return processed_rows, debug_rows, rejected_rows, rejected_counts, stats
+
+
+def _preprocess_rows_parallel(
+    *,
+    split: str,
+    rows: list[dict[str, Any]],
+    config: Config,
+    num_workers: int,
+    chunk_size: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Counter[str], Counter[str]]:
+    chunks = _chunk_rows(rows, chunk_size)
+    chunk_results: list[PreprocessChunkResult] = []
+
+    with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_preprocess_worker, initargs=(config,)) as executor:
+        futures = {
+            executor.submit(_preprocess_chunk_in_worker, split, chunk_index, chunk_rows): len(chunk_rows)
+            for chunk_index, chunk_rows in chunks
+        }
+        with tqdm(total=len(rows), desc=f"preprocess {split}", unit="row") as progress:
+            for future in as_completed(futures):
+                result = future.result()
+                chunk_results.append(result)
+                progress.update(result.num_input_rows)
+
+    return _merge_chunk_results(chunk_results)
+
+
 def preprocess_split(
     split: str,
     raw_path: Path,
-    tokenizer: Any,
+    tokenizer: Any | None,
     config: Config,
     *,
     preprocessing_signature: str | None = None,
     force_refresh: bool = False,
+    num_workers: int = 1,
+    worker_chunk_size: int = 512,
 ) -> PretokSplitResult:
     """Prepare or reuse one pretokenized split cache.
 
@@ -681,37 +821,32 @@ def preprocess_split(
     logger.info("%s dataframe loaded: rows=%s columns=%s", split, len(frame), list(frame.columns))
     rows = dataframe_to_rows(frame)
 
-    processed_rows: list[dict[str, Any]] = []
-    debug_rows: list[dict[str, Any]] = []
-    rejected_rows: list[dict[str, Any]] = []
-    rejected_counts: Counter[str] = Counter()
-    stats: Counter[str] = Counter()
-
-    for row in tqdm(rows, desc=f"preprocess {split}", unit="row"):
-        stats[f"raw_loss_kind/{row['loss_kind']}"] += 1
-        try:
-            if row["loss_kind"] == "dpo_target":
-                processed, debug, row_stats = _preprocess_raw_dpo_row(row, tokenizer, config)
-            else:
-                processed, debug, row_stats = _preprocess_raw_sft_row(row, tokenizer, config)
-            enforce_max_seq_len(processed, max_seq_len)
-        except Exception as exc:
-            reason = f"{type(exc).__name__}: {exc}"
-            rejected_rows.append(
-                {"row_index": row["row_index"], "loss_kind": row["loss_kind"], "reason": reason}
-            )
-            rejected_counts[reason] += 1
-            stats["rejected_rows"] += 1
-            continue
-
-        processed_rows.append(processed)
-        debug["split"] = split
-        debug_rows.append(debug)
-        stats.update(row_stats)
-        stats[f"processed_loss_kind/{row['loss_kind']}"] += 1
-        token_count, supervised_token_count = processed_token_stats(processed)
-        stats["tokens"] += token_count
-        stats["supervised_tokens"] += supervised_token_count
+    if num_workers > 1 and rows:
+        logger.info(
+            "preprocessing %s split with process workers: workers=%s chunk_size=%s rows=%s",
+            split,
+            num_workers,
+            worker_chunk_size,
+            len(rows),
+        )
+        processed_rows, debug_rows, rejected_rows, rejected_counts, stats = _preprocess_rows_parallel(
+            split=split,
+            rows=rows,
+            config=config,
+            num_workers=num_workers,
+            chunk_size=worker_chunk_size,
+        )
+    else:
+        if tokenizer is None:
+            tokenizer = load_tokenizer(config)
+        processed_rows, debug_rows, rejected_rows, rejected_counts, stats = _preprocess_decoded_rows(
+            split=split,
+            rows=rows,
+            tokenizer=tokenizer,
+            config=config,
+            max_seq_len=max_seq_len,
+            show_progress=True,
+        )
 
     enforce_preprocessing_quality(
         split=split,
@@ -755,6 +890,8 @@ def prepare_pretokenized_splits(
     *,
     model_source: Any | None = None,
     force_refresh: bool = False,
+    num_workers: int | None = None,
+    worker_chunk_size: int | None = None,
 ) -> list[PretokSplitResult]:
     """Build or reuse the tokenized training-data cache.
 
@@ -770,25 +907,41 @@ def prepare_pretokenized_splits(
     max_seq_len = validate_configured_max_seq_len(config, tokenizer)
     model_context = tokenizer_model_context(tokenizer)
     preprocessing_signature = build_preprocessing_signature(config, tokenizer, model_source=model_source)
+    effective_num_workers = num_workers if num_workers is not None else config.preprocessing.workers.num_workers
+    effective_chunk_size = (
+        worker_chunk_size if worker_chunk_size is not None else config.preprocessing.workers.chunk_size
+    )
+    if effective_num_workers <= 0:
+        raise ValueError("preprocessing workers must be a positive integer")
+    if effective_chunk_size <= 0:
+        raise ValueError("preprocessing worker chunk size must be a positive integer")
     logger.info(
-        "tokenizer loaded: class=%s fast=%s template_hash=%s max_seq_len=%s model_context=%s",
+        "tokenizer loaded: class=%s fast=%s template_hash=%s max_seq_len=%s model_context=%s workers=%s chunk_size=%s",
         tokenizer.__class__.__name__,
         bool(getattr(tokenizer, "is_fast", False)),
         sha256_text(getattr(tokenizer, "chat_template", "") or ""),
         max_seq_len,
         model_context if model_context is not None else "unknown",
+        effective_num_workers,
+        effective_chunk_size,
     )
 
     results: list[PretokSplitResult] = []
+    split_tokenizer = tokenizer if effective_num_workers == 1 else None
+    if split_tokenizer is None:
+        del tokenizer
+
     for split, raw_path in resolve_split_paths(config, splits):
         results.append(
             preprocess_split(
                 split,
                 raw_path,
-                tokenizer,
+                split_tokenizer,
                 config,
                 preprocessing_signature=preprocessing_signature,
                 force_refresh=force_refresh,
+                num_workers=effective_num_workers,
+                worker_chunk_size=effective_chunk_size,
             )
         )
     return results

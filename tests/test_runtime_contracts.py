@@ -21,6 +21,8 @@ def test_example_config_loads_with_dpo_route() -> None:
     assert config.distributed.fsdp.activation_checkpointing is True
     assert config.eval.bfcl.enabled is False
     assert config.eval.bfcl.limit == 100
+    assert config.preprocessing.workers.num_workers == 1
+    assert config.preprocessing.workers.chunk_size == 512
     assert config.registry.selection.metric == "eval/sft/loss"
     assert config.output_dir.as_posix().endswith("qwen35-a3b-lora-sft-dpo-v1")
 
