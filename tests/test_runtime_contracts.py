@@ -7,6 +7,7 @@ import torch
 from config import ConfigError, load_config
 from checkpointing.save import trainable_state_dict
 from conftest import example_config
+import trainer.distributed as distributed
 from trainer.distributed import configure_ignored_tied_embeddings, tied_frozen_embedding_modules
 from trainer.modeling import configure_gradient_checkpointing, disable_model_kv_cache, freeze_configured_modules
 
@@ -45,6 +46,40 @@ def test_config_rejects_accelerator_style_fsdp_mixed_precision() -> None:
         assert "fp32" in str(exc)
     else:
         raise AssertionError("expected invalid FSDP mixed_precision config to fail")
+
+
+def test_config_requires_fsdp_use_orig_params_for_lora() -> None:
+    try:
+        example_config(distributed={"fsdp": {"use_orig_params": False}})
+    except ConfigError as exc:
+        assert "distributed.fsdp.use_orig_params" in str(exc)
+        assert "LoRA" in str(exc)
+    else:
+        raise AssertionError("expected use_orig_params=false config to fail")
+
+
+def test_accelerator_mixed_precision_is_not_used_for_fsdp_policy(monkeypatch) -> None:
+    accelerator_kwargs = {}
+    plugin_kwargs = {}
+
+    class FakeFsdpPlugin:
+        def __init__(self, **kwargs):
+            plugin_kwargs.update(kwargs)
+            self.mixed_precision_policy = kwargs["mixed_precision_policy"]
+
+    class FakeAccelerator:
+        def __init__(self, **kwargs):
+            accelerator_kwargs.update(kwargs)
+            self.distributed_type = distributed.DistributedType.FSDP
+
+    monkeypatch.setattr(distributed, "FullyShardedDataParallelPlugin", FakeFsdpPlugin)
+    monkeypatch.setattr(distributed, "Accelerator", FakeAccelerator)
+
+    runtime = distributed.create_accelerator(example_config())
+
+    assert plugin_kwargs["mixed_precision_policy"] == "bf16"
+    assert accelerator_kwargs["fsdp_plugin"] is runtime.fsdp_plugin
+    assert accelerator_kwargs["mixed_precision"] == "no"
 
 
 class TinyModel(torch.nn.Module):

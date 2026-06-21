@@ -87,6 +87,25 @@ def test_routed_sampler_reshuffles_inside_route_per_epoch() -> None:
     assert sorted(index for batch in epoch_one for index in batch) == list(range(8))
 
 
+def test_routed_sampler_groups_batches_by_replica_route() -> None:
+    loss_kinds = ["dpo_target", "sft_target", "sft_tool", "dpo_target", "sft_target"]
+    sampler = RoutedBatchSampler(
+        loss_kinds,
+        batch_size=1,
+        seed=0,
+        shuffle=False,
+        replica_group_size=2,
+    )
+    batches = list(sampler)
+
+    assert len(batches) % 2 == 0
+    for start in range(0, len(batches), 2):
+        route_pair = {loss_kinds[batch[0]] for batch in batches[start : start + 2]}
+        assert len(route_pair) == 1
+
+    assert sampler.summary()["num_padded_replica_batches"] == 1
+
+
 def test_routed_collator_pads_sft_and_dpo() -> None:
     collator = RoutedCollator(pad_token_id=0, ignore_index=-100)
 
@@ -171,6 +190,29 @@ def test_build_dataloaders_from_pretokenized_parquet(tmp_path) -> None:
     for split_loader in bundle.splits.values():
         for batch in split_loader.dataloader:
             assert batch["loss_kind"] in {"sft_target", "sft_tool", "dpo_target"}
+
+
+def test_build_dataloaders_aligns_route_batches_for_distributed_sharding(tmp_path) -> None:
+    train_path = tmp_path / "train.parquet"
+    valid_path = tmp_path / "valid.parquet"
+    write_pretok(train_path)
+    write_pretok(valid_path)
+    config = example_config(training={"per_device_train_batch_size": 1})
+
+    bundle = build_dataloaders(
+        config,
+        [pretok_result("train", train_path), pretok_result("valid", valid_path)],
+        pad_token_id=0,
+        num_processes=2,
+    )
+
+    summary = bundle["train"].summary
+    assert summary["replica_group_size"] == 2
+    assert summary["num_padded_replica_batches"] == 3
+    batches = list(bundle["train"].sampler)
+    for start in range(0, len(batches), 2):
+        route_pair = {bundle["train"].dataset.loss_kinds[batch[0]] for batch in batches[start : start + 2]}
+        assert len(route_pair) == 1
 
 
 def test_validate_training_inputs_rejects_unconfigured_data_route(tmp_path) -> None:

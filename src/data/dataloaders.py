@@ -70,6 +70,7 @@ def build_dataloaders(
     pretok_results: list[PretokSplitResult],
     *,
     pad_token_id: int | None = None,
+    num_processes: int = 1,
 ) -> DataLoaderBundle:
     """Build homogeneous routed DataLoader instances from pretokenized splits.
 
@@ -87,6 +88,7 @@ def build_dataloaders(
     batch_size = config.training.per_device_train_batch_size
     if batch_size <= 0:
         raise ValueError("training.per_device_train_batch_size must be a positive integer")
+    replica_group_size = max(int(num_processes), 1)
     drop_last = config.training.drop_last
     seed = config.project.seed
     collator = RoutedCollator(
@@ -106,7 +108,14 @@ def build_dataloaders(
         if split in REQUIRED_TRAINING_SPLITS and len(dataset) == 0:
             raise ValueError(f"pretokenized {split} split is empty: {result.pretok_path}")
         
-        sampler = RoutedBatchSampler(dataset.loss_kinds, batch_size, seed=seed, drop_last=drop_last, shuffle=True)
+        sampler = RoutedBatchSampler(
+            dataset.loss_kinds,
+            batch_size,
+            seed=seed,
+            drop_last=drop_last,
+            shuffle=True,
+            replica_group_size=replica_group_size,
+        )
         if split in REQUIRED_TRAINING_SPLITS and len(sampler) == 0:
             raise ValueError(
                 f"{split} routed sampler produced zero batches; check training.drop_last and per-device batch size"

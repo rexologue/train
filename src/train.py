@@ -114,16 +114,23 @@ def main() -> None:
             results = load_pretokenized_split_results(config, ["train", "valid", "test"])
 
         logger.info("building routed dataloaders")
-        dataloaders = build_dataloaders(config, results)
+        dataloaders = build_dataloaders(
+            config,
+            results,
+            num_processes=int(getattr(accelerator, "num_processes", 1)),
+        )
 
         for split, split_loader in dataloaders.splits.items():
             summary = split_loader.summary
             logger.info(
-                "dataloader ready: split=%s rows=%s batches=%s short_batches=%s loss_kinds=%s path=%s",
+                "dataloader ready: split=%s rows=%s batches=%s short_batches=%s "
+                "replica_group_size=%s padded_replica_batches=%s loss_kinds=%s path=%s",
                 split,
                 summary["num_rows"],
                 summary["num_batches"],
                 summary["num_short_batches"],
+                summary["replica_group_size"],
+                summary["num_padded_replica_batches"],
                 summary["loss_kind_counts"],
                 summary["path"],
             )

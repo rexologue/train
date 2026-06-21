@@ -46,7 +46,7 @@ def create_accelerator(config: Config) -> DistributedRuntime:
 
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        mixed_precision=fsdp.mixed_precision,
+        mixed_precision="no",
         fsdp_plugin=fsdp_plugin,
         project_dir=str(config.project.output_dir),
     )

@@ -1012,6 +1012,13 @@ class Config:
                 "model.gradient_checkpointing and distributed.fsdp.activation_checkpointing cannot both be true"
             )
 
+        if not self.distributed.fsdp.use_orig_params:
+            raise ConfigError(
+                "distributed.fsdp.use_orig_params must be true for PEFT LoRA training; "
+                "FSDP use_orig_params=false cannot flatten transformer blocks that mix "
+                "frozen base parameters with trainable LoRA adapter parameters"
+            )
+
         metric = self.registry.selection.metric
         route_types = {route.type for route in self.loss_routing.routes.values()}
 

@@ -22,16 +22,21 @@ class RoutedBatchSampler:
         seed: int = 0,
         drop_last: bool = False,
         shuffle: bool = True,
+        replica_group_size: int = 1,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if replica_group_size <= 0:
+            raise ValueError("replica_group_size must be positive")
 
         self.loss_kinds = list(loss_kinds)
         self.batch_size = batch_size
         self.seed = seed
         self.drop_last = drop_last
         self.shuffle = shuffle
+        self.replica_group_size = int(replica_group_size)
         self.epoch = 0
+        self.num_padded_replica_batches = 0
 
         groups: dict[str, list[int]] = defaultdict(list)
         for index, loss_kind in enumerate(self.loss_kinds):
@@ -44,20 +49,46 @@ class RoutedBatchSampler:
     def _build_batches(self) -> list[list[int]]:
         """Create route-local batches before deterministic cross-route shuffle."""
 
-        batches: list[list[int]] = []
+        replica_groups: list[list[list[int]]] = []
+        self.num_padded_replica_batches = 0
         rng = random.Random(self.seed + self.epoch)
         for indices in self.groups.values():
             route_indices = list(indices)
             if self.shuffle:
                 rng.shuffle(route_indices)
+            route_batches: list[list[int]] = []
             for start in range(0, len(route_indices), self.batch_size):
                 batch = route_indices[start : start + self.batch_size]
                 if self.drop_last and len(batch) < self.batch_size:
                     continue
-                batches.append(batch)
+                route_batches.append(batch)
+            replica_groups.extend(self._replica_groups(route_batches))
+
         if self.shuffle:
-            rng.shuffle(batches)
+            rng.shuffle(replica_groups)
+
+        batches: list[list[int]] = []
+        for group in replica_groups:
+            batches.extend(group)
         return batches
+
+    def _replica_groups(self, route_batches: list[list[int]]) -> list[list[list[int]]]:
+        """Group route-local batches so Accelerate batch sharding keeps ranks aligned."""
+
+        groups: list[list[list[int]]] = []
+        width = self.replica_group_size
+        for start in range(0, len(route_batches), width):
+            group = [list(batch) for batch in route_batches[start : start + width]]
+            if len(group) < width:
+                if self.drop_last:
+                    continue
+                if not group:
+                    continue
+                while len(group) < width:
+                    group.append(list(group[-1]))
+                    self.num_padded_replica_batches += 1
+            groups.append(group)
+        return groups
 
 
     def set_epoch(self, epoch: int) -> None:
@@ -101,6 +132,8 @@ class RoutedBatchSampler:
             "batch_size": self.batch_size,
             "drop_last": self.drop_last,
             "shuffle": self.shuffle,
+            "replica_group_size": self.replica_group_size,
+            "num_padded_replica_batches": self.num_padded_replica_batches,
             "seed": self.seed,
             "epoch": self.epoch,
         }
