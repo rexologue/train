@@ -8,7 +8,7 @@ import pytest
 from preprocessing.io import ParquetSchemaError, read_rows
 from preprocessing.masking import canonicalize_row
 from preprocessing.pipeline import preprocess_dpo_row, preprocess_sft_row, preprocess_split
-from preprocessing.rendering import QwenTemplateRenderer
+from preprocessing.rendering import ChatTemplateRenderer
 from conftest import CharTokenizer, example_config, renderer_config
 
 
@@ -113,7 +113,7 @@ def test_preprocess_split_force_refresh_rebuilds_valid_cache(tmp_path) -> None:
 def test_sft_target_masks_selected_assistant_tokens_only() -> None:
     config = example_config()
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, renderer_config(config))
+    renderer = ChatTemplateRenderer(None, renderer_config(config))
     row = canonicalize_row(
         {
             "sample_id": "mask1",
@@ -142,7 +142,7 @@ def test_sft_target_masks_selected_assistant_tokens_only() -> None:
 def test_sft_tool_masks_assistant_tool_call_and_final_answer_not_tool_response() -> None:
     config = example_config()
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, renderer_config(config))
+    renderer = ChatTemplateRenderer(None, renderer_config(config))
     row = canonicalize_row(
         {
             "sample_id": "tool1",
@@ -191,7 +191,7 @@ def test_reasoning_disabled_masks_think_blocks() -> None:
         }
     )
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, renderer_config(config))
+    renderer = ChatTemplateRenderer(None, renderer_config(config))
     row = canonicalize_row(
         {
             "sample_id": "think1",
@@ -217,7 +217,7 @@ def test_reasoning_disabled_masks_think_blocks() -> None:
 def test_dpo_masks_chosen_and_rejected_completion_text() -> None:
     config = example_config()
     tokenizer = CharTokenizer()
-    renderer = QwenTemplateRenderer(None, renderer_config(config))
+    renderer = ChatTemplateRenderer(None, renderer_config(config))
     row = canonicalize_row(
         {
             "id": "dpo1",

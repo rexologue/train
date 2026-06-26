@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from eval.ru_bfcl.io import default_eval_path, dump_jsonl, load_bfcl_eval, load_jsonl, load_predictions
+from eval.ru_bfcl.io import default_eval_path, dump_jsonl, load_bfcl_eval, load_jsonl, load_predictions, resolve_bfcl_eval_path
 from eval.ru_bfcl.matching import (
     evaluate_sample,
     evaluate_single_turn_prediction,
@@ -31,6 +31,7 @@ __all__ = [
     "load_bfcl_eval",
     "load_jsonl",
     "load_predictions",
+    "resolve_bfcl_eval_path",
     "normalize_prediction",
     "normalize_tool_call",
     "parse_arguments",

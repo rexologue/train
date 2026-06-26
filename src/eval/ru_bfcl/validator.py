@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-from eval.ru_bfcl.io import dump_jsonl, load_bfcl_eval, load_predictions
+from eval.ru_bfcl.io import dump_jsonl, load_bfcl_eval, load_predictions, resolve_bfcl_eval_path
 from eval.ru_bfcl.matching import evaluate_sample, summarize_results
 from eval.ru_bfcl.schema import BFCLRequest, BFCLEvalSample
 
@@ -12,8 +12,9 @@ PredictionFn = Callable[[BFCLRequest], Any]
 
 
 class BFCLValidator:
-    def __init__(self, samples: Iterable[BFCLEvalSample]):
+    def __init__(self, samples: Iterable[BFCLEvalSample], *, source_path: str | Path | None = None):
         self.samples = list(samples)
+        self.source_path = None if source_path is None else Path(source_path)
 
     @classmethod
     def from_jsonl(
@@ -24,13 +25,15 @@ class BFCLValidator:
         include_multi_turn: bool = True,
         limit: int | None = None,
     ) -> "BFCLValidator":
+        source_path = resolve_bfcl_eval_path(path)
         return cls(
             load_bfcl_eval(
-                path,
+                source_path,
                 categories=categories,
                 include_multi_turn=include_multi_turn,
                 limit=limit,
-            )
+            ),
+            source_path=source_path,
         )
 
     def iter_requests(self) -> Iterator[BFCLRequest]:
@@ -102,7 +105,10 @@ def evaluate_predictions_file(
         limit=limit,
     )
     if not require_all:
-        validator = BFCLValidator(sample for sample in validator.samples if sample.id in predictions)
+        validator = BFCLValidator(
+            (sample for sample in validator.samples if sample.id in predictions),
+            source_path=validator.source_path,
+        )
     summary = validator.evaluate_predictions(predictions)
     if rows_out is not None:
         dump_jsonl(rows_out, summary["rows"])

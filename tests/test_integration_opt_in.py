@@ -19,9 +19,9 @@ def env_path(name: str) -> Path | None:
 
 @pytest.mark.integration
 def test_opt_in_dataset_root_has_supported_raw_splits() -> None:
-    data_root = env_path("ESTADEL_TEST_DATA_ROOT")
+    data_root = env_path("SFT_DPO_TEST_DATA_ROOT")
     if data_root is None:
-        pytest.skip("set ESTADEL_TEST_DATA_ROOT to run dataset integration checks")
+        pytest.skip("set SFT_DPO_TEST_DATA_ROOT to run dataset integration checks")
 
     pyarrow_parquet = pytest.importorskip("pyarrow.parquet")
     for split in ("train", "valid"):
@@ -41,9 +41,9 @@ def test_opt_in_dataset_root_has_supported_raw_splits() -> None:
 
 @pytest.mark.integration
 def test_opt_in_dataset_root_exposes_dvc_lineage() -> None:
-    data_root = env_path("ESTADEL_TEST_DATA_ROOT")
+    data_root = env_path("SFT_DPO_TEST_DATA_ROOT")
     if data_root is None:
-        pytest.skip("set ESTADEL_TEST_DATA_ROOT to run dataset integration checks")
+        pytest.skip("set SFT_DPO_TEST_DATA_ROOT to run dataset integration checks")
 
     config = example_config(preprocessing={"raw": {"train_path": str(data_root / "data" / "train.parquet")}})
 
@@ -55,10 +55,10 @@ def test_opt_in_dataset_root_exposes_dvc_lineage() -> None:
 
 @pytest.mark.integration
 def test_opt_in_modelctl_can_resolve_registry_source() -> None:
-    tracking_uri = os.environ.get("ESTADEL_TEST_MLFLOW_URI")
-    model_ref = os.environ.get("ESTADEL_TEST_MODEL_REF")
+    tracking_uri = os.environ.get("SFT_DPO_TEST_MLFLOW_URI")
+    model_ref = os.environ.get("SFT_DPO_TEST_MODEL_REF")
     if not tracking_uri or not model_ref:
-        pytest.skip("set ESTADEL_TEST_MLFLOW_URI and ESTADEL_TEST_MODEL_REF to run registry integration checks")
+        pytest.skip("set SFT_DPO_TEST_MLFLOW_URI and SFT_DPO_TEST_MODEL_REF to run registry integration checks")
 
     info = ModelctlClient(tracking_uri=tracking_uri, timeout_seconds=60).info(model_ref)
 

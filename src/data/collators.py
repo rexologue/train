@@ -103,17 +103,4 @@ class RoutedCollator:
             "chosen_render_hash": [example.get("chosen_render_hash") for example in examples],
             "rejected_render_hash": [example.get("rejected_render_hash") for example in examples],
         }
-        if any("_ref_logprob_cache_owner" in example for example in examples):
-            batch["ref_logprob_cache_owner"] = [
-                bool(example.get("_ref_logprob_cache_owner", True)) for example in examples
-            ]
-        if all("chosen_ref_logp" in example and "rejected_ref_logp" in example for example in examples):
-            batch["chosen_ref_logp"] = torch.tensor(
-                [float(example["chosen_ref_logp"]) for example in examples],
-                dtype=torch.float32,
-            )
-            batch["rejected_ref_logp"] = torch.tensor(
-                [float(example["rejected_ref_logp"]) for example in examples],
-                dtype=torch.float32,
-            )
         return batch

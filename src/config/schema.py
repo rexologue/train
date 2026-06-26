@@ -112,8 +112,6 @@ class ModelConfig:
     experts_implementation: Literal["eager", "batched_mm", "grouped_mm"] | None
     gradient_checkpointing: bool
     freeze_router: bool
-    freeze_embeddings: bool
-    freeze_lm_head: bool
 
     @classmethod
     def from_dict(cls, raw: Any) -> ModelConfig:
@@ -131,8 +129,6 @@ class ModelConfig:
                 "experts_implementation",
                 "gradient_checkpointing",
                 "freeze_router",
-                "freeze_embeddings",
-                "freeze_lm_head",
             },
             "model",
         )
@@ -156,8 +152,6 @@ class ModelConfig:
             experts_implementation=experts_implementation,  # type: ignore[arg-type]
             gradient_checkpointing=_require_bool(data.get("gradient_checkpointing"), "model.gradient_checkpointing"),
             freeze_router=_require_bool(data.get("freeze_router"), "model.freeze_router"),
-            freeze_embeddings=_require_bool(data.get("freeze_embeddings"), "model.freeze_embeddings"),
-            freeze_lm_head=_require_bool(data.get("freeze_lm_head"), "model.freeze_lm_head"),
         )
 
 
@@ -485,45 +479,19 @@ class LossRouteConfig:
 
 
 @dataclass(frozen=True)
-class DpoReferenceConfig:
-    cache_enabled: bool
-    cache_refresh: bool
-    cache_required: bool
-
-    @classmethod
-    def from_dict(cls, raw: Any) -> DpoReferenceConfig:
-        data = {} if raw is None else _mapping(raw, "loss_routing.dpo.reference")
-        _reject_unknown(
-            data,
-            {"cache_enabled", "cache_refresh", "cache_required"},
-            "loss_routing.dpo.reference",
-        )
-
-        return cls(
-            cache_enabled=_optional_bool(data.get("cache_enabled"), "loss_routing.dpo.reference.cache_enabled", True),
-            cache_refresh=_optional_bool(data.get("cache_refresh"), "loss_routing.dpo.reference.cache_refresh", False),
-            cache_required=_optional_bool(data.get("cache_required"), "loss_routing.dpo.reference.cache_required", False),
-        )
-
-
-@dataclass(frozen=True)
 class DpoConfig:
     beta: float
-    reference: DpoReferenceConfig
 
     @classmethod
     def from_dict(cls, raw: Any) -> DpoConfig:
         data = {} if raw is None else _mapping(raw, "loss_routing.dpo")
-        _reject_unknown(data, {"beta", "reference"}, "loss_routing.dpo")
+        _reject_unknown(data, {"beta"}, "loss_routing.dpo")
 
         beta = _optional_float(data.get("beta"), "loss_routing.dpo.beta", 0.1)
         if beta <= 0.0:
             raise ConfigError("loss_routing.dpo.beta must be positive")
 
-        return cls(
-            beta=beta,
-            reference=DpoReferenceConfig.from_dict(data.get("reference")),
-        )
+        return cls(beta=beta)
 
 
 
@@ -747,6 +715,7 @@ class BfclGenerationConfig:
 @dataclass(frozen=True)
 class BfclEvalConfig:
     enabled: bool
+    path: Path | None
     run_every_n_validations: int
     include_multi_turn: bool
     categories: tuple[str, ...] | None
@@ -758,7 +727,7 @@ class BfclEvalConfig:
         data = _mapping(raw, "eval.bfcl")
         _reject_unknown(
             data,
-            {"enabled", "run_every_n_validations", "include_multi_turn", "categories", "limit", "generation"},
+            {"enabled", "path", "run_every_n_validations", "include_multi_turn", "categories", "limit", "generation"},
             "eval.bfcl",
         )
 
@@ -770,6 +739,7 @@ class BfclEvalConfig:
 
         return cls(
             enabled=_require_bool(data.get("enabled"), "eval.bfcl.enabled"),
+            path=None if data.get("path") is None else _path(data.get("path"), "eval.bfcl.path"),
             run_every_n_validations=_require_positive_int(
                 data.get("run_every_n_validations"),
                 "eval.bfcl.run_every_n_validations",
@@ -1037,8 +1007,8 @@ class Config:
         return self.preprocessing.masking.ignore_index
 
     def _validate_cross_fields(self) -> None:
-        if self.model.freeze_lm_head and "lm_head" in self.lora.modules_to_save:
-            raise ConfigError("lora.modules_to_save cannot include lm_head when model.freeze_lm_head=true")
+        _reject_vocab_modules_in_lora(self.lora.target_modules, "lora.target_modules")
+        _reject_vocab_modules_in_lora(self.lora.modules_to_save, "lora.modules_to_save")
 
         if self.model.gradient_checkpointing and self.distributed.fsdp.activation_checkpointing:
             raise ConfigError(
@@ -1068,6 +1038,25 @@ class Config:
             if checkpoint_every % bfcl_every != 0:
                 raise ConfigError("BFCL registry selection requires every checkpoint boundary to run BFCL")
 
+
+
+def _reject_vocab_modules_in_lora(modules: tuple[str, ...], name: str) -> None:
+    """Reject trainable vocab projection modules in LoRA config.
+
+    The training stack always keeps input embeddings and lm_head frozen and out
+    of FSDP flattening. Making them LoRA targets or modules_to_save reintroduces
+    FSDP shared-parameter/view corruption for tied vocab weights during DPO's
+    on-the-fly reference forward.
+    """
+
+    forbidden = {"embed_tokens", "lm_head"}
+    for index, module_name in enumerate(modules):
+        parts = tuple(part for part in module_name.split(".") if part)
+        if any(part in forbidden for part in parts):
+            raise ConfigError(
+                f"{name}[{index}]={module_name!r} is not supported: "
+                "embed_tokens and lm_head are always frozen and FSDP-ignored"
+            )
 
 def _to_plain_data(value: Any) -> Any:
     if isinstance(value, Path):

@@ -35,7 +35,7 @@ from preprocessing.masking import (
     stable_uniform_0_1,
     tokenize_with_offsets,
 )
-from preprocessing.rendering import QwenTemplateRenderer, reject_forbidden_raw_markers
+from preprocessing.rendering import ChatTemplateRenderer, reject_forbidden_raw_markers
 from utils.hashing import file_sha256, sha256_text, stable_hash
 from utils.logging import get_logger
 
@@ -267,12 +267,12 @@ def decode_labeled_token_spans(
 
 
 def normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Convert OpenAI-like JSON-string tool arguments into dicts for Qwen template rendering.
+    """Convert OpenAI-like JSON-string tool arguments into dicts for chat-template rendering.
 
     The raw dataset is allowed to store `tool_calls[].function.arguments` as a
-    JSON string. The local Qwen chat template renders function parameters by
-    iterating `arguments|items`, so it needs a mapping. We keep this conversion
-    in preprocessing instead of mutating raw parquet.
+    JSON string. Some chat templates render function parameters by iterating
+    `arguments|items`, so they need a mapping. We keep this conversion in
+    preprocessing instead of mutating raw parquet.
     """
 
     normalized = copy.deepcopy(messages)
@@ -322,7 +322,7 @@ def apply_chat_template(
 ) -> tuple[str, list[str]]:
     """Render messages through tokenizer chat template with configured thinking mode.
 
-    Qwen templates may accept `enable_thinking`. Older tokenizer versions may
+    Some templates may accept `enable_thinking`. Older tokenizer versions may
     reject it. In that case we retry with only stable chat-template arguments
     and record that the kwarg was unsupported.
     """
@@ -343,7 +343,7 @@ def apply_chat_template(
 
 
 def assistant_blocks(rendered: str) -> list[tuple[int, int, str]]:
-    """Find assistant body ranges in Qwen rendered chat text."""
+    """Find assistant body ranges in rendered ChatML-style text."""
 
     blocks: list[tuple[int, int, str]] = []
     search_from = 0
@@ -499,7 +499,7 @@ def _preprocess_raw_sft_row(row: dict[str, Any], tokenizer: Any, config: Config)
 
     This is the main per-row route for `sft_target` and `sft_tool` in the real
     training-data pipeline. It keeps the raw parquet payload immutable,
-    normalizes only the copy passed to Qwen's template, selects supervised
+    normalizes only the copy passed to the tokenizer template, selects supervised
     assistant spans according to `loss_kind`, tokenizes the full rendered text
     with offsets, and finally builds labels that only expose selected assistant
     completion tokens to the loss.
@@ -966,8 +966,8 @@ def prepare_pretokenized_splits(
     return results
 
 
-def preprocess_sft_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Test helper for direct `QwenTemplateRenderer` preprocessing."""
+def preprocess_sft_row(row: CanonicalRow, renderer: ChatTemplateRenderer, tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Test helper for direct chat-template preprocessing."""
 
     rendered = renderer.render_sft(row)
     if row.loss_kind == "sft_tool":
@@ -1035,7 +1035,7 @@ def preprocess_sft_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokeni
     return processed, audit
 
 
-def preprocess_dpo_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any]]:
+def preprocess_dpo_row(row: CanonicalRow, renderer: ChatTemplateRenderer, tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any]]:
     """Test helper for DPO mask preprocessing with direct renderer usage."""
 
     if row.prompt is None or row.chosen is None or row.rejected is None:
@@ -1088,8 +1088,6 @@ def preprocess_dpo_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokeni
         "rejected_labels": rejected_labels,
         "chosen_completion_token_count": chosen_tokens,
         "rejected_completion_token_count": rejected_tokens,
-        "chosen_ref_logp": None,
-        "rejected_ref_logp": None,
         "prompt_render_hash": stable_hash(row.prompt),
         "chosen_render_hash": chosen_rendered.render_metadata["render_hash"],
         "rejected_render_hash": rejected_rendered.render_metadata["render_hash"],
@@ -1113,7 +1111,7 @@ def preprocess_dpo_row(row: CanonicalRow, renderer: QwenTemplateRenderer, tokeni
 def preprocess_raw_rows(
     raw_rows: list[dict[str, Any]],
     split: str,
-    renderer: QwenTemplateRenderer,
+    renderer: ChatTemplateRenderer,
     tokenizer: Any,
     config: Config,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:

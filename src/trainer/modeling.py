@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.util import find_spec
-import math
 from pathlib import Path
 from typing import Any
 
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 import torch
+
+from utils.cuda_runtime import preload_cuda_runtime
+
+preload_cuda_runtime()
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 from config import Config
@@ -43,7 +47,7 @@ def load_base_model(config: Config) -> Any:
     dtype = precision_to_dtype(model_cfg.precision)
 
     kwargs = {
-        "dtype": dtype,
+        "torch_dtype": dtype,
         "trust_remote_code": model_cfg.trust_remote_code,
         "attn_implementation": model_cfg.attn_implementation,
     }
@@ -51,13 +55,28 @@ def load_base_model(config: Config) -> Any:
     if model_cfg.experts_implementation is not None:
         kwargs["experts_implementation"] = model_cfg.experts_implementation
 
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_cfg.cache_dir),
-        **kwargs,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(str(model_cfg.cache_dir), **kwargs)
+    except TypeError as exc:
+        if "torch_dtype" not in str(exc):
+            raise
+        kwargs["dtype"] = kwargs.pop("torch_dtype")
+        model = AutoModelForCausalLM.from_pretrained(str(model_cfg.cache_dir), **kwargs)
+
     disable_model_kv_cache(model)
+    disable_router_logits_when_frozen(model, config)
     return model
 
+
+def disable_router_logits_when_frozen(model: Any, config: Config) -> None:
+    """Avoid materializing MoE router logits when router loss is not trained."""
+
+    if not config.model.freeze_router:
+        return
+
+    for cfg in (getattr(model, "config", None), getattr(getattr(model, "base_model", None), "config", None)):
+        if cfg is not None and hasattr(cfg, "output_router_logits"):
+            cfg.output_router_logits = False
 
 def disable_model_kv_cache(model: Any) -> None:
     """Disable generation KV cache for full-sequence train/eval forwards."""
@@ -73,10 +92,19 @@ def disable_model_kv_cache(model: Any) -> None:
 
 
 def validate_model_runtime_requirements(config: Config) -> None:
+    runtime_path = preload_cuda_runtime()
+
+    if find_spec("causal_conv1d") is not None and runtime_path is None:
+        raise ImportError(
+            "causal_conv1d is installed, but libcudart.so.12 was not found in the environment. "
+            "Install this project with constraints/cuda126_kernels.txt or install "
+            "nvidia-cuda-runtime-cu12."
+        )
+
     if config.model.attn_implementation == "flash_attention_2" and find_spec("flash_attn") is None:
         raise ImportError(
             "model.attn_implementation=flash_attention_2 requires the flash_attn package; "
-            "install it in the training environment or select another attention implementation"
+            "install it with the project cuda-kernels extra or select another attention implementation"
         )
 
 
@@ -99,11 +127,7 @@ def cast_floating_parameters(model: Any, dtype: Any) -> None:
 
 
 def freeze_configured_modules(model: Any, config: Config) -> None:
-    if config.model.freeze_embeddings:
-        _freeze_module(getattr(model, "get_input_embeddings", lambda: None)())
-
-    if config.model.freeze_lm_head:
-        _freeze_module(getattr(model, "lm_head", None))
+    freeze_vocab_modules(model)
 
     if config.model.freeze_router:
         for name, parameter in model.named_parameters():
@@ -111,6 +135,106 @@ def freeze_configured_modules(model: Any, config: Config) -> None:
 
             if "router" in lowered or ("gate" in lowered and "gate_proj" not in lowered):
                 parameter.requires_grad = False
+
+
+
+def freeze_vocab_modules(model: Any) -> None:
+    """Always freeze input embeddings and output vocab projection.
+
+    This is deliberately not configurable. The DPO reference pass is computed by
+    disabling PEFT adapters on the same model, so vocab projection modules must
+    stay outside the trainable adapter/state-switching surface.
+    """
+
+    seen: set[int] = set()
+
+    for module in vocab_modules_from_names(model) + vocab_modules_from_accessors(model):
+        if module is None:
+            continue
+        marker = id(module)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        _freeze_module(module)
+
+
+def assert_vocab_modules_frozen(model: Any) -> None:
+    """Fail before optimizer/FSDP if any discovered vocab module is trainable."""
+
+    modules = vocab_modules_from_names(model) + vocab_modules_from_accessors(model)
+    seen: set[int] = set()
+    trainable: list[str] = []
+
+    for module in modules:
+        if module is None:
+            continue
+        marker = id(module)
+        if marker in seen:
+            continue
+        seen.add(marker)
+
+        module_name = module_name_or_class(model, module)
+        for parameter_name, parameter in module.named_parameters():
+            if parameter.requires_grad:
+                trainable.append(f"{module_name}.{parameter_name}")
+
+    if trainable:
+        raise RuntimeError(f"vocab modules must be frozen, but trainable parameters were found: {trainable[:10]}")
+
+
+def vocab_modules_from_names(model: Any) -> list[Any]:
+    modules: list[Any] = []
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf in {"embed_tokens", "lm_head"} and getattr(module, "weight", None) is not None:
+            modules.append(module)
+    return modules
+
+
+def vocab_modules_from_accessors(model: Any) -> list[Any]:
+    modules: list[Any] = []
+    for root in iter_model_roots(model):
+        for accessor_name in ("get_input_embeddings", "get_output_embeddings"):
+            accessor = getattr(root, accessor_name, None)
+            if not callable(accessor):
+                continue
+            try:
+                module = accessor()
+            except Exception:
+                continue
+            if module is not None and getattr(module, "weight", None) is not None:
+                modules.append(module)
+    return modules
+
+
+def iter_model_roots(model: Any) -> tuple[Any, ...]:
+    result: list[Any] = []
+    queue: list[Any] = [model]
+    seen: set[int] = set()
+
+    while queue:
+        current = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(current)
+
+        for attr in ("base_model", "model"):
+            child = getattr(current, attr, None)
+            if child is not None and id(child) not in seen:
+                queue.append(child)
+
+    return tuple(result)
+
+
+def module_name_or_class(model: Any, target_module: Any) -> str:
+    for name, module in model.named_modules():
+        if module is target_module:
+            return name or target_module.__class__.__name__
+    return target_module.__class__.__name__
 
 
 def configure_gradient_checkpointing(model: Any, config: Config) -> None:
@@ -149,6 +273,44 @@ def apply_lora(config: Config, model: Any) -> Any:
     return get_peft_model(model, peft_config)
 
 
+def validate_peft_reference_support(model: Any) -> None:
+    """Fail before FSDP wrapping if DPO cannot compute its on-the-fly reference."""
+
+    if not callable(getattr(model, "disable_adapter", None)):
+        raise RuntimeError(
+            "DPO on-the-fly reference requires PEFT disable_adapter(); "
+            "the training model must be created with get_peft_model() or loaded as a trainable PeftModel."
+        )
+
+
+def summarize_trainable_parameters(model: Any) -> dict[str, Any]:
+    """Return a compact startup audit for LoRA/FSDP runs."""
+
+    total = 0
+    trainable = 0
+    trainable_names: list[str] = []
+    router_trainable = 0
+    for name, parameter in model.named_parameters():
+        count = int(parameter.numel())
+        total += count
+        if parameter.requires_grad:
+            trainable += count
+            if len(trainable_names) < 20:
+                trainable_names.append(name)
+            lowered = name.lower()
+            if "router" in lowered or ("gate" in lowered and "gate_proj" not in lowered):
+                router_trainable += count
+
+    return {
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "trainable_ratio": (trainable / total) if total else 0.0,
+        "router_trainable_parameters": router_trainable,
+        "trainable_name_sample": trainable_names,
+        "has_disable_adapter": callable(getattr(model, "disable_adapter", None)),
+    }
+
+
 def build_optimizer(config: Config, model: Any) -> Any:
     training = config.training
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -165,11 +327,28 @@ def build_optimizer(config: Config, model: Any) -> Any:
 
 
 def training_steps_for_epochs(config: Config, train_dataloader: Any, *, num_processes: int = 1) -> int:
-    """Resolve epoch count into optimizer steps for the distributed DataLoader."""
+    """Resolve epoch count into full optimizer steps for the distributed DataLoader."""
 
-    micro_batches_per_process = math.ceil(len(train_dataloader) / max(int(num_processes), 1))
-    steps_per_epoch = math.ceil(micro_batches_per_process / config.training.gradient_accumulation_steps)
+    processes = max(int(num_processes), 1)
+    total_micro_batches = int(len(train_dataloader))
+    if total_micro_batches <= 0:
+        raise ValueError("train dataloader must contain at least one micro-batch")
+    if total_micro_batches % processes != 0:
+        raise RuntimeError(
+            "train dataloader length must be divisible by the number of processes before step counting: "
+            f"len={total_micro_batches} num_processes={processes}"
+        )
 
+    micro_batches_per_process = total_micro_batches // processes
+    grad_accum = int(config.training.gradient_accumulation_steps)
+    if micro_batches_per_process % grad_accum != 0:
+        raise RuntimeError(
+            "per-process train dataloader length must be divisible by gradient_accumulation_steps: "
+            f"micro_batches_per_process={micro_batches_per_process} gradient_accumulation_steps={grad_accum}. "
+            "The train sampler must drop or pad the accumulation tail before training starts."
+        )
+
+    steps_per_epoch = micro_batches_per_process // grad_accum
     return steps_per_epoch * config.training.num_epochs
 
 
@@ -210,9 +389,11 @@ def build_training_objects(
     disable_model_kv_cache(model)
     configure_gradient_checkpointing(model, config)
     freeze_configured_modules(model, config)
+    assert_vocab_modules_frozen(model)
 
     target_dtype = precision_to_dtype(config.model.precision)
     cast_floating_parameters(model, target_dtype)
+    validate_peft_reference_support(model)
 
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, total_steps=total_steps)

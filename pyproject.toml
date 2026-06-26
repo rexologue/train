@@ -3,11 +3,11 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "estadel-training"
+name = "sft-dpo-training"
 version = "0.1.0"
 description = "Custom FSDP/LoRA SFT and DPO training contour with MLflow/modelctl registry integration."
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
   "accelerate>=1.14,<2",
   "huggingface-hub>=0.30,<2",
@@ -16,16 +16,18 @@ dependencies = [
   "numpy>=1.26,<3",
   "packaging>=24",
   "pandas>=2.2,<3",
-  "peft>=0.19,<0.20",
+  "peft>=0.19.1,<0.20",
   "pillow>=10,<12",
   "psutil>=5.9,<8",
   "pyarrow>=16,<22",
   "PyYAML>=6,<7",
   "safetensors>=0.4.5,<1",
-  "torch>=2.7,<2.8",
-  "torchvision>=0.22,<0.23",
+  "torch>=2.7,<2.13",
+  # CUDA runtime wheel is required by CUDA/causal-conv1d CUDA extensions.
+  # Pin the cu12 runtime family through constraints/cuda126_kernels.txt for production.
+  "nvidia-cuda-runtime-cu12>=12.6,<13",
   "tqdm>=4.66,<5",
-  "transformers[torch]>=5.0.0.dev0,<6",
+  "transformers[torch]>=5.12,<6",
 ]
 
 [project.optional-dependencies]
@@ -37,19 +39,14 @@ cuda-kernels = [
   "flash-attn>=2.8,<3",
   "ninja>=1.11,<2",
 ]
-transformers-main = [
-  # Qwen3.5 model cards currently require latest Transformers from main.
-  # Install this extra only when the target environment can resolve VCS deps.
-  "transformers[torch,serving] @ git+https://github.com/huggingface/transformers.git@main",
-]
 dev = [
   "pytest>=8,<10",
   "ruff>=0.8,<1",
 ]
 
 [project.scripts]
-estadel-prepare = "prepare:main"
-estadel-train = "train:main"
+sft-dpo-prepare = "prepare:main"
+sft-dpo-train = "train:main"
 ru-bfcl-eval = "eval.ru_bfcl.cli:main"
 
 [tool.setuptools]
@@ -78,7 +75,7 @@ packages = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

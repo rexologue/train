@@ -23,11 +23,15 @@ class RoutedBatchSampler:
         drop_last: bool = False,
         shuffle: bool = True,
         replica_group_size: int = 1,
+        gradient_accumulation_steps: int | None = None,
+        drop_incomplete_accumulation: bool = False,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if replica_group_size <= 0:
             raise ValueError("replica_group_size must be positive")
+        if gradient_accumulation_steps is not None and gradient_accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be positive when provided")
 
         self.loss_kinds = list(loss_kinds)
         self.batch_size = batch_size
@@ -35,8 +39,12 @@ class RoutedBatchSampler:
         self.drop_last = drop_last
         self.shuffle = shuffle
         self.replica_group_size = int(replica_group_size)
+        self.gradient_accumulation_steps = int(gradient_accumulation_steps or 1)
+        self.drop_incomplete_accumulation = bool(drop_incomplete_accumulation)
         self.epoch = 0
         self.num_padded_replica_batches = 0
+        self.num_dropped_accumulation_replica_groups = 0
+        self.num_dropped_accumulation_batches = 0
 
         groups: dict[str, list[int]] = defaultdict(list)
         for index, loss_kind in enumerate(self.loss_kinds):
@@ -51,6 +59,8 @@ class RoutedBatchSampler:
 
         replica_groups: list[list[list[int]]] = []
         self.num_padded_replica_batches = 0
+        self.num_dropped_accumulation_replica_groups = 0
+        self.num_dropped_accumulation_batches = 0
         rng = random.Random(self.seed + self.epoch)
         for indices in self.groups.values():
             route_indices = list(indices)
@@ -66,6 +76,14 @@ class RoutedBatchSampler:
 
         if self.shuffle:
             rng.shuffle(replica_groups)
+
+        if self.drop_incomplete_accumulation and self.gradient_accumulation_steps > 1:
+            usable_group_count = (len(replica_groups) // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
+            dropped_groups = len(replica_groups) - usable_group_count
+            if dropped_groups:
+                self.num_dropped_accumulation_replica_groups = dropped_groups
+                self.num_dropped_accumulation_batches = dropped_groups * self.replica_group_size
+                replica_groups = replica_groups[:usable_group_count]
 
         batches: list[list[int]] = []
         for group in replica_groups:
@@ -134,6 +152,10 @@ class RoutedBatchSampler:
             "shuffle": self.shuffle,
             "replica_group_size": self.replica_group_size,
             "num_padded_replica_batches": self.num_padded_replica_batches,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "drop_incomplete_accumulation": self.drop_incomplete_accumulation,
+            "num_dropped_accumulation_replica_groups": self.num_dropped_accumulation_replica_groups,
+            "num_dropped_accumulation_batches": self.num_dropped_accumulation_batches,
             "seed": self.seed,
             "epoch": self.epoch,
         }

@@ -7,11 +7,92 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+from jinja2.exceptions import TemplateError
 
 from eval.ru_bfcl import BFCLRequest, normalize_prediction
 
 
 TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+class BFCLTokenizerError(RuntimeError):
+    """Raised when a BFCL sample cannot be rendered or tokenized."""
+
+    def __init__(self, request: BFCLRequest, cause: BaseException):
+        self.request = request
+        self.cause = cause
+        super().__init__(
+            "BFCL tokenizer/rendering failed: "
+            f"{describe_bfcl_request(request)}; "
+            f"error={type(cause).__name__}: {cause}"
+        )
+
+
+def describe_bfcl_request(request: BFCLRequest) -> str:
+    """Return compact BFCL request context for skip/debug logs."""
+
+    roles = [message.get("role") for message in request.messages if isinstance(message, dict)]
+    user_messages = [
+        message
+        for message in request.messages
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        and message.get("content", "").strip()
+    ]
+    last_role = roles[-1] if roles else None
+    return (
+        f"sample_id={request.sample.id} "
+        f"category={request.sample.category} "
+        f"source_file={request.sample.source_file} "
+        f"turn_index={request.turn_index} "
+        f"is_multi_turn={request.sample.is_multi_turn} "
+        f"roles={roles} "
+        f"last_role={last_role} "
+        f"non_empty_user_messages={len(user_messages)} "
+        f"tools={len(request.tools)}"
+    )
+
+
+def render_bfcl_request(*, tokenizer: Any, config: Any, request: BFCLRequest) -> str:
+    """Render a BFCL request through the model chat template.
+
+    Tool-calling chat templates can raise Jinja TemplateError for malformed
+    conversational shapes, for example when no user query is present. Convert
+    those errors into BFCLTokenizerError so eval code can quarantine the sample
+    without hiding unrelated generation/runtime failures.
+    """
+
+    kwargs = {
+        "tools": request.tools,
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "enable_thinking": config.preprocessing.reasoning.enable_thinking,
+    }
+
+    try:
+        return tokenizer.apply_chat_template(request.messages, **kwargs)
+    except TypeError:
+        # Some tokenizers/templates do not accept enable_thinking. Preserve the
+        # previous compatibility path, but wrap failures from the retry as BFCL
+        # tokenizer/rendering errors.
+        kwargs.pop("enable_thinking", None)
+        try:
+            return tokenizer.apply_chat_template(request.messages, **kwargs)
+        except (TemplateError, TypeError, ValueError, KeyError) as exc:
+            raise BFCLTokenizerError(request, exc) from exc
+    except (TemplateError, ValueError, KeyError) as exc:
+        raise BFCLTokenizerError(request, exc) from exc
+
+
+def tokenize_bfcl_request(*, tokenizer: Any, config: Any, request: BFCLRequest) -> dict[str, Any]:
+    """Render and tokenize a BFCL request, converting tokenizer failures."""
+
+    rendered = render_bfcl_request(tokenizer=tokenizer, config=config, request=request)
+    try:
+        return tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise BFCLTokenizerError(request, exc) from exc
 
 
 class BFCLModelPredictor:
@@ -24,8 +105,7 @@ class BFCLModelPredictor:
         self.accelerator = accelerator
 
     def __call__(self, request: BFCLRequest) -> list[dict[str, Any]]:
-        rendered = self._render_request(request)
-        inputs = self.tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
+        inputs = tokenize_bfcl_request(tokenizer=self.tokenizer, config=self.config, request=request)
         device = self.accelerator.device if self.accelerator is not None else next(self.model.parameters()).device
         inputs = {key: value.to(device) for key, value in inputs.items()}
         input_length = int(inputs["input_ids"].shape[-1])
@@ -83,19 +163,6 @@ class BFCLModelPredictor:
         finally:
             if was_training:
                 self.model.train()
-
-    def _render_request(self, request: BFCLRequest) -> str:
-        kwargs = {
-            "tools": request.tools,
-            "tokenize": False,
-            "add_generation_prompt": True,
-            "enable_thinking": self.config.preprocessing.reasoning.enable_thinking,
-        }
-        try:
-            return self.tokenizer.apply_chat_template(request.messages, **kwargs)
-        except TypeError:
-            kwargs.pop("enable_thinking", None)
-            return self.tokenizer.apply_chat_template(request.messages, **kwargs)
 
 
 def extract_tool_calls(text: str) -> list[dict[str, Any]]:

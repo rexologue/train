@@ -158,8 +158,5 @@ class PretokenizedDataset:
             normalized[f"{side}_labels"] = labels
             normalized[f"{side}_length"] = int(_optional(row.get(f"{side}_length")) or len(input_ids))
             normalized[f"{side}_completion_token_count"] = int(_optional(row.get(f"{side}_completion_token_count")) or 0)
-            ref_logp = _optional_float(row.get(f"{side}_ref_logp"))
-            if ref_logp is not None:
-                normalized[f"{side}_ref_logp"] = ref_logp
 
         return normalized

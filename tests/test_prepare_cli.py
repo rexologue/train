@@ -36,7 +36,7 @@ def test_prepare_cli_reuses_valid_cache_by_default(monkeypatch) -> None:
         calls["worker_chunk_size"] = worker_chunk_size
         return []
 
-    monkeypatch.setattr(sys, "argv", ["estadel-prepare", "--config", "configs/config.example.yaml"])
+    monkeypatch.setattr(sys, "argv", ["sft-dpo-prepare", "--config", "configs/config.example.yaml"])
     monkeypatch.setattr(prepare, "resolve_model_source", fake_resolve_model_source)
     monkeypatch.setattr(prepare, "prepare_pretokenized_splits", fake_prepare_pretokenized_splits)
 
@@ -80,7 +80,7 @@ def test_prepare_cli_force_rebuilds_pretokenized_cache(monkeypatch) -> None:
         sys,
         "argv",
         [
-            "estadel-prepare",
+            "sft-dpo-prepare",
             "--config",
             "configs/config.example.yaml",
             "--force",
@@ -104,7 +104,7 @@ def test_prepare_cli_rejects_non_positive_workers(monkeypatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
-        ["estadel-prepare", "--config", "configs/config.example.yaml", "--workers", "0"],
+        ["sft-dpo-prepare", "--config", "configs/config.example.yaml", "--workers", "0"],
     )
 
     with pytest.raises(SystemExit):

@@ -104,7 +104,6 @@ class RoutedTrainer:
                 beta=float(self.config.loss_routing.dpo.beta),
                 ignore_index=int(self.config.ignore_index),
                 accelerator=self.accelerator,
-                cache_required=bool(self.config.loss_routing.dpo.reference.cache_required),
             )
             self.last_loss_metrics = result.metrics
             return result.loss
@@ -147,8 +146,6 @@ class RoutedTrainer:
         max_grad_norm = float(self.config.training.max_grad_norm if self.config is not None else 0.0)
         ignore_index = int(getattr(self.config, "ignore_index", -100)) if self.config is not None else -100
         state = state or TrainerState()
-        train_iterator = iter(train_dataloader)
-        train_iterator = _advance_iterator(train_iterator, train_dataloader, state.consumed_batches)
         exact_epoch_mode = total_micro_batches is not None
         target_micro_batches = (
             _positive_int(total_micro_batches, "total_micro_batches")
@@ -157,7 +154,27 @@ class RoutedTrainer:
         )
         batches_per_epoch = len(train_dataloader) if exact_epoch_mode else 0  # type: ignore[arg-type]
         if exact_epoch_mode:
+            if batches_per_epoch <= 0:
+                raise ValueError("train dataloader must contain at least one micro-batch")
+            if batches_per_epoch % grad_accum != 0:
+                raise RuntimeError(
+                    "exact epoch training requires len(train_dataloader) to be divisible by "
+                    "training.gradient_accumulation_steps: "
+                    f"len={batches_per_epoch} gradient_accumulation_steps={grad_accum}"
+                )
+            if target_micro_batches % grad_accum != 0:
+                raise RuntimeError(
+                    "target_micro_batches must be divisible by training.gradient_accumulation_steps: "
+                    f"target_micro_batches={target_micro_batches} gradient_accumulation_steps={grad_accum}"
+                )
+            if state.consumed_batches % grad_accum != 0:
+                raise RuntimeError(
+                    "resume state is not on an optimizer-step boundary: "
+                    f"consumed_batches={state.consumed_batches} gradient_accumulation_steps={grad_accum}"
+                )
             _set_epoch(train_dataloader, state.consumed_batches // batches_per_epoch)
+        train_iterator = iter(train_dataloader)
+        train_iterator = _advance_iterator(train_iterator, train_dataloader, state.consumed_batches)
 
         accumulated_loss = 0.0
         step_samples = 0
@@ -174,12 +191,6 @@ class RoutedTrainer:
         optimizer.zero_grad(set_to_none=True)
 
         while state.global_step < total_steps and state.consumed_batches < target_micro_batches:
-            if accumulated_batches == 0 and exact_epoch_mode:
-                batches_into_epoch = state.consumed_batches % batches_per_epoch
-                remaining_in_epoch = batches_per_epoch - batches_into_epoch
-                remaining_total = target_micro_batches - state.consumed_batches
-                accumulation_target = min(grad_accum, remaining_in_epoch, remaining_total)
-
             with self.accelerator.accumulate(model):
                 batch, train_iterator = _cycle_next(train_iterator, train_dataloader)
                 loss = self.compute_loss(model, batch)
@@ -192,24 +203,14 @@ class RoutedTrainer:
                 step_samples += batch_stats["samples"]
                 step_tokens += batch_stats["tokens"]
                 step_supervised_tokens += batch_stats["supervised_tokens"]
-                backward_loss = loss
-                accelerator_grad_accum = int(getattr(self.accelerator, "gradient_accumulation_steps", 1))
-
-                if exact_epoch_mode and accumulation_target < accelerator_grad_accum:
-                    backward_loss = loss * (accelerator_grad_accum / accumulation_target)
-
-                self.accelerator.backward(backward_loss)
+                self.accelerator.backward(loss)
                 state.consumed_batches += 1
                 accumulated_batches += 1
 
             epoch_boundary = exact_epoch_mode and state.consumed_batches % batches_per_epoch == 0
             if epoch_boundary:
                 _set_epoch(train_dataloader, state.consumed_batches // batches_per_epoch)
-            should_step = (
-                accumulated_batches >= accumulation_target
-                or epoch_boundary
-                or state.consumed_batches >= target_micro_batches
-            )
+            should_step = accumulated_batches >= accumulation_target
             if not should_step:
                 continue
             if hasattr(self.accelerator, "sync_gradients") and not self.accelerator.sync_gradients:

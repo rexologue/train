@@ -44,14 +44,12 @@ def write_pretok(path) -> None:
                 "chosen_length": 2,
                 "chosen_completion_token_count": 1,
                 "chosen_render_hash": "chosen-hash",
-                "chosen_ref_logp": -0.25,
                 "rejected_input_ids": [6],
                 "rejected_attention_mask": [1],
                 "rejected_labels": [6],
                 "rejected_length": 1,
                 "rejected_completion_token_count": 1,
                 "rejected_render_hash": "rejected-hash",
-                "rejected_ref_logp": -0.75,
             },
         ]
     ).to_parquet(path, index=False)
@@ -159,15 +157,17 @@ def test_routed_collator_rejects_mixed_loss_kind_batch() -> None:
         )
 
 
-def test_pretokenized_dataset_normalizes_dpo_ref_logps(tmp_path) -> None:
+def test_pretokenized_dataset_normalizes_dpo_pair_fields(tmp_path) -> None:
     path = tmp_path / "train.parquet"
     write_pretok(path)
 
     dataset = PretokenizedDataset.from_parquet(path, split="train")
     dpo = next(row for row in dataset.rows if row["loss_kind"] == "dpo_target")
 
-    assert dpo["chosen_ref_logp"] == -0.25
-    assert dpo["rejected_ref_logp"] == -0.75
+    assert dpo["chosen_input_ids"] == [4, 5]
+    assert dpo["rejected_input_ids"] == [6]
+    assert "chosen_ref_logp" not in dpo
+    assert "rejected_ref_logp" not in dpo
     assert dataset.loss_kind_counts == {"sft_target": 1, "sft_tool": 1, "dpo_target": 1}
 
 
@@ -176,7 +176,7 @@ def test_build_dataloaders_from_pretokenized_parquet(tmp_path) -> None:
     valid_path = tmp_path / "valid.parquet"
     write_pretok(train_path)
     write_pretok(valid_path)
-    config = example_config(training={"per_device_train_batch_size": 1})
+    config = example_config(training={"per_device_train_batch_size": 1, "gradient_accumulation_steps": 1})
 
     bundle = build_dataloaders(
         config,
@@ -197,7 +197,7 @@ def test_build_dataloaders_aligns_route_batches_for_distributed_sharding(tmp_pat
     valid_path = tmp_path / "valid.parquet"
     write_pretok(train_path)
     write_pretok(valid_path)
-    config = example_config(training={"per_device_train_batch_size": 1})
+    config = example_config(training={"per_device_train_batch_size": 1, "gradient_accumulation_steps": 1})
 
     bundle = build_dataloaders(
         config,
@@ -220,7 +220,9 @@ def test_validate_training_inputs_rejects_unconfigured_data_route(tmp_path) -> N
     valid_path = tmp_path / "valid.parquet"
     write_pretok(train_path)
     write_pretok(valid_path)
-    config_data = example_config(training={"per_device_train_batch_size": 1}).to_dict()
+    config_data = example_config(
+        training={"per_device_train_batch_size": 1, "gradient_accumulation_steps": 1}
+    ).to_dict()
     del config_data["loss_routing"]["routes"]["dpo_target"]
     config = Config.from_dict(config_data)
     bundle = build_dataloaders(

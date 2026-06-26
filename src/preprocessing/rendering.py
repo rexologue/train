@@ -64,7 +64,7 @@ def _message_completion_text(message: dict[str, Any]) -> str:
     return str(message.get("content") or "")
 
 
-class QwenTemplateRenderer:
+class ChatTemplateRenderer:
     """Small wrapper around tokenizer `apply_chat_template`.
 
     Production preprocessing uses the official tokenizer template. The fallback

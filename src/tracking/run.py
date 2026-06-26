@@ -182,26 +182,6 @@ class ExperimentTracker:
                 for loss_kind, count in loss_kind_counts.items():
                     self.mlflow.log_metric(f"dataloader/{split}/loss_kind/{loss_kind}", int(count))
 
-    def log_ref_logprob_cache(self, state: Any) -> None:
-        """Log DPO reference-logprob cache state."""
-
-        if not self.enabled:
-            return
-        summary = {
-            "cache_dir": str(state.cache_dir),
-            "signature": str(state.signature),
-            "applied_rows": int(state.applied_rows),
-            "missing_rows": int(state.missing_rows),
-            "complete": bool(state.complete),
-        }
-        self.mlflow.log_dict(summary, "dpo/ref_logprob_cache.json")
-        self.mlflow.log_metric("dpo/ref_logprob_cache/applied_rows", int(state.applied_rows))
-        self.mlflow.log_metric("dpo/ref_logprob_cache/missing_rows", int(state.missing_rows))
-        self.mlflow.log_metric("dpo/ref_logprob_cache/complete", 1 if state.complete else 0)
-        manifest_path = Path(state.cache_dir) / "manifest.json"
-        if manifest_path.exists():
-            self.mlflow.log_artifact(str(manifest_path), artifact_path="dpo/ref_logprob_cache")
-
     def create_async_worker(self) -> AsyncTrackingWorker | None:
         """Create a CPU-only async worker for metrics, artifacts, and registry jobs."""
 

@@ -21,7 +21,7 @@ from checkpointing import (
 )
 from config import load_config
 from data.dataloaders import build_dataloaders, validate_training_inputs
-from eval.bfcl import run_bfcl_eval
+from eval.bfcl import prepare_bfcl_eval, run_bfcl_eval
 from eval.ordinary import run_standard_eval
 from preprocessing.io import load_pretokenized_split_results
 from registry.modelctl_client import ModelctlClient
@@ -31,9 +31,8 @@ from tracking import ExperimentTracker
 from tracking.model_source import load_model_source_resolution_from_cache
 from trainer.callbacks import TrainerHooks
 from trainer.distributed import create_accelerator, prepare_with_accelerator
-from trainer.modeling import build_training_objects, load_tokenizer, training_steps_for_epochs
+from trainer.modeling import build_training_objects, load_tokenizer, summarize_trainable_parameters, training_steps_for_epochs
 from trainer.progress import TrainingProgress
-from trainer.ref_logprobs import ensure_ref_logprob_cache
 from trainer.state import TrainerState
 from trainer.trainer import RoutedTrainer
 from utils.logging import configure_logging, get_logger
@@ -68,7 +67,10 @@ def main() -> None:
 
     with tracker:
         if is_main_process:
-            tracker.model_source_resolution = load_model_source_resolution_from_cache(config)
+            # The main process owns registry resolution. It may pull/verify the
+            # configured model cache and always writes the local sidecar that
+            # worker processes read after the barrier below.
+            tracker.model_source_resolution = tracker.resolve_model_source()
 
             logger.info(
                 "registry model resolved: effective_model_id=%s ref=%s pulled=%s used_local=%s",
@@ -78,7 +80,6 @@ def main() -> None:
                 tracker.model_source_resolution.used_local,
             )
 
-            tracker.log_model_source_resolution(tracker.model_source_resolution)
             tracker.log_run_start(config_path=args.config)
             tracker.log_lineage()
 
@@ -114,13 +115,15 @@ def main() -> None:
             summary = split_loader.summary
             logger.info(
                 "dataloader ready: split=%s rows=%s batches=%s short_batches=%s "
-                "replica_group_size=%s padded_replica_batches=%s loss_kinds=%s path=%s",
+                "replica_group_size=%s padded_replica_batches=%s dropped_accumulation_batches=%s "
+                "loss_kinds=%s path=%s",
                 split,
                 summary["num_rows"],
                 summary["num_batches"],
                 summary["num_short_batches"],
                 summary["replica_group_size"],
                 summary["num_padded_replica_batches"],
+                summary.get("num_dropped_accumulation_batches", 0),
                 summary["loss_kind_counts"],
                 summary["path"],
             )
@@ -129,22 +132,7 @@ def main() -> None:
             tracker.log_dataloaders(dataloaders)
 
         validate_training_inputs(config, dataloaders)
-        logger.info("ensuring DPO reference-logprob cache")
-        ref_cache_state = ensure_ref_logprob_cache(
-            config=config,
-            dataloaders=dataloaders,
-            accelerator=accelerator,
-            model_source=tracker.model_source_resolution,
-        )
-        if is_main_process:
-            logger.info(
-                "DPO ref-logprob cache: complete=%s applied=%s missing=%s path=%s",
-                ref_cache_state.complete,
-                ref_cache_state.applied_rows,
-                ref_cache_state.missing_rows,
-                ref_cache_state.cache_dir,
-            )
-            tracker.log_ref_logprob_cache(ref_cache_state)
+        logger.info("DPO reference mode: on-the-fly PEFT adapter disable; no precompute cache")
 
         run_training(config, dataloaders, tracker, runtime=runtime)
 
@@ -185,12 +173,29 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
         resume_adapter_path=adapter_dir(resume_checkpoint) if resume_checkpoint is not None else None,
         tokenizer=resume_hash_tokenizer,
     )
+    audit = summarize_trainable_parameters(objects.model)
+    logger.info(
+        "model trainability audit: total=%s trainable=%s ratio=%.6f router_trainable=%s has_disable_adapter=%s sample=%s",
+        audit["total_parameters"],
+        audit["trainable_parameters"],
+        audit["trainable_ratio"],
+        audit["router_trainable_parameters"],
+        audit["has_disable_adapter"],
+        audit["trainable_name_sample"],
+    )
     if resume_checkpoint is None:
         current_resume_hashes = build_resume_hashes(
             config,
             tokenizer=objects.tokenizer,
             model_source=tracker.model_source_resolution,
         )
+
+    prepare_bfcl_eval(
+        tokenizer=objects.tokenizer,
+        config=config,
+        accelerator=accelerator,
+    )
+    accelerator.wait_for_everyone()
 
     train_loader = dataloaders["train"].dataloader
     valid_loader = dataloaders["valid"].dataloader

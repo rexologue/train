@@ -12,6 +12,14 @@ def default_eval_path() -> Path:
     return Path(str(files("eval.ru_bfcl.data").joinpath("bfcl_eval.jsonl")))
 
 
+def resolve_bfcl_eval_path(path: str | Path | None = None) -> Path:
+    """Resolve the BFCL JSONL path used by loaders and logs."""
+
+    if path is None:
+        return default_eval_path()
+    return Path(path).expanduser().resolve(strict=False)
+
+
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     with Path(path).open(encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -33,7 +41,8 @@ def load_bfcl_eval(
     limit: int | None = None,
 ) -> list[BFCLEvalSample]:
     samples: list[BFCLEvalSample] = []
-    for row in load_jsonl(default_eval_path() if path is None else path):
+    eval_path = resolve_bfcl_eval_path(path)
+    for row in load_jsonl(eval_path):
         sample = BFCLEvalSample(
             id=row["id"],
             category=row["category"],

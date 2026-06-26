@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 import losses.dpo as dpo_module
@@ -36,6 +35,40 @@ class TinyLogitModel:
         logits[..., 6] = 1.0
         return SimpleNamespace(logits=logits)
 
+
+
+class AdapterAwareTinyLogitModel:
+    def __init__(self) -> None:
+        self.adapter_enabled = True
+        self.call_input_shapes = []
+
+    def disable_adapter(self):
+        model = self
+
+        class DisableAdapterContext:
+            def __enter__(self):
+                self.previous = model.adapter_enabled
+                model.adapter_enabled = False
+                return model
+
+            def __exit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                model.adapter_enabled = self.previous
+                return False
+
+        return DisableAdapterContext()
+
+    def __call__(self, *, input_ids, attention_mask=None, **kwargs):
+        del attention_mask, kwargs
+        self.call_input_shapes.append(tuple(input_ids.shape))
+        logits = torch.zeros((*input_ids.shape, 16), dtype=torch.float32, device=input_ids.device)
+        if self.adapter_enabled:
+            logits[..., 5] = 3.0
+            logits[..., 6] = 1.0
+        else:
+            logits[..., 5] = 2.0
+            logits[..., 6] = 2.0
+        return SimpleNamespace(logits=logits)
 
 class CompactLogitModel:
     def __init__(self) -> None:
@@ -93,18 +126,16 @@ def test_sft_loss_requests_only_selected_label_positions() -> None:
     assert model.seen_logits_to_keep == [0, 2]
 
 
-def test_dpo_loss_uses_cached_reference_logprobs() -> None:
-    model = TinyLogitModel()
+def test_dpo_loss_uses_on_the_fly_disabled_adapter_reference() -> None:
+    model = AdapterAwareTinyLogitModel()
     batch = {
         "loss_kind": "dpo_target",
         "chosen_input_ids": torch.tensor([[1, 5]]),
         "chosen_attention_mask": torch.tensor([[1, 1]]),
         "chosen_labels": torch.tensor([[-100, 5]]),
-        "rejected_input_ids": torch.tensor([[1, 6]]),
-        "rejected_attention_mask": torch.tensor([[1, 1]]),
-        "rejected_labels": torch.tensor([[-100, 6]]),
-        "chosen_ref_logp": torch.tensor([-1.0]),
-        "rejected_ref_logp": torch.tensor([-1.0]),
+        "rejected_input_ids": torch.tensor([[1, 6, 0]]),
+        "rejected_attention_mask": torch.tensor([[1, 1, 0]]),
+        "rejected_labels": torch.tensor([[-100, 6, -100]]),
     }
 
     result = dpo_loss(
@@ -113,11 +144,13 @@ def test_dpo_loss_uses_cached_reference_logprobs() -> None:
         beta=0.1,
         ignore_index=-100,
         accelerator=DummyAccelerator(),
-        cache_required=True,
     )
 
     assert torch.isfinite(result.loss)
+    assert model.adapter_enabled is True
+    assert model.call_input_shapes == [(2, 3), (2, 3)]
     assert result.metrics["dpo/policy_chosen_logp"] > result.metrics["dpo/policy_rejected_logp"]
+    assert result.metrics["dpo/ref_chosen_logp"] == result.metrics["dpo/ref_rejected_logp"]
     assert result.metrics["dpo/accuracy"] == 1.0
 
 
@@ -154,7 +187,7 @@ def test_sequence_logps_requests_only_selected_label_positions() -> None:
     assert torch.isfinite(logps).all()
 
 
-def test_dpo_loss_requires_precomputed_reference_logprobs() -> None:
+def test_dpo_loss_requires_peft_disable_adapter_for_reference() -> None:
     batch = {
         "loss_kind": "dpo_target",
         "chosen_input_ids": torch.tensor([[1, 5]]),
@@ -165,15 +198,18 @@ def test_dpo_loss_requires_precomputed_reference_logprobs() -> None:
         "rejected_labels": torch.tensor([[-100, 6]]),
     }
 
-    with pytest.raises(ValueError, match="reference logprobs are missing"):
+    try:
         dpo_loss(
             TinyLogitModel(),
             batch,
             beta=0.1,
             ignore_index=-100,
             accelerator=DummyAccelerator(),
-            cache_required=False,
         )
+    except RuntimeError as exc:
+        assert "disable_adapter" in str(exc)
+    else:
+        raise AssertionError("expected non-PEFT DPO model to fail")
 
 
 def test_routed_trainer_dispatches_dpo_and_records_route_metrics() -> None:
@@ -186,11 +222,9 @@ def test_routed_trainer_dispatches_dpo_and_records_route_metrics() -> None:
         "rejected_input_ids": torch.tensor([[1, 6]]),
         "rejected_attention_mask": torch.tensor([[1, 1]]),
         "rejected_labels": torch.tensor([[-100, 6]]),
-        "chosen_ref_logp": torch.tensor([-1.0]),
-        "rejected_ref_logp": torch.tensor([-1.0]),
     }
 
-    loss = trainer.compute_loss(TinyLogitModel(), batch)
+    loss = trainer.compute_loss(AdapterAwareTinyLogitModel(), batch)
 
     assert torch.isfinite(loss)
     assert "dpo/reward_margin" in trainer.last_loss_metrics

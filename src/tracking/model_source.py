@@ -195,7 +195,7 @@ def pull_registry_model(
 def registry_metadata_path(local_dir: Path) -> Path:
     """Return the sidecar path stored outside the model payload directory."""
 
-    return local_dir.with_name(f"{local_dir.name}.estadel_registry.json")
+    return local_dir.with_name(f"{local_dir.name}.sft_dpo_registry.json")
 
 
 def build_registry_sidecar(

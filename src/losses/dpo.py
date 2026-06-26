@@ -90,10 +90,10 @@ def align_kept_logits(
 ) -> tuple[Any, Any, Any]:
     """Align compact `logits_to_keep` outputs with target ids and loss mask.
 
-    Qwen-style models support `logits_to_keep=<positions>` and return logits
-    only for those original hidden-state positions. Some test doubles or older
-    models may ignore the kwarg and return full sequence logits; keep that path
-    working without changing the DPO math.
+    Some causal LM implementations support `logits_to_keep=<positions>` and
+    return logits only for those original hidden-state positions. Some test
+    doubles or older models may ignore the kwarg and return full sequence
+    logits; keep that path working without changing the DPO math.
     """
 
     if logits.shape[1] == keep_positions.numel():
@@ -110,31 +110,26 @@ def dpo_loss(
     beta: float,
     ignore_index: int,
     accelerator: Any | None = None,
-    cache_required: bool = False,
 ) -> DpoLossResult:
-    """Compute one DPO batch loss with precomputed reference logprobs."""
+    """Compute one DPO batch with an on-the-fly PEFT reference policy.
 
-    del accelerator, cache_required
+    There is intentionally no reference-logprob cache and no second reference
+    model. The policy forward uses the active LoRA adapter. The reference forward
+    runs the same FSDP-wrapped model under ``no_grad`` with PEFT adapters disabled.
+    """
 
-    policy_chosen_logp = sequence_logps(
-        model,
-        input_ids=batch["chosen_input_ids"],
-        attention_mask=batch.get("chosen_attention_mask"),
-        labels=batch["chosen_labels"],
-        ignore_index=ignore_index,
-    )
-    policy_rejected_logp = sequence_logps(
-        model,
-        input_ids=batch["rejected_input_ids"],
-        attention_mask=batch.get("rejected_attention_mask"),
-        labels=batch["rejected_labels"],
-        ignore_index=ignore_index,
-    )
-    ref_chosen_logp, ref_rejected_logp = reference_logps(
+    policy_chosen_logp, policy_rejected_logp = concatenated_dpo_logps(
         model,
         batch,
         ignore_index=ignore_index,
     )
+
+    with torch.no_grad(), peft_adapter_disabled(model, accelerator=accelerator):
+        ref_chosen_logp, ref_rejected_logp = concatenated_dpo_logps(
+            model,
+            batch,
+            ignore_index=ignore_index,
+        )
 
     policy_logratio = policy_chosen_logp - policy_rejected_logp
     ref_logratio = ref_chosen_logp - ref_rejected_logp
@@ -156,32 +151,105 @@ def dpo_loss(
     return DpoLossResult(loss=losses.mean(), metrics=metrics)
 
 
-def reference_logps(
-    model: Any,
-    batch: dict[str, Any],
-    *,
-    ignore_index: int,
-) -> tuple[Any, Any]:
-    """Return precomputed reference logprobs attached to the DPO batch."""
+def concatenated_dpo_logps(model: Any, batch: dict[str, Any], *, ignore_index: int) -> tuple[Any, Any]:
+    """Run chosen and rejected continuations in one forward pass."""
 
-    del model, ignore_index
-    cached = cached_reference_logps(batch)
-    if cached is None:
-        raise ValueError(
-            "DPO reference logprobs are missing from batch; run reference precompute with "
-            "loss_routing.dpo.reference.cache_enabled=true before training"
+    chosen_input_ids = batch["chosen_input_ids"]
+    rejected_input_ids = batch["rejected_input_ids"]
+    chosen_size = int(chosen_input_ids.shape[0])
+    rejected_size = int(rejected_input_ids.shape[0])
+    if chosen_size != rejected_size:
+        raise ValueError(f"DPO chosen/rejected batch sizes differ: {chosen_size} != {rejected_size}")
+
+    input_ids = concat_pair_padded(
+        chosen_input_ids,
+        rejected_input_ids,
+        pad_value=0,
+    )
+    attention_mask = concat_pair_padded(
+        batch["chosen_attention_mask"],
+        batch["rejected_attention_mask"],
+        pad_value=0,
+    )
+    labels = concat_pair_padded(
+        batch["chosen_labels"],
+        batch["rejected_labels"],
+        pad_value=int(ignore_index),
+    )
+
+    logps = sequence_logps(
+        model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        ignore_index=ignore_index,
+    )
+    return logps[:chosen_size], logps[chosen_size:]
+
+
+def concat_pair_padded(chosen: Any, rejected: Any, *, pad_value: int) -> Any:
+    """Pad two [batch, seq] tensors to a shared length and concatenate by batch."""
+
+    target_len = max(int(chosen.shape[1]), int(rejected.shape[1]))
+    return torch.cat(
+        [
+            pad_to_length(chosen, target_len, pad_value=pad_value),
+            pad_to_length(rejected, target_len, pad_value=pad_value),
+        ],
+        dim=0,
+    )
+
+
+def pad_to_length(tensor: Any, target_len: int, *, pad_value: int) -> Any:
+    """Right-pad a [batch, seq] tensor to target_len."""
+
+    if int(tensor.shape[1]) == int(target_len):
+        return tensor
+    if int(tensor.shape[1]) > int(target_len):
+        raise ValueError(f"cannot pad seq_len={tensor.shape[1]} down to target_len={target_len}")
+    pad_width = int(target_len) - int(tensor.shape[1])
+    return F.pad(tensor, (0, pad_width), value=pad_value)
+
+
+def peft_adapter_disabled(model: Any, *, accelerator: Any | None = None) -> Any:
+    """Return PEFT's adapter-disable context for wrapped or unwrapped models."""
+
+    target = find_disable_adapter_owner(model, accelerator=accelerator)
+    if target is None:
+        raise RuntimeError(
+            "DPO on-the-fly reference requires a PEFT LoRA model with disable_adapter(). "
+            "Build the model through PEFT/get_peft_model before FSDP wrapping."
         )
-    return cached
+    return target.disable_adapter()
 
 
-def cached_reference_logps(batch: dict[str, Any]) -> tuple[Any, Any] | None:
-    """Return cached reference logprobs when both sides are present."""
+def find_disable_adapter_owner(model: Any, *, accelerator: Any | None = None) -> Any | None:
+    """Find the object that owns PEFT's disable_adapter context method."""
 
-    chosen = batch.get("chosen_ref_logp")
-    rejected = batch.get("rejected_ref_logp")
-    if chosen is None or rejected is None:
-        return None
-    return chosen, rejected
+    candidates: list[Any] = []
+    if accelerator is not None and hasattr(accelerator, "unwrap_model"):
+        try:
+            candidates.append(accelerator.unwrap_model(model))
+        except Exception:
+            pass
+    candidates.append(model)
+
+    seen: set[int] = set()
+    while candidates:
+        candidate = candidates.pop(0)
+        if candidate is None:
+            continue
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if callable(getattr(candidate, "disable_adapter", None)):
+            return candidate
+        for attr in ("module", "model", "base_model"):
+            child = getattr(candidate, attr, None)
+            if child is not None:
+                candidates.append(child)
+    return None
 
 
 def tensor_mean(value: Any) -> float:

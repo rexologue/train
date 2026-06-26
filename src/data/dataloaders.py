@@ -115,6 +115,10 @@ def build_dataloaders(
             drop_last=drop_last,
             shuffle=True,
             replica_group_size=replica_group_size,
+            gradient_accumulation_steps=(
+                config.training.gradient_accumulation_steps if split == "train" else None
+            ),
+            drop_incomplete_accumulation=(split == "train"),
         )
         if split in REQUIRED_TRAINING_SPLITS and len(sampler) == 0:
             raise ValueError(

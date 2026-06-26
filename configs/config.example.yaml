@@ -5,18 +5,18 @@
 #
 # The run always executes the same high-level pipeline:
 # modelctl/MLflow source resolution -> preprocessing cache -> routed dataloaders
-# -> optional DPO reference-logprob cache -> FSDP LoRA training -> ordinary eval
+# -> FSDP LoRA training with on-the-fly DPO reference -> ordinary eval
 # -> optional BFCL eval -> checkpointing -> MLflow logging -> candidate registry.
 
 project:
   # MLflow experiment name. Candidate adapters are also registered into the
   # registry model with this exact name, so use a stable model-family name, not
   # a one-off run label.
-  name: estadel-dialog-tuning
+  name: dialog-sft-dpo
 
   # MLflow run name. This is safe to change for each attempt, seed, dataset
   # version, or hyperparameter sweep.
-  run_name: qwen35-a3b-lora-sft-dpo-v1
+  run_name: source-lora-sft-dpo-v1
 
   # Seed for Python, torch, preprocessing short-reply sampling, and routed
   # sampler shuffling. Change it only when intentionally running a new trial.
@@ -25,25 +25,24 @@ project:
   # Single local root for all generated run artifacts. The trainer derives
   # these paths under it:
   #   pretokenized/
-  #   ref_logprobs/<signature>/
   #   checkpoints/
   #   eval/bfcl_rows.jsonl
   # Use a fresh directory for clean experiments. Reuse it only when you want
   # cache/resume behavior.
-  output_dir: runs/estadel-dialog-tuning/qwen35-a3b-lora-sft-dpo-v1
+  output_dir: runs/dialog-sft-dpo/source-lora-sft-dpo-v1
 
 model:
   # Source model registry name and alias. The trainer resolves models:/<name>@<alias>
   # through modelctl. Do not point the tokenizer elsewhere: tokenizer is loaded
   # from the resolved model payload directory.
-  name: estadel-llm
+  name: source-llm
   alias: champion
 
   # Local payload cache for the source model. Main process verifies this
   # directory against registry metadata and pulls into it when missing/stale.
   # For shared machines, prefer a stable cache outside output_dir so repeated
   # runs do not download the same base model.
-  cache_dir: artifacts/model_cache/estadel-llm/champion
+  cache_dir: artifacts/model_cache/source-llm/champion
 
   checks:
     # Verify the local payload hash before using cache_dir. Keep true for
@@ -61,7 +60,7 @@ model:
     require_registry_metadata: true
 
   # Base model load dtype. bf16 is the normal production choice for Ampere+
-  # GPUs and Qwen-style training. fp16 can be less stable. fp32 is for debugging
+  # GPUs and large-model training. fp16 can be less stable. fp32 is for debugging
   # only and is usually too memory-heavy.
   precision: bf16
 
@@ -84,12 +83,10 @@ model:
   # both because double checkpointing is expensive and ambiguous.
   gradient_checkpointing: false
 
-  # Freeze non-LoRA base components. For LoRA-only tuning these should usually
-  # stay true: fewer trainable params, lower optimizer memory, cleaner adapter
-  # checkpoints. Set false only when intentionally training those base weights.
+  # Freeze router/gate parameters outside the LoRA adapter. Vocab modules are
+  # always frozen by the trainer because DPO reference passes disable adapters
+  # on the same model.
   freeze_router: true
-  freeze_embeddings: true
-  freeze_lm_head: true
 
 tokenizer:
   # Loaded from model.cache_dir. Fast tokenizer is expected for offset-aware
@@ -130,7 +127,7 @@ lora:
     - o_proj
 
   # Extra non-LoRA modules to save/train with the adapter. Keep empty for pure
-  # LoRA. Do not include lm_head when model.freeze_lm_head=true; schema rejects it.
+  # LoRA. Do not include vocab projection modules; the trainer freezes them.
   modules_to_save: []
 
 preprocessing:
@@ -148,7 +145,7 @@ preprocessing:
     test_required: false
 
   workers:
-    # CPU process workers used only by estadel-prepare. 1 preserves the
+    # CPU process workers used only by sft-dpo-prepare. 1 preserves the
     # deterministic single-process path and is the safest debugging default.
     # Increase to 4-8 for large datasets after checking host RAM: each worker
     # loads its own tokenizer and holds one processed chunk at a time.
@@ -234,23 +231,10 @@ loss_routing:
   dpo:
     # DPO beta controls preference strength. Higher beta pushes harder on
     # chosen-vs-rejected margins and can destabilize noisy preference data.
-    # 0.05-0.2 is a typical sweep range.
+    # 0.05-0.2 is a typical sweep range. The reference policy is computed
+    # on-the-fly from the same PEFT/FSDP model with the active LoRA adapter
+    # disabled; there is no reference model and no reference-logprob cache.
     beta: 0.1
-
-    reference:
-      # The reference policy is the source base model before LoRA is attached.
-      # Reference logprobs are computed once into output_dir/ref_logprobs/<signature>
-      # and then loaded into DPO batches.
-      cache_enabled: true
-
-      # true forces recomputation even when signature-matching cache exists.
-      # Use after changing reference computation code or when auditing cache.
-      cache_refresh: false
-
-      # true makes missing/incomplete cache fatal. For production DPO runs this
-      # is safer. false allows migration/debug runs to continue only when the
-      # code path can fill or reuse cache successfully.
-      cache_required: false
 
 training:
   # Number of full passes over the routed train dataloader. Optimizer steps are
@@ -338,11 +322,9 @@ distributed:
     auto_wrap_policy: transformer_based_wrap
 
     # Exact decoder layer class names to wrap. Must match the source model
-    # implementation. Examples:
-    #   Qwen3_5MoeDecoderLayer for MoE model variants
-    #   Qwen3_5DecoderLayer for dense model variants
+    # implementation. Replace this with the class name used by your model.
     transformer_cls_names_to_wrap:
-      - Qwen3_5MoeDecoderLayer
+      - DecoderLayerClassName
 
     # Load pretrained weights on rank 0 and initialize other ranks efficiently,
     # then sync module states. Keep both true for multi-GPU memory-safe loading.
