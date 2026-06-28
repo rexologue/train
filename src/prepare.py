@@ -65,7 +65,6 @@ def main() -> None:
     results = prepare_pretokenized_splits(
         config,
         ["train", "valid", "test"],
-        model_source=model_source,
         force_refresh=args.force,
         num_workers=args.workers,
         worker_chunk_size=args.worker_chunk_size,

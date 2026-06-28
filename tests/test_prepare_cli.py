@@ -24,13 +24,11 @@ def test_prepare_cli_reuses_valid_cache_by_default(monkeypatch) -> None:
         config,
         splits,
         *,
-        model_source=None,
         force_refresh=False,
         num_workers=None,
         worker_chunk_size=None,
     ):
         calls["splits"] = splits
-        calls["model_source"] = model_source
         calls["force_refresh"] = force_refresh
         calls["num_workers"] = num_workers
         calls["worker_chunk_size"] = worker_chunk_size
@@ -65,12 +63,11 @@ def test_prepare_cli_force_rebuilds_pretokenized_cache(monkeypatch) -> None:
         config,
         splits,
         *,
-        model_source=None,
         force_refresh=False,
         num_workers=None,
         worker_chunk_size=None,
     ):
-        del config, splits, model_source
+        del config, splits
         calls["force_refresh"] = force_refresh
         calls["num_workers"] = num_workers
         calls["worker_chunk_size"] = worker_chunk_size

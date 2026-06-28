@@ -97,16 +97,12 @@ def verify_checkpoint_integrity(checkpoint_dir: str | Path) -> None:
 
 def build_resume_hashes(config, *, tokenizer=None, model_source=None) -> dict[str, str]:
     hashes = {
-        "config": stable_hash(config.to_dict()),
         "dataset": file_sha256(manifest_path(cache_root(config))),
         "data_contract": build_data_contract_hash(config),
         "training_contract": build_training_contract_hash(config, model_source=model_source),
     }
     if tokenizer is not None:
         hashes["template"] = sha256_text(getattr(tokenizer, "chat_template", "") or "")
-    model_source_hash = model_source_payload_hash(model_source)
-    if model_source_hash is not None:
-        hashes["model_source"] = model_source_hash
     return hashes
 
 
@@ -114,15 +110,12 @@ def validate_resume_checkpoint(config, checkpoint_dir: str | Path, current_hashe
     resume = config.checkpointing.resume
     expected: dict[str, str] = {}
     if resume.strict_config:
-        expected["config"] = _require_current_hash(current_hashes, "config")
         expected["training_contract"] = _require_current_hash(current_hashes, "training_contract")
     if resume.strict_dataset_hash:
         expected["dataset"] = _require_current_hash(current_hashes, "dataset")
         expected["data_contract"] = _require_current_hash(current_hashes, "data_contract")
     if resume.strict_template_hash:
         expected["template"] = _require_current_hash(current_hashes, "template")
-    if getattr(resume, "strict_model_source_hash", False):
-        expected["model_source"] = _require_current_hash(current_hashes, "model_source")
     if not expected:
         return
     manifest = load_checkpoint_manifest(checkpoint_dir)
@@ -157,6 +150,10 @@ def build_training_contract_hash(config, *, model_source=None) -> str:
                 "alias": config.model.alias,
                 "cache_dir": str(config.model.cache_dir),
                 "precision": config.model.precision,
+                "attn_implementation": config.model.attn_implementation,
+                "experts_implementation": config.model.experts_implementation,
+                "gradient_checkpointing": config.model.gradient_checkpointing,
+                "freeze_router": config.model.freeze_router,
                 "expected_payload_hash": model_source_payload_hash(model_source),
             },
             "tokenizer": config.to_dict()["tokenizer"],

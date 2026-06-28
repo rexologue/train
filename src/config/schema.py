@@ -785,14 +785,13 @@ class ResumeConfig:
     strict_config: bool
     strict_dataset_hash: bool
     strict_template_hash: bool
-    strict_model_source_hash: bool
 
     @classmethod
     def from_dict(cls, raw: Any) -> ResumeConfig:
         data = _mapping(raw, "checkpointing.resume")
         _reject_unknown(
             data,
-            {"enabled", "strict_config", "strict_dataset_hash", "strict_template_hash", "strict_model_source_hash"},
+            {"enabled", "strict_config", "strict_dataset_hash", "strict_template_hash"},
             "checkpointing.resume",
         )
 
@@ -806,11 +805,6 @@ class ResumeConfig:
             strict_template_hash=_require_bool(
                 data.get("strict_template_hash"),
                 "checkpointing.resume.strict_template_hash",
-            ),
-            strict_model_source_hash=_optional_bool(
-                data.get("strict_model_source_hash"),
-                "checkpointing.resume.strict_model_source_hash",
-                True,
             ),
         )
 

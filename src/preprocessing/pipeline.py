@@ -123,7 +123,7 @@ def validate_configured_max_seq_len(config: Config, tokenizer: Any) -> int:
     return max_seq_len
 
 
-def build_preprocessing_signature(config: Config, tokenizer: Any, *, model_source: Any | None = None) -> str:
+def build_preprocessing_signature(config: Config, tokenizer: Any) -> str:
     """Hash the per-split tokenization/masking contract used for cache reuse."""
 
     preprocessing = config.to_dict()["preprocessing"]
@@ -135,14 +135,7 @@ def build_preprocessing_signature(config: Config, tokenizer: Any, *, model_sourc
             "reasoning": preprocessing["reasoning"],
             "masking": preprocessing["masking"],
             "quality": preprocessing["quality"],
-            "model": {
-                "ref": getattr(model_source, "ref", None),
-                "expected_payload_hash": getattr(model_source, "expected_payload_hash", None),
-                "source_dir_hash": getattr(model_source, "source_dir_hash", None),
-                "cache_dir": str(config.model.cache_dir),
-            },
             "tokenizer": {
-                "effective_id": str(config.model.cache_dir),
                 "use_fast": config.tokenizer.use_fast,
                 "add_special_tokens": config.tokenizer.add_special_tokens,
                 "class": tokenizer.__class__.__name__,
@@ -1106,7 +1099,6 @@ def prepare_pretokenized_splits(
     config: Config,
     splits: list[str],
     *,
-    model_source: Any | None = None,
     force_refresh: bool = False,
     num_workers: int | None = None,
     worker_chunk_size: int | None = None,
@@ -1124,7 +1116,7 @@ def prepare_pretokenized_splits(
     tokenizer = load_tokenizer(config)
     max_seq_len = validate_configured_max_seq_len(config, tokenizer)
     model_context = tokenizer_model_context(tokenizer)
-    preprocessing_signature = build_preprocessing_signature(config, tokenizer, model_source=model_source)
+    preprocessing_signature = build_preprocessing_signature(config, tokenizer)
     effective_num_workers = num_workers if num_workers is not None else config.preprocessing.workers.num_workers
     effective_chunk_size = (
         worker_chunk_size if worker_chunk_size is not None else config.preprocessing.workers.chunk_size

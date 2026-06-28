@@ -404,7 +404,6 @@ checkpointing:
     strict_config: true
     strict_dataset_hash: true
     strict_template_hash: true
-    strict_model_source_hash: true
 
 mlflow:
   # MLflow tracking server URI. Use localhost only for local dev; production
