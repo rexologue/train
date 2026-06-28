@@ -110,12 +110,21 @@ def dpo_loss(
     beta: float,
     ignore_index: int,
     accelerator: Any | None = None,
+    ref_chosen_logp: Any | None = None,
+    ref_rejected_logp: Any | None = None,
 ) -> DpoLossResult:
-    """Compute one DPO batch with an on-the-fly PEFT reference policy.
+    """Compute one DPO batch with a PEFT reference policy.
 
-    There is intentionally no reference-logprob cache and no second reference
-    model. The policy forward uses the active LoRA adapter. The reference forward
-    runs the same FSDP-wrapped model under ``no_grad`` with PEFT adapters disabled.
+    The reference completion logps can either be supplied (``ref_chosen_logp`` /
+    ``ref_rejected_logp``, e.g. read from the precomputed cache) or, when absent,
+    computed on the fly: the policy forward uses the active LoRA adapter and the
+    reference forward runs the same FSDP-wrapped model under ``no_grad`` with
+    PEFT adapters disabled. There is no second reference model.
+
+    Supplying both reference logps skips the on-the-fly reference forward
+    entirely. The two paths are numerically equivalent because the reference is
+    the frozen base model, independent of training state; the cache is produced
+    by this same ``concatenated_dpo_logps`` path with adapters disabled.
     """
 
     policy_chosen_logp, policy_rejected_logp = concatenated_dpo_logps(
@@ -124,12 +133,17 @@ def dpo_loss(
         ignore_index=ignore_index,
     )
 
-    with torch.no_grad(), peft_adapter_disabled(model, accelerator=accelerator):
-        ref_chosen_logp, ref_rejected_logp = concatenated_dpo_logps(
-            model,
-            batch,
-            ignore_index=ignore_index,
-        )
+    ref_cache_used = ref_chosen_logp is not None and ref_rejected_logp is not None
+    if ref_cache_used:
+        ref_chosen_logp = _as_logp_tensor(ref_chosen_logp, like=policy_chosen_logp)
+        ref_rejected_logp = _as_logp_tensor(ref_rejected_logp, like=policy_rejected_logp)
+    else:
+        with torch.no_grad(), peft_adapter_disabled(model, accelerator=accelerator):
+            ref_chosen_logp, ref_rejected_logp = concatenated_dpo_logps(
+                model,
+                batch,
+                ignore_index=ignore_index,
+            )
 
     policy_logratio = policy_chosen_logp - policy_rejected_logp
     ref_logratio = ref_chosen_logp - ref_rejected_logp
@@ -147,8 +161,25 @@ def dpo_loss(
         "dpo/reward_rejected": tensor_mean(rejected_rewards),
         "dpo/reward_margin": tensor_mean(reward_margin),
         "dpo/accuracy": tensor_mean(chosen_rewards > rejected_rewards),
+        "dpo/ref_cache_used": 1.0 if ref_cache_used else 0.0,
     }
     return DpoLossResult(loss=losses.mean(), metrics=metrics)
+
+
+def _as_logp_tensor(value: Any, *, like: Any) -> Any:
+    """Coerce supplied reference logps to a float tensor matching the policy logps.
+
+    The reference logps may arrive as a Python list (from the cache lookup) or as
+    a tensor on another device. Align device and dtype with the policy logps so
+    the downstream log-ratio arithmetic stays on one device, and validate the
+    batch dimension so a mismatched cache row count fails loudly.
+    """
+
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    tensor = tensor.to(device=like.device, dtype=like.dtype)
+    if tensor.shape != like.shape:
+        raise ValueError(f"reference logps shape {tuple(tensor.shape)} does not match policy logps {tuple(like.shape)}")
+    return tensor
 
 
 def concatenated_dpo_logps(model: Any, batch: dict[str, Any], *, ignore_index: int) -> tuple[Any, Any]:

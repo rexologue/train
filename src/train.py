@@ -21,6 +21,7 @@ from checkpointing import (
 )
 from config import load_config
 from data.dataloaders import build_dataloaders, validate_training_inputs
+from data.ref_cache import load_ref_logp_cache, reference_signature
 from eval.bfcl import prepare_bfcl_eval, run_bfcl_eval
 from eval.ordinary import run_standard_eval
 from preprocessing.io import load_pretokenized_split_results
@@ -132,7 +133,6 @@ def main() -> None:
             tracker.log_dataloaders(dataloaders)
 
         validate_training_inputs(config, dataloaders)
-        logger.info("DPO reference mode: on-the-fly PEFT adapter disable; no precompute cache")
 
         run_training(config, dataloaders, tracker, runtime=runtime)
 
@@ -325,6 +325,8 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
 
         return str(checkpoint_path)
 
+    ref_logp_cache = load_dpo_reference_cache(config, tracker)
+
     hooks = TrainerHooks(
         on_phase=on_phase,
         run_standard_eval=standard_eval_hook,
@@ -332,7 +334,7 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
         save_checkpoint=checkpoint_hook,
         log_metrics=log_metrics,
     )
-    trainer = RoutedTrainer(config, accelerator=accelerator, hooks=hooks)
+    trainer = RoutedTrainer(config, accelerator=accelerator, hooks=hooks, ref_logp_cache=ref_logp_cache)
 
     with async_context, progress:
         state = trainer.fit(
@@ -362,6 +364,40 @@ def run_training(config, dataloaders, tracker: ExperimentTracker, *, runtime) ->
                 logger.info("pruned old checkpoint after async flush: %s", deleted_path)
 
     return state
+
+
+def load_dpo_reference_cache(config, tracker: ExperimentTracker):
+    """Load the precomputed DPO reference-logp cache when one matches this run.
+
+    Optional by design: if no cache exists, or it was built against a different
+    model/precision (signature mismatch), or it is corrupt, this returns ``None``
+    and the trainer falls back to the on-the-fly PEFT-adapter-disabled reference
+    forward, exactly as before. Build the cache with ``precompute_ref`` to skip
+    that second forward on the DPO route.
+    """
+
+    logger = get_logger("train")
+    has_dpo_route = "dpo_target" in config.loss_routing.routes
+    if not has_dpo_route:
+        logger.info("DPO reference mode: no dpo_target route configured; reference cache not used")
+        return None
+
+    signature = reference_signature(config, tracker.model_source_resolution)
+    cache = load_ref_logp_cache(config, expected_signature=signature)
+    if cache is None:
+        logger.info(
+            "DPO reference mode: on-the-fly PEFT adapter disable (no usable precompute cache); "
+            "run precompute_ref to enable cached references"
+        )
+        return None
+
+    logger.info(
+        "DPO reference mode: precomputed cache (entries=%s signature=%s); "
+        "batches with all render hashes cached skip the reference forward",
+        len(cache),
+        signature,
+    )
+    return cache
 
 
 def prune_checkpoint_retention(

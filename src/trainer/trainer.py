@@ -82,11 +82,13 @@ class RoutedTrainer:
         accelerator: Any,
         hooks: TrainerHooks | None = None,
         cadence: TrainerCadence | None = None,
+        ref_logp_cache: Any | None = None,
     ):
         self.config = config
         self.accelerator = accelerator
         self.hooks = hooks or TrainerHooks()
         self.cadence = cadence or (TrainerCadence.from_config(config) if config is not None else None)
+        self.ref_logp_cache = ref_logp_cache
         self.last_loss_metrics: dict[str, float] = {}
 
     def compute_loss(self, model, batch):
@@ -98,16 +100,45 @@ class RoutedTrainer:
         if loss_kind == "dpo_target":
             if self.config is None:
                 raise ValueError("DPO loss requires trainer config")
+            ref_chosen_logp, ref_rejected_logp = self._cached_reference_logps(batch)
             result = dpo_loss(
                 model,
                 batch,
                 beta=float(self.config.loss_routing.dpo.beta),
                 ignore_index=int(self.config.ignore_index),
                 accelerator=self.accelerator,
+                ref_chosen_logp=ref_chosen_logp,
+                ref_rejected_logp=ref_rejected_logp,
             )
             self.last_loss_metrics = result.metrics
             return result.loss
         raise ValueError(f"unknown loss_kind {loss_kind!r}")
+
+    def _cached_reference_logps(self, batch: dict[str, Any]) -> tuple[Any | None, Any | None]:
+        """Resolve precomputed reference logps for a DPO batch, if fully cached.
+
+        Returns ``(None, None)`` whenever there is no cache or any sample's
+        chosen/rejected render hash is absent, so ``dpo_loss`` falls back to the
+        on-the-fly PEFT reference for the whole batch. Lookup is whole-batch: a
+        single miss makes the entire batch on-the-fly to keep the loss path
+        homogeneous.
+        """
+
+        cache = self.ref_logp_cache
+        if cache is None:
+            return None, None
+        chosen_hashes = batch.get("chosen_render_hash")
+        rejected_hashes = batch.get("rejected_render_hash")
+        if not isinstance(chosen_hashes, list) or not isinstance(rejected_hashes, list):
+            return None, None
+        chosen_logps = cache.lookup(chosen_hashes)
+        rejected_logps = cache.lookup(rejected_hashes)
+        if chosen_logps is None or rejected_logps is None:
+            return None, None
+        device = getattr(self.accelerator, "device", None)
+        chosen = torch.tensor(chosen_logps, dtype=torch.float32, device=device)
+        rejected = torch.tensor(rejected_logps, dtype=torch.float32, device=device)
+        return chosen, rejected
 
     def fit(
         self,

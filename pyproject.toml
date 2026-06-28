@@ -46,12 +46,13 @@ dev = [
 
 [project.scripts]
 sft-dpo-prepare = "prepare:main"
+sft-dpo-precompute-ref = "precompute_ref:main"
 sft-dpo-train = "train:main"
 ru-bfcl-eval = "eval.ru_bfcl.cli:main"
 
 [tool.setuptools]
 include-package-data = true
-py-modules = ["prepare", "train"]
+py-modules = ["prepare", "precompute_ref", "train"]
 packages = [
   "checkpointing",
   "config",
