@@ -295,6 +295,7 @@ class SftTargetMaskingPolicyConfig:
     min_guaranteed_assistant_chars: int
     loss_on_short_assistant_reply_prob: float
     short_response_sampling_seed: int
+    require_user_anchor: bool = False
 
     @classmethod
     def from_dict(cls, raw: Any) -> SftTargetMaskingPolicyConfig:
@@ -305,6 +306,7 @@ class SftTargetMaskingPolicyConfig:
                 "min_guaranteed_assistant_chars",
                 "loss_on_short_assistant_reply_prob",
                 "short_response_sampling_seed",
+                "require_user_anchor",
             },
             "preprocessing.masking.policies.sft_target",
         )
@@ -321,6 +323,14 @@ class SftTargetMaskingPolicyConfig:
             short_response_sampling_seed=_require_int(
                 data.get("short_response_sampling_seed"),
                 "preprocessing.masking.policies.sft_target.short_response_sampling_seed",
+            ),
+            require_user_anchor=(
+                False
+                if data.get("require_user_anchor") is None
+                else _require_bool(
+                    data.get("require_user_anchor"),
+                    "preprocessing.masking.policies.sft_target.require_user_anchor",
+                )
             ),
         )
 
@@ -1038,6 +1048,20 @@ class Config:
             if checkpoint_every % bfcl_every != 0:
                 raise ConfigError("BFCL registry selection requires every checkpoint boundary to run BFCL")
 
+        # A registry selection window spans `register_every_n_checkpoints`
+        # checkpoints. After a resume, the window is reconstructed from
+        # checkpoints still on disk, so retention must be able to keep a whole
+        # window. If save_total_limit is smaller, pruning can delete a window
+        # member and make resume crash (FileNotFoundError) on a long run.
+        limit = self.checkpointing.save_total_limit
+        window = self.registry.register_every_n_checkpoints
+        if limit is not None and limit < window:
+            raise ConfigError(
+                "checkpointing.save_total_limit must be >= registry.register_every_n_checkpoints "
+                f"({limit} < {window}); a smaller limit can prune a registry-selection window "
+                "member and break resume"
+            )
+
 
 
 def _reject_vocab_modules_in_lora(modules: tuple[str, ...], name: str) -> None:
@@ -1181,7 +1205,11 @@ def _optional_str(value: Any, name: str) -> str | None:
 
 def _path(value: Any, name: str) -> Path:
     text = _require_non_empty_str(value, name)
-    return Path(text).expanduser()
+    # Resolve to an absolute path at load time. Relative paths are otherwise
+    # interpreted against the process CWD, so launching prepare/train/resume from
+    # a different directory (common with accelerate/scheduler wrappers) would
+    # silently point at a different checkpoint/cache tree and start fresh.
+    return Path(text).expanduser().resolve()
 
 
 def _string_tuple(value: Any, name: str, *, allow_empty: bool) -> tuple[str, ...]:

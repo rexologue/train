@@ -87,6 +87,7 @@ def prepare_with_accelerator(runtime: DistributedRuntime, *objects: Any) -> tupl
 
     if model is not None:
         audit_and_validate_vocab_fsdp_contract(model, runtime)
+        validate_transformer_wrap_classes(model, runtime)
 
     prepared = runtime.accelerator.prepare(*objects)
 
@@ -94,6 +95,36 @@ def prepare_with_accelerator(runtime: DistributedRuntime, *objects: Any) -> tupl
         return (prepared,)
 
     return prepared
+
+
+def validate_transformer_wrap_classes(model: Any, runtime: DistributedRuntime) -> None:
+    """Fail fast if `transformer_cls_names_to_wrap` matches no module class.
+
+    With `transformer_based_wrap`, FSDP only shards modules whose class name is
+    listed. A wrong/placeholder name (the shipped config uses
+    `DecoderLayerClassName`) silently wraps nothing, so the whole 35B model
+    becomes one FSDP unit and OOMs on the first forward. Verify the contract
+    against the real module tree before `prepare()` builds FlatParameters.
+    """
+
+    plugin = getattr(getattr(runtime.accelerator, "state", None), "fsdp_plugin", None) or runtime.fsdp_plugin
+    auto_wrap = str(getattr(plugin, "auto_wrap_policy", "") or "")
+    configured = {name for name in getattr(plugin, "transformer_cls_names_to_wrap", None) or []}
+    if not configured or "transformer" not in auto_wrap.lower():
+        return
+
+    present = {module.__class__.__name__ for _name, module in model.named_modules()}
+    matched = configured & present
+    if not matched:
+        decoder_like = sorted(name for name in present if "DecoderLayer" in name or "Block" in name)
+        raise RuntimeError(
+            "distributed.fsdp.transformer_cls_names_to_wrap matches no module class in the model: "
+            f"configured={sorted(configured)}. Set it to the model's decoder layer class. "
+            f"Candidates found in the model: {decoder_like or sorted(present)[:20]}"
+        )
+
+    logger = get_logger("train")
+    logger.info("FSDP transformer wrap classes matched: %s", sorted(matched))
 
 
 def first_model_like_object(objects: tuple[Any, ...]) -> Any | None:

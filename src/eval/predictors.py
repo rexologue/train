@@ -11,8 +11,41 @@ from jinja2.exceptions import TemplateError
 
 from eval.ru_bfcl import BFCLRequest, normalize_prediction
 
+try:  # transformers >= 5.x ships a schema-driven reverse parser for chat output
+    from transformers.utils.chat_parsing_utils import recursive_parse
+except Exception:  # pragma: no cover - older transformers without parse_response
+    recursive_parse = None
+
 
 TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+# Qwen 3.5 chat templates emit tool calls as XML, not JSON, e.g.:
+#   <tool_call>
+#   <function=send_email>
+#   <parameter=recipient>
+#   boss@company.com
+#   </parameter>
+#   </function>
+#   </tool_call>
+# This schema mirrors transformers' own `_TOOL_CALL_FALLBACKS` entry for
+# `qwen3_5`/`qwen3_5_moe` (transformers/cli/serving/utils.py) and is consumed by
+# `recursive_parse` exactly as `tokenizer.parse_response` would. Parsing lives in
+# data (a schema keyed to the format), not hardcoded control flow, so a model that
+# declares its own `tokenizer.response_schema` is honored without code changes.
+_QWEN_XML_TOOL_CALL_SCHEMA = {
+    "x-regex-iterator": r"<function=(?P<name>[^>\n]+)>(?P<arguments>.*?)</function>",
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "arguments": {
+                "type": "object",
+                "x-regex-key-value": r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*</parameter>",
+            },
+        },
+    },
+}
 
 
 class BFCLTokenizerError(RuntimeError):
@@ -118,7 +151,7 @@ class BFCLModelPredictor:
         generated_ids = output_ids[0, input_length:]
         generated_ids = trim_after_eos(generated_ids, getattr(self.tokenizer, "eos_token_id", None))
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-        return extract_tool_calls(text)
+        return extract_tool_calls(text, tokenizer=self.tokenizer)
 
     def _generate_with_forward_loop(self, inputs: dict[str, torch.Tensor], generation: Any) -> torch.Tensor:
         """Generate tokens through regular model forwards so FSDP stays sharded."""
@@ -165,7 +198,87 @@ class BFCLModelPredictor:
                 self.model.train()
 
 
-def extract_tool_calls(text: str) -> list[dict[str, Any]]:
+def extract_tool_calls(text: str, *, tokenizer: Any | None = None) -> list[dict[str, Any]]:
+    """Extract tool calls from generated text.
+
+    Tries the model's native XML tool-call form first (Qwen 3.5 and any model that
+    declares a `response_schema`), then falls back to the legacy
+    JSON-inside-`<tool_call>` form (pre-3.5 Qwen and other templates). The XML path
+    is required for this contour's model: its template emits
+    `<function=...><parameter=...>` markup that is not valid JSON, so the JSON-only
+    parser scored every tool call as a miss.
+    """
+
+    xml_calls = _extract_xml_tool_calls(text, tokenizer)
+    if xml_calls:
+        return xml_calls
+    return _extract_json_tool_calls(text)
+
+
+def _extract_xml_tool_calls(text: str, tokenizer: Any | None) -> list[dict[str, Any]]:
+    if recursive_parse is None:
+        return []
+
+    schema = getattr(tokenizer, "response_schema", None) or _QWEN_XML_TOOL_CALL_SCHEMA
+
+    # Isolate <tool_call>...</tool_call> blocks so stray "<function=" text in prose
+    # cannot be misread as a call; fall back to the whole text if none are present.
+    blocks = [match.group(1) for match in TOOL_CALL_BLOCK_RE.finditer(text)]
+    sources = blocks if blocks else [text]
+
+    calls: list[dict[str, Any]] = []
+    for source in sources:
+        try:
+            parsed = recursive_parse(source, schema)
+        except (KeyError, TypeError, ValueError):
+            continue
+        for call in _coerce_parsed_calls(parsed):
+            try:
+                calls.extend(normalize_prediction([call]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return calls
+
+
+def _coerce_parsed_calls(parsed: Any) -> list[dict[str, Any]]:
+    """Normalize recursive_parse output into a list of {name, arguments} dicts."""
+
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+
+    calls: list[dict[str, Any]] = []
+    for call in parsed:
+        if not isinstance(call, dict) or not call.get("name"):
+            continue
+        calls.append({"name": call["name"], "arguments": _coerce_argument_values(call.get("arguments"))})
+    return calls
+
+
+def _coerce_argument_values(arguments: Any) -> dict[str, Any]:
+    """JSON-decode scalar/object parameter values, keeping plain strings as-is.
+
+    The XML template renders objects/sequences via tojson and scalars verbatim, so
+    a value parsed back out may be a JSON literal ("42", "true", '{"a":1}') or a
+    plain string ("boss@company.com"). Decode the former, preserve the latter.
+    """
+
+    if not isinstance(arguments, dict):
+        return {}
+    coerced: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            try:
+                coerced[key] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                coerced[key] = value
+        else:
+            coerced[key] = value
+    return coerced
+
+
+def _extract_json_tool_calls(text: str) -> list[dict[str, Any]]:
     candidates = [match.group(1) for match in TOOL_CALL_BLOCK_RE.finditer(text)]
     if not candidates:
         stripped = _strip_code_fence(text.strip())

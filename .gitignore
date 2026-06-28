@@ -1429,11 +1429,14 @@ erl_crash.dump
 .neptune
 
 .local/
+.claude
+.claude/
 .codex
 .codex/
 .agents
 .agents/
 AGENTS.md
+CLAUDE.md
 
 configs/**
 !configs/

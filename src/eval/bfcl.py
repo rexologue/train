@@ -11,7 +11,34 @@ from eval.ru_bfcl import BFCLRequest, BFCLValidator, dump_jsonl
 
 logger = logging.getLogger(__name__)
 _DISABLED_SAMPLE_IDS: set[str] = set()
+_DISABLED_REASONS: dict[str, str] = {}
 _LOGGED_DATASET_KEYS: set[tuple[Any, ...]] = set()
+
+
+def _classify_skip_reason(error: "BFCLTokenizerError") -> str:
+    """Map a tokenizer/render failure to a stable, explicit skip-reason code.
+
+    The most common malformed BFCL turn is one the chat template refuses to
+    render because it has no real user query (template raises 'No user query
+    found in messages'). Categorizing these makes the skip explicit and
+    countable instead of being lumped into a generic tokenizer error.
+    """
+
+    message = str(getattr(error, "cause", error)).lower()
+    if "no user query" in message:
+        return "no_user_query"
+    if "system message" in message:
+        return "system_message"
+    if "unexpected message role" in message:
+        return "unexpected_role"
+    cause = getattr(error, "cause", None)
+    return type(cause).__name__.lower() if cause is not None else "tokenizer_error"
+
+
+def _skip_reason_counts(skipped_ids: Iterable[str]) -> Counter[str]:
+    """Aggregate recorded skip reasons for a set of skipped sample ids."""
+
+    return Counter(_DISABLED_REASONS.get(sample_id, "unknown") for sample_id in skipped_ids)
 
 
 def prepare_bfcl_eval(
@@ -32,8 +59,9 @@ def prepare_bfcl_eval(
 
     if skipped and log_enabled:
         logger.warning(
-            "BFCL preflight disabled tokenizer-invalid samples: count=%s ids=%s",
+            "BFCL preflight skipped malformed samples: count=%s by_reason=%s ids=%s",
             len(skipped),
+            _format_counter(_skip_reason_counts(skipped)),
             sorted(skipped),
         )
 
@@ -59,7 +87,12 @@ def run_bfcl_eval(
         skipped_ids = disabled_before_eval | (skipped_during_eval & loaded_sample_ids)
         summary = _evaluate_usable_samples(validator.samples, predictions_by_id, skipped_ids)
         _write_rows(config, summary)
-        return _summary_metrics(summary, loaded_total=len(validator.samples), skipped_total=len(skipped_ids))
+        return _summary_metrics(
+            summary,
+            loaded_total=len(validator.samples),
+            skipped_total=len(skipped_ids),
+            skipped_reasons=_skip_reason_counts(skipped_ids),
+        )
 
     # FSDP forwards are collective. Every rank must execute the
     # same requests in the same order; splitting variable-length/multi-turn
@@ -73,7 +106,18 @@ def run_bfcl_eval(
     skipped_ids = disabled_before_eval | (skipped_during_eval & loaded_sample_ids)
     summary = _evaluate_usable_samples(validator.samples, predictions_by_id, skipped_ids)
     _write_rows(config, summary)
-    return _summary_metrics(summary, loaded_total=len(validator.samples), skipped_total=len(skipped_ids))
+    if log_enabled and skipped_ids:
+        logger.warning(
+            "BFCL eval skipped malformed samples: count=%s by_reason=%s",
+            len(skipped_ids),
+            _format_counter(_skip_reason_counts(skipped_ids)),
+        )
+    return _summary_metrics(
+        summary,
+        loaded_total=len(validator.samples),
+        skipped_total=len(skipped_ids),
+        skipped_reasons=_skip_reason_counts(skipped_ids),
+    )
 
 
 def _load_validator(config: Any) -> BFCLValidator:
@@ -225,11 +269,14 @@ def _disable_sample(
 ) -> None:
     first_seen = request.sample.id not in _DISABLED_SAMPLE_IDS
     _DISABLED_SAMPLE_IDS.add(request.sample.id)
+    reason = _classify_skip_reason(error)
+    _DISABLED_REASONS[request.sample.id] = reason
 
     if log_enabled and first_seen:
         logger.warning(
-            "BFCL sample disabled after tokenizer error: phase=%s %s error=%s",
+            "BFCL sample skipped (malformed turn): phase=%s reason=%s %s error=%s",
             phase,
+            reason,
             describe_bfcl_request(request),
             error,
         )
@@ -300,7 +347,13 @@ def normalize_tool_call_arguments_for_template(arguments: Any) -> dict[str, Any]
     return {}
 
 
-def _summary_metrics(summary: dict[str, Any], *, loaded_total: int, skipped_total: int) -> dict[str, float]:
+def _summary_metrics(
+    summary: dict[str, Any],
+    *,
+    loaded_total: int,
+    skipped_total: int,
+    skipped_reasons: "Counter[str] | None" = None,
+) -> dict[str, float]:
     metrics = {
         "eval/bfcl/accuracy": float(summary["accuracy"]),
         "eval/bfcl/total": float(summary["total"]),
@@ -308,7 +361,12 @@ def _summary_metrics(summary: dict[str, Any], *, loaded_total: int, skipped_tota
         "eval/bfcl/failed": float(summary["failed"]),
         "eval/bfcl/loaded_total": float(loaded_total),
         "eval/bfcl/skipped_total": float(skipped_total),
+        # Fraction of the loaded set that was excluded; lets dashboards see when
+        # accuracy is computed over a shrinking denominator.
+        "eval/bfcl/skipped_fraction": float(skipped_total) / float(loaded_total) if loaded_total else 0.0,
     }
+    for reason, count in (skipped_reasons or {}).items():
+        metrics[f"eval/bfcl/skipped/{reason}"] = float(count)
     for category, bucket in summary.get("by_category", {}).items():
         metrics[f"eval/bfcl/{category}/accuracy"] = float(bucket["accuracy"])
         metrics[f"eval/bfcl/{category}/total"] = float(bucket["total"])

@@ -201,6 +201,15 @@ preprocessing:
         loss_on_short_assistant_reply_prob: 0.3
         short_response_sampling_seed: 42
 
+        # false: supervise every assistant turn (long ones always, short ones
+        # sampled), including a dialog's opening assistant turn that is not
+        # preceded by a user message. This is correct for agent-speaks-first
+        # data (e.g. outbound call transcripts).
+        # true: only supervise assistant turns immediately preceded by a user
+        # turn, dropping unprompted openers. Set true if you do NOT want the
+        # model to learn to start conversations on its own.
+        require_user_anchor: false
+
   quality:
     # Fail preprocessing when rejected/raw rows exceed this fraction. Tighten
     # for clean production data; loosen during dataset migration.
@@ -322,9 +331,12 @@ distributed:
     auto_wrap_policy: transformer_based_wrap
 
     # Exact decoder layer class names to wrap. Must match the source model
-    # implementation. Replace this with the class name used by your model.
+    # implementation exactly; a wrong name silently wraps nothing and OOMs.
+    # The trainer asserts this matches >=1 module class before FSDP build.
+    # For Qwen3_5MoeForConditionalGeneration the text decoder layer class is
+    # Qwen3_5MoeTextDecoderLayer (verify against the model's modeling_*.py).
     transformer_cls_names_to_wrap:
-      - DecoderLayerClassName
+      - Qwen3_5MoeTextDecoderLayer
 
     # Load pretrained weights on rank 0 and initialize other ranks efficiently,
     # then sync module states. Keep both true for multi-GPU memory-safe loading.
@@ -378,8 +390,9 @@ checkpointing:
 
   # Keep only the newest N checkpoints, except checkpoints still needed by an
   # active registry-selection window or pending async registration. null disables
-  # pruning.
-  save_total_limit: 3
+  # pruning. Must be >= registry.register_every_n_checkpoints so a full
+  # selection window always survives pruning across a resume.
+  save_total_limit: 5
 
   resume:
     # Resume from latest valid checkpoint under output_dir/checkpoints.

@@ -409,10 +409,19 @@ def maybe_register_candidate(
         return None
 
     request = build_candidate_registration_request(config, decision)
+    # Candidate registration is a side-channel. A registry/modelctl outage must
+    # not abort a long training run. The async worker has its own error policy
+    # (mlflow.async_logging.fail_on_worker_error); the synchronous fallback is
+    # made best-effort here so a missing/failing modelctl only logs and the run
+    # keeps training and checkpointing.
     if async_worker is not None:
         async_worker.run_modelctl_register(request)
     else:
-        ModelctlClient(tracking_uri=config.mlflow.tracking_uri).register(request)
+        try:
+            ModelctlClient(tracking_uri=config.mlflow.tracking_uri).register(request)
+        except Exception as exc:  # noqa: BLE001 - registry must not kill training
+            get_logger("train").error("candidate registration failed (continuing training): %s", exc)
+            return None
 
     return decision
 

@@ -7,7 +7,12 @@ import pytest
 
 from preprocessing.io import ParquetSchemaError, read_rows
 from preprocessing.masking import canonicalize_row
-from preprocessing.pipeline import preprocess_dpo_row, preprocess_sft_row, preprocess_split
+from preprocessing.pipeline import (
+    _preprocess_raw_sft_row,
+    preprocess_dpo_row,
+    preprocess_sft_row,
+    preprocess_split,
+)
 from preprocessing.rendering import ChatTemplateRenderer
 from conftest import CharTokenizer, example_config, renderer_config
 
@@ -28,6 +33,92 @@ class ChatTemplateTokenizer(CharTokenizer):
         for message in messages:
             rendered.append(f"<|im_start|>{message['role']}\n{message.get('content', '')}<|im_end|>")
         return "".join(rendered)
+
+
+class GenerationMaskTokenizer(CharTokenizer):
+    """Char tokenizer that also emits a {% generation %}-style assistant mask.
+
+    Mirrors the real Qwen template contract used by the production masking path:
+    the generated span is the assistant body + the assistant <|im_end|> (the
+    role header and any think scaffold are excluded). Lets CI exercise
+    tokenize_with_generation_mask without the real tokenizer.
+    """
+
+    is_fast = True
+
+    def _render(self, messages):
+        parts: list[str] = []
+        spans: list[tuple[int, int]] = []
+        cursor = 0
+        for message in messages:
+            header = f"<|im_start|>{message['role']}\n"
+            parts.append(header)
+            cursor += len(header)
+            body = str(message.get("content") or "")
+            start = cursor
+            parts.append(body)
+            cursor += len(body)
+            end = "<|im_end|>"
+            parts.append(end)
+            cursor += len(end)
+            if message.get("role") == "assistant":
+                spans.append((start, cursor))  # body + <|im_end|>
+            parts.append("\n")
+            cursor += 1
+        return "".join(parts), spans
+
+    def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=False,
+                            return_dict=False, return_assistant_tokens_mask=False, tools=None, **kwargs):
+        del add_generation_prompt, tools, kwargs
+        text, spans = self._render(messages)
+        if not tokenize:
+            return text
+        ids = [ord(ch) for ch in text]
+        result = {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        if return_assistant_tokens_mask:
+            mask = [0] * len(ids)
+            for start, end in spans:
+                for index in range(start, end):
+                    mask[index] = 1
+            result["assistant_masks"] = mask
+        return result
+
+
+def test_generation_mask_path_supervises_assistant_only() -> None:
+    config = example_config()
+    tokenizer = GenerationMaskTokenizer()
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "the question"},
+        {"role": "assistant", "content": "a sufficiently long supervised answer " * 3},
+    ]
+    processed, _debug, stats = _preprocess_raw_sft_row(_sft_target_row(messages), tokenizer, config)
+    text = supervised_text(processed["input_ids"], processed["labels"])
+
+    assert stats["masking_path/generation_mask"] == 1  # used the new path, not the fallback
+    assert processed["num_supervised_tokens"] > 0
+    assert "system prompt" not in text and "the question" not in text
+    assert "a sufficiently long supervised answer" in text
+    assert "<|im_end|>" in text
+
+
+def test_generation_mask_path_honors_user_anchor() -> None:
+    messages = [
+        {"role": "assistant", "content": "unprompted opener that is plenty long here " * 2},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "anchored reply that is also plenty long here " * 2},
+    ]
+    default_proc, _d, _s = _preprocess_raw_sft_row(_sft_target_row(messages), GenerationMaskTokenizer(), example_config())
+    assert "unprompted opener" in supervised_text(default_proc["input_ids"], default_proc["labels"])
+
+    anchored = example_config(
+        preprocessing={"masking": {"policies": {"sft_target": {"require_user_anchor": True}}}}
+    )
+    proc, _d, stats = _preprocess_raw_sft_row(_sft_target_row(messages), GenerationMaskTokenizer(), anchored)
+    text = supervised_text(proc["input_ids"], proc["labels"])
+    assert stats["masking_path/generation_mask"] == 1
+    assert "unprompted opener" not in text
+    assert "anchored reply" in text
 
 
 def supervised_text(input_ids: list[int], labels: list[int], *, ignore_index: int = -100) -> str:
@@ -108,6 +199,58 @@ def test_preprocess_split_force_refresh_rebuilds_valid_cache(tmp_path) -> None:
     assert first.reused is False
     assert reused.reused is True
     assert refreshed.reused is False
+
+
+def _sft_target_row(messages):
+    return {"payload": {"sample_id": "prod1", "messages": messages}, "loss_kind": "sft_target", "row_index": 0}
+
+
+def test_production_path_supervises_assistant_completions_and_eom() -> None:
+    # Exercises the REAL training path (_preprocess_raw_sft_row ->
+    # select_sft_supervision_ranges -> assistant_blocks), not the test-helper
+    # renderer. Locks in: system/user not supervised, assistant content + the
+    # <|im_end|> stop token supervised.
+    config = example_config()
+    tokenizer = ChatTemplateTokenizer()
+    messages = [
+        {"role": "system", "content": "system prompt here"},
+        {"role": "user", "content": "please answer"},
+        {"role": "assistant", "content": "this is a sufficiently long supervised answer " * 3},
+    ]
+    processed, _debug, _stats = _preprocess_raw_sft_row(_sft_target_row(messages), tokenizer, config)
+    text = supervised_text(processed["input_ids"], processed["labels"])
+
+    assert processed["num_supervised_tokens"] > 0
+    assert "system prompt here" not in text
+    assert "please answer" not in text
+    assert "this is a sufficiently long supervised answer" in text
+    assert "<|im_end|>" in text  # assistant stop token must be supervised so the model learns to stop
+
+
+def test_production_path_user_anchor_drops_unprompted_opener() -> None:
+    # Dialog starts with assistant (no preceding user) -> opener is unprompted.
+    messages = [
+        {"role": "assistant", "content": "unprompted opener line that is quite long " * 2},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "anchored answer that is also quite long enough " * 2},
+    ]
+    tokenizer = ChatTemplateTokenizer()
+
+    default_cfg = example_config()  # require_user_anchor defaults to false
+    default_text = supervised_text(
+        *(lambda p: (p["input_ids"], p["labels"]))(
+            _preprocess_raw_sft_row(_sft_target_row(messages), tokenizer, default_cfg)[0]
+        )
+    )
+    assert "unprompted opener line" in default_text  # current behavior keeps openers
+
+    anchored_cfg = example_config(
+        preprocessing={"masking": {"policies": {"sft_target": {"require_user_anchor": True}}}}
+    )
+    anchored = _preprocess_raw_sft_row(_sft_target_row(messages), tokenizer, anchored_cfg)[0]
+    anchored_text = supervised_text(anchored["input_ids"], anchored["labels"])
+    assert "unprompted opener line" not in anchored_text  # opener dropped
+    assert "anchored answer" in anchored_text  # user-anchored turn kept
 
 
 def test_sft_target_masks_selected_assistant_tokens_only() -> None:

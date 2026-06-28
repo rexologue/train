@@ -380,6 +380,22 @@ def _advance_iterator(iterator: Any, iterable: Iterable[Any], consumed_batches: 
 
 
 def _set_epoch(iterable: Iterable[Any], epoch: int) -> None:
-    batch_sampler = getattr(iterable, "batch_sampler", None)
-    if hasattr(batch_sampler, "set_epoch"):
-        batch_sampler.set_epoch(epoch)
+    """Propagate the epoch to the routed sampler for per-epoch reshuffle.
+
+    After ``accelerator.prepare`` the object is an Accelerate ``DataLoaderShard``
+    whose ``.batch_sampler`` is Accelerate's ``BatchSamplerShard`` wrapper, which
+    does not expose ``set_epoch``. The shard itself does, and it forwards the
+    epoch to the underlying ``RoutedBatchSampler``. Try every layer so the epoch
+    reaches the real sampler in both the prepared and unprepared cases.
+    """
+
+    applied = False
+    for target in (iterable, getattr(iterable, "batch_sampler", None), getattr(iterable, "sampler", None)):
+        if hasattr(target, "set_epoch"):
+            target.set_epoch(epoch)
+            applied = True
+    if not applied:
+        # Reach through Accelerate's wrapper to the wrapped routed sampler.
+        wrapped = getattr(getattr(iterable, "batch_sampler", None), "batch_sampler", None)
+        if hasattr(wrapped, "set_epoch"):
+            wrapped.set_epoch(epoch)

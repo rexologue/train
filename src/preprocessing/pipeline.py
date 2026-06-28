@@ -451,6 +451,7 @@ def select_sft_supervision_ranges(
     seed = policy.short_response_sampling_seed
     min_chars = policy.min_guaranteed_assistant_chars if row["loss_kind"] == "sft_target" else 0
     short_prob = policy.loss_on_short_assistant_reply_prob
+    require_user_anchor = bool(getattr(policy, "require_user_anchor", False)) and row["loss_kind"] == "sft_target"
     selected: list[dict[str, Any]] = []
     supervised_ranges: list[tuple[int, int]] = []
     stats: Counter[str] = Counter()
@@ -461,6 +462,13 @@ def select_sft_supervision_ranges(
     ):
         ranges, text, removed = assistant_supervision_segments(start, body, include_thinking=include_thinking)
         stats["removed_think_blocks_from_loss"] += removed
+        # When user-anchoring is enabled, only supervise assistant turns that are
+        # immediately preceded by a user turn. This drops unprompted opener turns
+        # (e.g. dialogs that start with assistant). Default-off preserves the
+        # "supervise all assistant turns" behavior the dataset was built for.
+        if require_user_anchor and (message_position == 0 or messages[message_position - 1].get("role") != "user"):
+            stats["sft_target_dropped_no_user_anchor"] += 1
+            continue
         if row["loss_kind"] == "sft_tool":
             keep = True
             reason = "all_assistant"
@@ -494,6 +502,159 @@ def select_sft_supervision_ranges(
     return selected, supervised_ranges, stats
 
 
+def _assistant_mask_runs(assistant_masks: list[int]) -> list[tuple[int, int]]:
+    """Split a per-token assistant mask into contiguous [start, end) token runs.
+
+    Each run is one model-generated assistant span (answer + tool calls + the
+    assistant `<|im_end|>`), as marked by the template's `{% generation %}`
+    block. Runs are separated by non-generation tokens (role headers, the think
+    scaffold, user/tool turns), so one run corresponds to one assistant turn.
+    """
+
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, flag in enumerate([*assistant_masks, 0]):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            runs.append((start, index))
+            start = None
+    return runs
+
+
+def tokenize_with_generation_mask(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    config: Config,
+) -> dict[str, Any] | None:
+    """Tokenize via the official template and return the model-generated token mask.
+
+    This is the template-agnostic masking path: the supervised spans come from
+    the chat template's own `{% generation %}` markers (`return_assistant_tokens_mask`),
+    not from hardcoded ChatML string parsing. Returns ``None`` when the template
+    has no generation markers so callers can fall back to the legacy parser.
+    """
+
+    base_kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "return_dict": True,
+        "return_assistant_tokens_mask": True,
+        "add_generation_prompt": False,
+    }
+    if tools is not None:
+        base_kwargs["tools"] = tools
+    reasoning_kwargs = {"enable_thinking": config.preprocessing.reasoning.enable_thinking}
+    try:
+        encoded = tokenizer.apply_chat_template(messages, **base_kwargs, **reasoning_kwargs)
+        unsupported: list[str] = []
+    except TypeError:
+        encoded = tokenizer.apply_chat_template(messages, **base_kwargs)
+        unsupported = sorted(reasoning_kwargs)
+
+    masks = encoded.get("assistant_masks") if hasattr(encoded, "get") else None
+    if masks is None:
+        return None
+    masks = [int(value) for value in masks]
+    if sum(masks) == 0:
+        # Template has no {% generation %} markers (or marked nothing): fall back.
+        return None
+    input_ids = [int(value) for value in encoded["input_ids"]]
+    attention_mask = [int(value) for value in encoded.get("attention_mask", [1] * len(input_ids))]
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "assistant_masks": masks,
+        "unsupported_apply_chat_template_kwargs": unsupported,
+    }
+
+
+def select_supervised_runs(
+    row: dict[str, Any],
+    messages: list[dict[str, Any]],
+    original_message_indices: list[int],
+    runs: list[tuple[int, int]],
+    input_ids: list[int],
+    tokenizer: Any,
+    config: Config,
+) -> tuple[list[dict[str, Any]], list[tuple[int, int]], Counter[str]]:
+    """Apply the project target-selection policy to per-turn generation runs.
+
+    Exactly mirrors `select_sft_supervision_ranges` (long replies always kept,
+    short replies deterministically sampled, optional user-anchoring), but works
+    on token runs from the generation mask instead of parsed char ranges. The
+    deterministic short-sampling key is unchanged (`sample_id:message_index:seed`)
+    so selection is identical to the legacy path.
+    """
+
+    policy = config.preprocessing.masking.policies.sft_target
+    loss_kind = row["loss_kind"]
+    assistant_positions = [index for index, message in enumerate(messages) if message.get("role") == "assistant"]
+    if len(runs) != len(assistant_positions):
+        raise ValueError(
+            f"generation-mask run count {len(runs)} != assistant message count {len(assistant_positions)}"
+        )
+
+    sample_id = str(row["payload"].get("sample_id") or row["payload"].get("id") or stable_hash(row["payload"]))
+    seed = policy.short_response_sampling_seed
+    min_chars = policy.min_guaranteed_assistant_chars if loss_kind == "sft_target" else 0
+    short_prob = policy.loss_on_short_assistant_reply_prob
+    require_user_anchor = bool(getattr(policy, "require_user_anchor", False)) and loss_kind == "sft_target"
+
+    selected: list[dict[str, Any]] = []
+    kept_runs: list[tuple[int, int]] = []
+    stats: Counter[str] = Counter()
+
+    for order, (position, (token_start, token_end)) in enumerate(zip(assistant_positions, runs)):
+        message_index = original_message_indices[position] if original_message_indices else position
+        if require_user_anchor and (position == 0 or messages[position - 1].get("role") != "user"):
+            stats["sft_target_dropped_no_user_anchor"] += 1
+            continue
+        decoded = decode_token_ids(tokenizer, input_ids[token_start:token_end])
+        if loss_kind == "sft_tool":
+            keep = True
+            reason = "all_assistant"
+            chars = message_reply_chars(messages[position], decoded)
+        else:
+            chars = message_reply_chars(messages[position], decoded)
+            stats["sft_target_candidates"] += 1
+            if chars > min_chars:
+                keep = True
+                reason = "long_response"
+                stats["sft_target_long_kept"] += 1
+            else:
+                stats["sft_target_short_total"] += 1
+                keep = stable_uniform_0_1(f"{sample_id}:{message_index}:{seed}") < short_prob
+                reason = "short_sampled" if keep else "short_dropped"
+                if keep:
+                    stats["sft_target_short_kept"] += 1
+        if keep:
+            kept_runs.append((token_start, token_end))
+            selected.append(
+                {"assistant_order": order, "message_index": message_index, "reason": reason, "assistant_chars": chars}
+            )
+    return selected, kept_runs, stats
+
+
+def build_labels_from_token_runs(
+    input_ids: list[int],
+    kept_runs: list[tuple[int, int]],
+    ignore_index: int,
+    require_positive: bool = True,
+) -> tuple[list[int], int]:
+    """Label only tokens inside kept generation runs; everything else is ignored."""
+
+    labels = [ignore_index] * len(input_ids)
+    supervised = 0
+    for token_start, token_end in kept_runs:
+        for index in range(token_start, token_end):
+            labels[index] = input_ids[index]
+            supervised += 1
+    if require_positive and supervised == 0:
+        raise MaskingError("accepted training sample has zero supervised tokens")
+    return labels, supervised
+
+
 def _preprocess_raw_sft_row(row: dict[str, Any], tokenizer: Any, config: Config) -> tuple[dict[str, Any], dict[str, Any], Counter[str]]:
     """Render, tokenize, and label one decoded parquet SFT/tool row.
 
@@ -515,40 +676,62 @@ def _preprocess_raw_sft_row(row: dict[str, Any], tokenizer: Any, config: Config)
         raise ValueError("tools must be a list when present")
     reject_forbidden_raw_markers(messages, config.preprocessing.rendering.reject_raw_special_markers)
     rendered, unsupported_kwargs = apply_chat_template(tokenizer, messages, tools, config)
-    selected, supervised_ranges, stats = select_sft_supervision_ranges(
-        row,
-        messages,
-        rendered,
-        config,
-        original_message_indices=original_message_indices,
-    )
+
+    # Primary path: derive supervised spans from the template's own
+    # {% generation %} markers (return_assistant_tokens_mask). This is
+    # template-agnostic and keeps the think scaffold out of loss by construction.
+    # Fall back to legacy ChatML char parsing when the template has no markers.
+    generation = tokenize_with_generation_mask(tokenizer, messages, tools, config)
+    if generation is not None:
+        runs = _assistant_mask_runs(generation["assistant_masks"])
+        selected, kept_runs, stats = select_supervised_runs(
+            row, messages, original_message_indices, runs, generation["input_ids"], tokenizer, config
+        )
+        input_ids = generation["input_ids"]
+        attention_mask = generation["attention_mask"]
+        supervised_ranges: list[tuple[int, int]] = []
+        labels, supervised_tokens = build_labels_from_token_runs(
+            input_ids,
+            kept_runs,
+            config.ignore_index,
+            require_positive=config.preprocessing.masking.require_positive_supervised_tokens,
+        )
+        stats["masking_path/generation_mask"] += 1
+        path_unsupported = generation["unsupported_apply_chat_template_kwargs"]
+    else:
+        selected, supervised_ranges, stats = select_sft_supervision_ranges(
+            row, messages, rendered, config, original_message_indices=original_message_indices
+        )
+        encoded = tokenize_with_offsets(
+            tokenizer, rendered, add_special_tokens=config.tokenizer.add_special_tokens
+        )
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        labels, supervised_tokens = build_labels(
+            input_ids,
+            encoded["offset_mapping"],
+            supervised_ranges,
+            config.ignore_index,
+            require_positive=config.preprocessing.masking.require_positive_supervised_tokens,
+        )
+        stats["masking_path/char_fallback"] += 1
+        path_unsupported = unsupported_kwargs
+
     stats["converted_tool_argument_strings"] += converted_arguments
     stats["removed_system_messages"] += removed_system_messages
-    for key in unsupported_kwargs:
+    for key in path_unsupported:
         stats[f"unsupported_apply_chat_template_kwargs/{key}"] += 1
 
-    encoded = tokenize_with_offsets(
-        tokenizer,
-        rendered,
-        add_special_tokens=config.tokenizer.add_special_tokens,
-    )
-    labels, supervised_tokens = build_labels(
-        encoded["input_ids"],
-        encoded["offset_mapping"],
-        supervised_ranges,
-        config.ignore_index,
-        require_positive=config.preprocessing.masking.require_positive_supervised_tokens,
-    )
-    loss_only_text, loss_only_token_spans = decode_labeled_token_spans(tokenizer, encoded["input_ids"], labels, config.ignore_index)
+    loss_only_text, loss_only_token_spans = decode_labeled_token_spans(tokenizer, input_ids, labels, config.ignore_index)
     sample_id = str(row["payload"].get("sample_id") or row["payload"].get("id") or stable_hash(row["payload"]))
     processed = {
         "sample_id": sample_id,
         "row_index": row["row_index"],
         "loss_kind": row["loss_kind"],
-        "input_ids": encoded["input_ids"],
-        "attention_mask": encoded["attention_mask"],
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
         "labels": labels,
-        "length": len(encoded["input_ids"]),
+        "length": len(input_ids),
         "num_supervised_tokens": supervised_tokens,
         "render_hash": stable_hash(rendered),
         "source_hash": stable_hash(row["payload"]),
@@ -617,28 +800,44 @@ def _preprocess_raw_dpo_row(row: dict[str, Any], tokenizer: Any, config: Config)
         messages, _original_message_indices, removed_system_messages = apply_system_message_policy(messages, config)
         reject_forbidden_raw_markers(messages, config.preprocessing.rendering.reject_raw_special_markers)
         rendered, unsupported_kwargs = apply_chat_template(tokenizer, messages, None, config)
-        ranges, removed = last_assistant_supervision_ranges(rendered, include_thinking=include_thinking)
+        # Supervise only the final completion (chosen/rejected). With the
+        # generation mask that is the last assistant run; else fall back to the
+        # legacy last-assistant char parser.
+        generation = tokenize_with_generation_mask(tokenizer, messages, None, config)
+        if generation is not None:
+            runs = _assistant_mask_runs(generation["assistant_masks"])
+            if not runs:
+                raise ValueError("DPO completion produced no generation span")
+            input_ids = generation["input_ids"]
+            attention_mask = generation["attention_mask"]
+            labels, supervised_tokens = build_labels_from_token_runs(input_ids, [runs[-1]], config.ignore_index)
+            removed = 0
+            path_unsupported = generation["unsupported_apply_chat_template_kwargs"]
+        else:
+            ranges, removed = last_assistant_supervision_ranges(rendered, include_thinking=include_thinking)
+            encoded = tokenize_with_offsets(
+                tokenizer, rendered, add_special_tokens=config.tokenizer.add_special_tokens
+            )
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded["attention_mask"]
+            labels, supervised_tokens = build_labels(input_ids, encoded["offset_mapping"], ranges, config.ignore_index)
+            path_unsupported = unsupported_kwargs
+
         stats["converted_tool_argument_strings"] += converted
         stats["removed_system_messages"] += removed_system_messages
         stats["removed_think_blocks_from_loss"] += removed
-        for key in unsupported_kwargs:
+        for key in path_unsupported:
             stats[f"unsupported_apply_chat_template_kwargs/{key}"] += 1
-        encoded = tokenize_with_offsets(
-            tokenizer,
-            rendered,
-            add_special_tokens=config.tokenizer.add_special_tokens,
-        )
-        labels, supervised_tokens = build_labels(encoded["input_ids"], encoded["offset_mapping"], ranges, config.ignore_index)
         loss_only_text_from_labels, loss_only_token_spans = decode_labeled_token_spans(
             tokenizer,
-            encoded["input_ids"],
+            input_ids,
             labels,
             config.ignore_index,
         )
-        processed[f"{side}_input_ids"] = encoded["input_ids"]
-        processed[f"{side}_attention_mask"] = encoded["attention_mask"]
+        processed[f"{side}_input_ids"] = input_ids
+        processed[f"{side}_attention_mask"] = attention_mask
         processed[f"{side}_labels"] = labels
-        processed[f"{side}_length"] = len(encoded["input_ids"])
+        processed[f"{side}_length"] = len(input_ids)
         processed[f"{side}_completion_token_count"] = supervised_tokens
         processed[f"{side}_render_hash"] = stable_hash(rendered)
         debug[f"{side}_rendered_text"] = rendered

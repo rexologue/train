@@ -95,14 +95,25 @@ def run_standard_eval(
     if reduced["loss_count"] <= 0:
         return {}
 
-    loss = reduced["loss_weighted_sum"] / reduced["loss_count"]
     metrics = {
-        "eval/loss": loss,
-        "eval/ppl": math.exp(min(loss, 20.0)),
         "eval/batches": float(reduced["batch_count"]),
         "eval/tokens": float(reduced["tokens"]),
         "eval/supervised_tokens": float(reduced["supervised_tokens"]),
     }
+
+    # An aggregate eval/loss only has meaning when a single objective is present.
+    # SFT cross-entropy (per token) and DPO logsigmoid (per pair) live on
+    # different scales, so blending them into one eval/loss/eval/ppl is a
+    # category error. When both routes appear, expose only the per-route metrics
+    # below, which are computed on their own correct denominators.
+    has_sft = reduced["sft_loss_count"] > 0
+    has_dpo = reduced["dpo_loss_count"] > 0
+    if has_sft != has_dpo:
+        loss = reduced["loss_weighted_sum"] / reduced["loss_count"]
+        metrics["eval/loss"] = loss
+        if has_sft:
+            metrics["eval/ppl"] = math.exp(min(loss, 20.0))
+
     metrics.update(_route_metrics(reduced))
     return metrics
 

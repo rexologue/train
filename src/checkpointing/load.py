@@ -9,6 +9,8 @@ from accelerate.checkpointing import load_accelerator_state
 from accelerate.utils import DistributedType
 from accelerate.utils.fsdp_utils import load_fsdp_optimizer
 
+from checkpointing.atomic import checkpoint_is_ready
+from checkpointing.checksums import verify_directory_checksums
 from preprocessing.io import cache_root, manifest_path
 from trainer.state import TrainerState
 from utils.hashing import file_sha256, sha256_text, stable_hash
@@ -66,7 +68,31 @@ def resolve_resume_checkpoint(config) -> Path | None:
     resume = config.checkpointing.resume
     if not resume.enabled:
         return None
-    return find_latest_checkpoint(config.checkpoint_dir)
+    checkpoint = find_latest_checkpoint(config.checkpoint_dir)
+    if checkpoint is not None:
+        verify_checkpoint_integrity(checkpoint)
+    return checkpoint
+
+
+def verify_checkpoint_integrity(checkpoint_dir: str | Path) -> None:
+    """Fail before resume if a checkpoint is incomplete or corrupt.
+
+    Resume must never start from a partially written or bit-rotted checkpoint:
+    a corrupt optimizer/adapter shard would silently continue training from
+    garbage. The READY marker proves the save completed; the checksum manifest
+    proves every saved file is byte-identical.
+    """
+
+    path = Path(checkpoint_dir)
+    if not checkpoint_is_ready(path):
+        raise ValueError(f"refusing to resume from checkpoint without READY marker: {path}")
+    checksums_path = path / "checksums.json"
+    if not checksums_path.exists():
+        raise ValueError(f"checkpoint is missing checksums.json: {path}")
+    expected = json.loads(checksums_path.read_text(encoding="utf-8"))
+    problems = verify_directory_checksums(path, expected)
+    if problems:
+        raise ValueError(f"checkpoint integrity check failed for {path}: {problems[:10]}")
 
 
 def build_resume_hashes(config, *, tokenizer=None, model_source=None) -> dict[str, str]:
@@ -216,6 +242,7 @@ def _is_final_checkpoint_dir(path: Path) -> bool:
         path.is_dir()
         and re.fullmatch(r"step-\d+", path.name) is not None
         and (path / "manifest.json").exists()
+        and checkpoint_is_ready(path)
     )
 
 
