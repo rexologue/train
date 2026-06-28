@@ -12,7 +12,7 @@ CheckpointHook = Callable[[Any, Any, TrainerState, dict[str, float]], str | None
 MetricsHook = Callable[[dict[str, Any], TrainerState], None]
 
 
-@dataclass
+@dataclass(slots=True)
 class TrainerHooks:
     """Optional side-effect hooks used by the routed training loop."""
 

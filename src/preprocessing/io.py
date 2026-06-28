@@ -20,7 +20,7 @@ class ParquetSchemaError(ValueError):
     """Raised when raw parquet rows do not match the `data` + `type` contract."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PretokSplitResult:
     """Prepared pretokenized split location plus manifest summary."""
 

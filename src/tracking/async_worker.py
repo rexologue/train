@@ -17,7 +17,7 @@ JobFn = Callable[[], None]
 ClientFactory = Callable[[str | None], Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AsyncJobError:
     name: str
     error: BaseException

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import copy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import re
@@ -60,7 +60,7 @@ _WORKER_TOKENIZER: Any | None = None
 _WORKER_MAX_SEQ_LEN: int | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class PreprocessChunkResult:
     chunk_index: int
     num_input_rows: int
@@ -1228,7 +1228,7 @@ def preprocess_sft_row(row: CanonicalRow, renderer: ChatTemplateRenderer, tokeni
         "assistant_span_char_ranges": [(span.start, span.end) for span in rendered.assistant_spans],
         "loss_only_token_spans": loss_only_token_spans,
         "supervised_char_ranges": supervised_ranges,
-        "target_selection": selection_summary.__dict__,
+        "target_selection": asdict(selection_summary),
         "enable_thinking": config.preprocessing.reasoning.enable_thinking,
     }
     return processed, audit

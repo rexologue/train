@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DpoLossResult:
     """DPO loss plus detached diagnostics for route-level metrics."""
 

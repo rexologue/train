@@ -13,7 +13,7 @@ def better_metric(current: float | None, candidate: float, greater_is_better: bo
     return candidate > current if greater_is_better else candidate < current
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CheckpointCandidate:
     path: Path
     checkpoint_index: int
@@ -22,7 +22,7 @@ class CheckpointCandidate:
     metrics: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RegistrationDecision:
     checkpoint: CheckpointCandidate
     candidate_index: int

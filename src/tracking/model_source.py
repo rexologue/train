@@ -10,7 +10,7 @@ from config import Config
 from registry.modelctl_client import ModelctlClient, ModelctlInfo, ModelctlPullResult, ModelctlVerifyResult
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelSourceResolution:
     """Effective model source selected for this run."""
 

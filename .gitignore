@@ -1437,6 +1437,7 @@ erl_crash.dump
 .agents/
 AGENTS.md
 CLAUDE.md
+code_style.md
 
 configs/**
 !configs/

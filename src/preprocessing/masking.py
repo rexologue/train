@@ -19,7 +19,7 @@ class MaskingError(ValueError):
     """Raised when token labels cannot be built safely."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CanonicalRow:
     """Canonical in-memory sample after parsing the parquet wrapper."""
 
@@ -35,7 +35,7 @@ class CanonicalRow:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AssistantSpan:
     """Character span for an assistant completion body in rendered text."""
 
@@ -45,7 +45,7 @@ class AssistantSpan:
     kind: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TargetSpan:
     """Character span selected for supervised loss."""
 
@@ -55,7 +55,7 @@ class TargetSpan:
     reason: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RenderedSample:
     """Rendered chat text plus assistant spans and renderer metadata."""
 
@@ -64,7 +64,7 @@ class RenderedSample:
     render_metadata: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TargetSelectionSummary:
     """Counters emitted by deterministic target selection."""
 

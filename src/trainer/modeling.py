@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from config import Config
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrainingObjects:
     tokenizer: Any
     model: Any

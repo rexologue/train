@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BFCLEvalSample:
     id: str
     category: str
@@ -26,7 +26,7 @@ class BFCLEvalSample:
         return self.turns[0]["messages"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BFCLRequest:
     sample: BFCLEvalSample
     turn_index: int
@@ -38,7 +38,7 @@ class BFCLRequest:
         return self.sample.is_multi_turn
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MatchIssue:
     code: str
     message: str
@@ -47,7 +47,7 @@ class MatchIssue:
     predicted: Any = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TurnResult:
     turn_index: int
     passed: bool
@@ -56,7 +56,7 @@ class TurnResult:
     issues: list[MatchIssue] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SampleResult:
     id: str
     category: str

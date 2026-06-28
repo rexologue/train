@@ -9,7 +9,7 @@ from typing import Any
 from registry.tags import validate_training_aliases
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelctlCommandFailure(RuntimeError):
     """Raised when a modelctl command exits unsuccessfully."""
 
@@ -26,7 +26,7 @@ class ModelctlCommandFailure(RuntimeError):
         return f"modelctl command failed rc={self.returncode}: {command_text}: {details}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelctlInfo:
     """Parsed output of `modelctl info`."""
 
@@ -39,7 +39,7 @@ class ModelctlInfo:
     raw: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelctlVerifyResult:
     """Parsed output of `modelctl verify`."""
 
@@ -52,7 +52,7 @@ class ModelctlVerifyResult:
     raw: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelctlPullResult:
     """Parsed output of `modelctl pull`."""
 
@@ -67,7 +67,7 @@ class ModelctlPullResult:
     raw: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelctlRegisterRequest:
     """A candidate registration request for modelctl."""
 
@@ -79,7 +79,7 @@ class ModelctlRegisterRequest:
     description: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelctlRegisterResult:
     """Parsed output of `modelctl register`."""
 

@@ -12,7 +12,7 @@ from trainer.callbacks import TrainerHooks
 from trainer.state import TrainerState
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrainerCadence:
     """Validation/checkpoint cadence expressed in training-loop units."""
 

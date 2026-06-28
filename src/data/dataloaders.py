@@ -19,7 +19,7 @@ SFT_LOSS_KINDS = {"sft_target", "sft_tool"}
 DPO_LOSS_KIND = "dpo_target"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SplitDataLoader:
     """DataLoader plus the dataset/sampler metadata needed for audits."""
 
@@ -31,7 +31,7 @@ class SplitDataLoader:
     summary: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DataLoaderBundle:
     """Container for all split DataLoader instances used by the run."""
 

@@ -104,19 +104,20 @@ def run_bfcl_eval(
         return {}
 
     skipped_ids = disabled_before_eval | (skipped_during_eval & loaded_sample_ids)
+    skipped_reasons = _skip_reason_counts(skipped_ids)
     summary = _evaluate_usable_samples(validator.samples, predictions_by_id, skipped_ids)
     _write_rows(config, summary)
     if log_enabled and skipped_ids:
         logger.warning(
             "BFCL eval skipped malformed samples: count=%s by_reason=%s",
             len(skipped_ids),
-            _format_counter(_skip_reason_counts(skipped_ids)),
+            _format_counter(skipped_reasons),
         )
     return _summary_metrics(
         summary,
         loaded_total=len(validator.samples),
         skipped_total=len(skipped_ids),
-        skipped_reasons=_skip_reason_counts(skipped_ids),
+        skipped_reasons=skipped_reasons,
     )
 
 

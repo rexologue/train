@@ -21,7 +21,7 @@ VOCAB_FSDP_IGNORE_PATTERN = r"(.*\.)?(embed_tokens|lm_head)"
 VOCAB_MODULE_LEAVES = {"embed_tokens", "lm_head"}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DistributedRuntime:
     accelerator: Any
     fsdp_plugin: Any

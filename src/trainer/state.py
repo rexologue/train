@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-@dataclass
+@dataclass(slots=True)
 class TrainerState:
     """Serializable counters that define strict resume position."""
 

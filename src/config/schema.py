@@ -55,7 +55,7 @@ class ConfigError(ValueError):
     """Raised when YAML config is missing training-critical settings."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProjectConfig:
     name: str
     run_name: str | None
@@ -75,7 +75,7 @@ class ProjectConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelChecksConfig:
     verify_local_hash: bool
     verify_remote_ref: bool
@@ -100,7 +100,7 @@ class ModelChecksConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelConfig:
     name: str
     alias: str
@@ -155,7 +155,7 @@ class ModelConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TokenizerConfig:
     use_fast: bool
     add_special_tokens: bool
@@ -177,7 +177,7 @@ class TokenizerConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LoraConfig:
     r: int
     alpha: int
@@ -209,7 +209,7 @@ class LoraConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PreprocessingRawConfig:
     train_path: Path
     valid_path: Path
@@ -231,7 +231,7 @@ class PreprocessingRawConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SequenceConfig:
     max_seq_len: int
     truncation: bool
@@ -257,7 +257,7 @@ class SequenceConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RenderingConfig:
     use_system: bool
     reject_raw_special_markers: bool
@@ -276,7 +276,7 @@ class RenderingConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReasoningConfig:
     enable_thinking: bool
 
@@ -290,7 +290,7 @@ class ReasoningConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SftTargetMaskingPolicyConfig:
     min_guaranteed_assistant_chars: int
     loss_on_short_assistant_reply_prob: float
@@ -335,7 +335,7 @@ class SftTargetMaskingPolicyConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MaskingPoliciesConfig:
     sft_target: SftTargetMaskingPolicyConfig
 
@@ -349,7 +349,7 @@ class MaskingPoliciesConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MaskingConfig:
     ignore_index: int
     require_positive_supervised_tokens: bool
@@ -374,7 +374,7 @@ class MaskingConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PreprocessingQualityConfig:
     max_rejected_fraction: float
     min_processed_rows_per_loss_kind: dict[str, int]
@@ -415,7 +415,7 @@ class PreprocessingQualityConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PreprocessingWorkersConfig:
     num_workers: int = 1
     chunk_size: int = 512
@@ -442,7 +442,7 @@ class PreprocessingWorkersConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PreprocessingConfig:
     raw: PreprocessingRawConfig
     sequence: SequenceConfig
@@ -472,7 +472,7 @@ class PreprocessingConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LossRouteConfig:
     type: Literal["sft_ce", "dpo"]
 
@@ -488,7 +488,7 @@ class LossRouteConfig:
         return cls(type=route_type)  # type: ignore[arg-type]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DpoConfig:
     beta: float
 
@@ -505,7 +505,7 @@ class DpoConfig:
 
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LossRoutingConfig:
     routes: dict[str, LossRouteConfig]
     dpo: DpoConfig
@@ -529,7 +529,7 @@ class LossRoutingConfig:
         return cls(routes=routes, dpo=DpoConfig.from_dict(data.get("dpo")))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrainingLoopConfig:
     num_epochs: int
     per_device_train_batch_size: int
@@ -594,7 +594,7 @@ class TrainingLoopConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FsdpConfig:
     sharding_strategy: str
     mixed_precision: str
@@ -664,7 +664,7 @@ class FsdpConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DistributedConfig:
     fsdp: FsdpConfig
 
@@ -676,7 +676,7 @@ class DistributedConfig:
         return cls(fsdp=FsdpConfig.from_dict(data.get("fsdp")))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StandardEvalConfig:
     max_batches: int | None
 
@@ -690,7 +690,7 @@ class StandardEvalConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BfclGenerationConfig:
     max_new_tokens: int
     temperature: float
@@ -722,7 +722,7 @@ class BfclGenerationConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BfclEvalConfig:
     enabled: bool
     path: Path | None
@@ -761,7 +761,7 @@ class BfclEvalConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EvalConfig:
     every_train_steps: int
     standard: StandardEvalConfig
@@ -779,7 +779,7 @@ class EvalConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ResumeConfig:
     enabled: bool
     strict_config: bool
@@ -815,7 +815,7 @@ class ResumeConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CheckpointingConfig:
     save_every_n_validations: int
     save_total_limit: int | None
@@ -836,7 +836,7 @@ class CheckpointingConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MlflowAsyncLoggingConfig:
     enabled: bool
     queue_max_items: int
@@ -866,7 +866,7 @@ class MlflowAsyncLoggingConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MlflowConfig:
     tracking_uri: str
     resume_run_id: str | None
@@ -890,7 +890,7 @@ class MlflowConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RegistrySelectionConfig:
     metric: str
     mode: Literal["min", "max"]
@@ -916,7 +916,7 @@ class RegistrySelectionConfig:
         return cls(metric=metric, mode=mode)  # type: ignore[arg-type]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RegistryConfig:
     register_every_n_checkpoints: int
     selection: RegistrySelectionConfig
@@ -935,7 +935,7 @@ class RegistryConfig:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProgressConfig:
     enabled: bool = True
 
@@ -948,7 +948,7 @@ class ProgressConfig:
         return cls(enabled=_require_bool(data.get("enabled"), "progress.enabled"))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Config:
     project: ProjectConfig
     model: ModelConfig
